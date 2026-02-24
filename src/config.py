@@ -80,7 +80,7 @@ ACTUARIAL_PARAMS = {
 }
 
 FUNDAMENTAL_FEATURES_CONFIG = {
-    "enabled": True,
+    "enabled": False,
     # CSV expected to contain columns: Date, Ticker, FCFE, Revenue, NCFO
     "data_path": os.path.join(BASE_DATA_PATH, "quarterly_fundamentals.csv"),
     "lag_quarters": 8,
@@ -108,7 +108,7 @@ PHASE12_REDUNDANT_FEATURES_TO_DISABLE = [
 ]
 
 # Feature-audit pruning (2026-02-22):
-# Target active feature space: 49 non-actuarial features (+4 actuarial = 53).
+# Target active feature space: 45 non-actuarial features (+4 actuarial = 49).
 # Notes:
 # - Keeps VIX_zscore (implied-vol context), while dropping VIX_level.
 # - Applies high-confidence redundancy/noise removals from audit.
@@ -201,11 +201,6 @@ PHASE12_AUDIT_ACTIVE_FEATURES_NON_ACTUARIAL = [
     "HY_Credit_diff",
     "HY_Credit_zscore",
     "VIX_zscore",
-    # Fundamentals
-    "Fundamental_FCFE_Delta",
-    "Fundamental_Revenue_Delta",
-    "Fundamental_NCFO_Delta",
-    "Fundamental_Staleness_Days",
 ]
 
 PHASE12_AUDIT_ACTIVE_FEATURES_ACTUARIAL = [

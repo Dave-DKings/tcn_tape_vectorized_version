@@ -1284,12 +1284,15 @@ def load_training_metadata_into_config(
         "deterministic_validation_eval_every_episodes",
         "deterministic_validation_mode",
         "deterministic_validation_episode_length_limit",
+        "deterministic_validation_episode_length_limit_curriculum",
         "deterministic_validation_sharpe_min",
         "deterministic_validation_sharpe_min_delta",
         "deterministic_validation_seed_offset",
         "deterministic_validation_log_alpha_stats",
         "high_watermark_checkpoint_enabled",
         "high_watermark_sharpe_threshold",
+        "high_watermark_max_drawdown_abs_threshold",
+        "high_watermark_skip_on_deterministic_validation_trigger",
         "step_sharpe_checkpoint_enabled",
         "step_sharpe_checkpoint_threshold",
         "periodic_checkpoint_every_steps",
@@ -2801,6 +2804,12 @@ def run_experiment6_tape(
         sharpe_float = float(sharpe_val)
         if sharpe_float < high_watermark_sharpe_threshold:
             return
+        mdd_val = to_scalar(metrics_dict.get("max_drawdown_abs"))
+        if mdd_val is None:
+            return
+        mdd_float = float(mdd_val)
+        if mdd_float > high_watermark_max_drawdown_abs_threshold:
+            return
         high_watermark_checkpoint_dir.mkdir(parents=True, exist_ok=True)
         sharpe_tag = _format_checkpoint_metric_tag(sharpe_float)
         prefix = high_watermark_checkpoint_dir / (
@@ -2809,7 +2818,7 @@ def run_experiment6_tape(
         agent.save_models(str(prefix))
         print(
             "      💾 Sharpe-threshold checkpoint saved: "
-            f"{prefix}_actor.weights.h5 (Sharpe={sharpe_float:.3f})"
+            f"{prefix}_actor.weights.h5 (Sharpe={sharpe_float:.3f}, MDD={mdd_float*100.0:.2f}%)"
         )
         saved_checkpoint_records.append(
             {
@@ -2817,6 +2826,7 @@ def run_experiment6_tape(
                 "episode": int(episode_idx),
                 "step": int(step) if "step" in locals() else None,
                 "sharpe": float(sharpe_float),
+                "max_drawdown_abs": float(mdd_float),
                 "actor_path": f"{prefix}_actor.weights.h5",
                 "critic_path": f"{prefix}_critic.weights.h5",
             }
@@ -2839,10 +2849,65 @@ def run_experiment6_tape(
     deterministic_validation_episode_length_limit_cfg = training_params.get(
         "deterministic_validation_episode_length_limit", None
     )
-    if deterministic_validation_episode_length_limit_cfg is not None:
+    if isinstance(deterministic_validation_episode_length_limit_cfg, str):
+        limit_raw = deterministic_validation_episode_length_limit_cfg.strip().lower()
+        if limit_raw in {"", "none", "full", "all"}:
+            deterministic_validation_episode_length_limit_cfg = None
+        else:
+            deterministic_validation_episode_length_limit_cfg = max(
+                1, int(deterministic_validation_episode_length_limit_cfg)
+            )
+    elif deterministic_validation_episode_length_limit_cfg is not None:
         deterministic_validation_episode_length_limit_cfg = max(
             1, int(deterministic_validation_episode_length_limit_cfg)
         )
+    deterministic_validation_episode_length_limit_curriculum_cfg = training_params.get(
+        "deterministic_validation_episode_length_limit_curriculum", None
+    )
+    deterministic_validation_episode_length_limit_schedule: List[Dict[str, Optional[int]]] = []
+    if isinstance(deterministic_validation_episode_length_limit_curriculum_cfg, dict):
+        for threshold_raw, limit_raw in deterministic_validation_episode_length_limit_curriculum_cfg.items():
+            try:
+                threshold_val = max(0, int(threshold_raw))
+            except (TypeError, ValueError):
+                continue
+            if isinstance(limit_raw, str) and limit_raw.strip().lower() in {"", "none", "full", "all"}:
+                limit_val: Optional[int] = None
+            elif limit_raw is None:
+                limit_val = None
+            else:
+                try:
+                    limit_val = max(1, int(limit_raw))
+                except (TypeError, ValueError):
+                    continue
+            deterministic_validation_episode_length_limit_schedule.append(
+                {"threshold": threshold_val, "limit": limit_val}
+            )
+    elif isinstance(deterministic_validation_episode_length_limit_curriculum_cfg, list):
+        for entry in deterministic_validation_episode_length_limit_curriculum_cfg:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                threshold_val = max(0, int(entry.get("threshold", 0)))
+            except (TypeError, ValueError):
+                continue
+            limit_raw = entry.get("limit")
+            if isinstance(limit_raw, str) and limit_raw.strip().lower() in {"", "none", "full", "all"}:
+                limit_val = None
+            elif limit_raw is None:
+                limit_val = None
+            else:
+                try:
+                    limit_val = max(1, int(limit_raw))
+                except (TypeError, ValueError):
+                    continue
+            deterministic_validation_episode_length_limit_schedule.append(
+                {"threshold": threshold_val, "limit": limit_val}
+            )
+    deterministic_validation_episode_length_limit_schedule = sorted(
+        deterministic_validation_episode_length_limit_schedule,
+        key=lambda item: item["threshold"],
+    )
     deterministic_validation_sharpe_min_cfg = float(
         training_params.get("deterministic_validation_sharpe_min", 0.5)
     )
@@ -2859,6 +2924,12 @@ def run_experiment6_tape(
     # Legacy routes disabled by default; deterministic validation is now primary selector.
     high_watermark_checkpoint_enabled_cfg = bool(training_params.get("high_watermark_checkpoint_enabled", False))
     high_watermark_sharpe_threshold_cfg = float(training_params.get("high_watermark_sharpe_threshold", 0.5))
+    high_watermark_max_drawdown_abs_threshold_cfg = float(
+        training_params.get("high_watermark_max_drawdown_abs_threshold", 0.25)
+    )
+    high_watermark_skip_on_det_validation_trigger_cfg = bool(
+        training_params.get("high_watermark_skip_on_deterministic_validation_trigger", True)
+    )
     step_sharpe_checkpoint_enabled_cfg = bool(training_params.get("step_sharpe_checkpoint_enabled", False))
     step_sharpe_checkpoint_threshold_cfg = float(training_params.get("step_sharpe_checkpoint_threshold", 0.5))
     periodic_checkpoint_every_steps_cfg = int(training_params.get("periodic_checkpoint_every_steps", 0) or 0)
@@ -2873,6 +2944,16 @@ def run_experiment6_tape(
     deterministic_validation_best_episode: Optional[int] = None
     deterministic_validation_best_path: Optional[str] = None
     deterministic_validation_last_metrics: Dict[str, float] = {}
+
+    def determine_deterministic_validation_episode_limit(current_step: int) -> Optional[int]:
+        """Resolve deterministic validation horizon from static setting plus optional curriculum."""
+        active_limit = deterministic_validation_episode_length_limit_cfg
+        for entry in deterministic_validation_episode_length_limit_schedule:
+            if current_step >= int(entry["threshold"]):
+                active_limit = entry["limit"]
+            else:
+                break
+        return active_limit
 
     def run_deterministic_validation_metrics(episode_idx: int) -> Dict[str, float]:
         """Run deterministic policy on validation env and return episode metrics."""
@@ -2895,10 +2976,12 @@ def run_experiment6_tape(
             )
 
         prev_eval_limit = getattr(env_eval, "episode_length_limit", None)
+        current_step_for_validation = int(step) if "step" in locals() else 0
+        active_eval_limit = determine_deterministic_validation_episode_limit(current_step_for_validation)
         try:
             agent.reset_state_history()
-            if deterministic_validation_episode_length_limit_cfg is not None:
-                env_eval.set_episode_length_limit(deterministic_validation_episode_length_limit_cfg)
+            if active_eval_limit is not None:
+                env_eval.set_episode_length_limit(active_eval_limit)
             obs_eval, _ = env_eval.reset(seed=experiment_seed + deterministic_validation_seed_offset_cfg + int(episode_idx))
             done_eval = False
             truncated_eval = False
@@ -2941,7 +3024,7 @@ def run_experiment6_tape(
                 metrics_eval["validation_alpha_diag_error"] = alpha_diag_error
             return metrics_eval
         finally:
-            if deterministic_validation_episode_length_limit_cfg is not None:
+            if active_eval_limit is not None:
                 env_eval.set_episode_length_limit(prev_eval_limit)
             agent.reset_state_history()
             if state_history_backup is not None and getattr(agent, "state_history", None) is not None:
@@ -3030,6 +3113,12 @@ def run_experiment6_tape(
             }
         )
 
+    def is_deterministic_validation_trigger_episode(episode_idx: int) -> bool:
+        return bool(
+            deterministic_validation_checkpointing_enabled_cfg
+            and episode_idx % deterministic_validation_eval_every_episodes_cfg == 0
+        )
+
     print(f"\n🎯 Starting THREE-COMPONENT TAPE v3 training (with curriculum)...")
     print(f"   Total timesteps: {max_total_timesteps:,}")
     if len(timestep_update_schedule) == 1:
@@ -3063,11 +3152,18 @@ def run_experiment6_tape(
     for threshold, beta_value in sorted(action_execution_beta_curriculum.items(), key=lambda item: item[0]):
         print(f"      {threshold:,}+ steps: beta={beta_value:.2f}")
     if deterministic_validation_checkpointing_enabled_cfg:
-        val_limit_label = (
-            "full"
-            if deterministic_validation_episode_length_limit_cfg is None
-            else str(deterministic_validation_episode_length_limit_cfg)
-        )
+        if deterministic_validation_episode_length_limit_schedule:
+            schedule_label = " → ".join(
+                f"{entry['threshold']:,}@{'full' if entry['limit'] is None else entry['limit']}"
+                for entry in deterministic_validation_episode_length_limit_schedule
+            )
+            val_limit_label = f"scheduled ({schedule_label})"
+        else:
+            val_limit_label = (
+                "full"
+                if deterministic_validation_episode_length_limit_cfg is None
+                else str(deterministic_validation_episode_length_limit_cfg)
+            )
         print(
             "   🏆 Deterministic-validation checkpoints: "
             f"enabled (every {deterministic_validation_eval_every_episodes_cfg} episodes | "
@@ -3087,6 +3183,15 @@ def run_experiment6_tape(
         print("   ✅ Checkpoint selector default: deterministic validation Sharpe improvement")
     else:
         print("   ⚠️ Checkpoint selector default: legacy high-watermark path")
+    if high_watermark_checkpoint_enabled_cfg:
+        print(
+            "   💾 High-watermark checkpoints: "
+            f"enabled (Sharpe ≥ {high_watermark_sharpe_threshold_cfg:.2f}, "
+            f"MDD ≤ {high_watermark_max_drawdown_abs_threshold_cfg*100:.1f}%, "
+            f"skip_on_det_validation={bool(high_watermark_skip_on_det_validation_trigger_cfg)})"
+        )
+    else:
+        print("   💾 High-watermark checkpoints: disabled")
 
     metadata_path = log_dir / f"{training_log_prefix}_metadata.json"
     feature_manifest_path = log_dir / f"{training_log_prefix}_active_feature_manifest.json"
@@ -3141,6 +3246,7 @@ def run_experiment6_tape(
         "deterministic_validation_eval_every_episodes": int(deterministic_validation_eval_every_episodes_cfg),
         "deterministic_validation_mode": deterministic_validation_mode_cfg,
         "deterministic_validation_episode_length_limit": deterministic_validation_episode_length_limit_cfg,
+        "deterministic_validation_episode_length_limit_curriculum": deterministic_validation_episode_length_limit_schedule,
         "deterministic_validation_sharpe_min": float(deterministic_validation_sharpe_min_cfg),
         "deterministic_validation_sharpe_min_delta": float(deterministic_validation_sharpe_min_delta_cfg),
         "deterministic_validation_seed_offset": int(deterministic_validation_seed_offset_cfg),
@@ -3149,8 +3255,12 @@ def run_experiment6_tape(
         "periodic_checkpoint_every_steps": int(periodic_checkpoint_every_steps_cfg),
         "high_watermark_checkpoint_enabled": bool(high_watermark_checkpoint_enabled_cfg),
         "high_watermark_sharpe_threshold": float(high_watermark_sharpe_threshold_cfg),
+        "high_watermark_max_drawdown_abs_threshold": float(high_watermark_max_drawdown_abs_threshold_cfg),
+        "high_watermark_skip_on_deterministic_validation_trigger": bool(
+            high_watermark_skip_on_det_validation_trigger_cfg
+        ),
         "high_watermark_checkpoint_subdir": "high_watermark_checkpoints",
-        "high_watermark_logic": "save_on_deterministic_validation_sharpe_improvement",
+        "high_watermark_logic": "save_on_episode_metric_threshold",
         "step_sharpe_checkpoint_enabled": bool(step_sharpe_checkpoint_enabled_cfg),
         "step_sharpe_checkpoint_threshold": float(step_sharpe_checkpoint_threshold_cfg),
         "step_sharpe_checkpoint_subdir": "step_sharpe_checkpoints",
@@ -3284,6 +3394,13 @@ def run_experiment6_tape(
             "action_execution_beta_curriculum": action_execution_beta_curriculum,
             "evaluation_action_execution_beta": eval_action_execution_beta,
             "evaluation_turnover_penalty_scalar": eval_turnover_scalar,
+            "deterministic_validation_episode_length_limit_curriculum": deterministic_validation_episode_length_limit_schedule,
+            "high_watermark_checkpoint_enabled": bool(high_watermark_checkpoint_enabled_cfg),
+            "high_watermark_sharpe_threshold": float(high_watermark_sharpe_threshold_cfg),
+            "high_watermark_max_drawdown_abs_threshold": float(high_watermark_max_drawdown_abs_threshold_cfg),
+            "high_watermark_skip_on_deterministic_validation_trigger": bool(
+                high_watermark_skip_on_det_validation_trigger_cfg
+            ),
             "log_step_diagnostics": bool(step_diagnostics_enabled),
             "gamma": gamma_cfg,
             "ra_kl_enabled": bool(ra_kl_enabled),
@@ -3347,6 +3464,10 @@ def run_experiment6_tape(
     periodic_checkpoint_every_steps = int(periodic_checkpoint_every_steps_cfg)
     high_watermark_checkpoint_enabled = bool(high_watermark_checkpoint_enabled_cfg)
     high_watermark_sharpe_threshold = float(high_watermark_sharpe_threshold_cfg)
+    high_watermark_max_drawdown_abs_threshold = float(high_watermark_max_drawdown_abs_threshold_cfg)
+    high_watermark_skip_on_det_validation_trigger = bool(
+        high_watermark_skip_on_det_validation_trigger_cfg
+    )
     high_watermark_checkpoint_dir = results_root / "high_watermark_checkpoints"
     step_sharpe_checkpoint_enabled = bool(step_sharpe_checkpoint_enabled_cfg)
     step_sharpe_checkpoint_threshold = float(step_sharpe_checkpoint_threshold_cfg)
@@ -3592,10 +3713,14 @@ def run_experiment6_tape(
                         last_episode_length_info = to_scalar(info.get("episode_length", last_episode_length_info))
                         last_termination_reason = info.get("termination_reason", last_termination_reason)
 
+                        det_validation_triggered = is_deterministic_validation_trigger_episode(training_episode_count)
                         if deterministic_validation_checkpointing_enabled_cfg:
                             maybe_save_deterministic_validation_checkpoint(training_episode_count)
-                        else:
-                            maybe_save_high_watermark_checkpoint(training_episode_count, metrics_current)
+                        if high_watermark_checkpoint_enabled:
+                            if high_watermark_skip_on_det_validation_trigger and det_validation_triggered:
+                                pass
+                            else:
+                                maybe_save_high_watermark_checkpoint(training_episode_count, metrics_current)
                         reset_obs, reset_info = active_env.reset()
                         train_obs[env_idx] = reset_obs
                         train_infos[env_idx] = reset_info
@@ -3842,10 +3967,14 @@ def run_experiment6_tape(
                         elif not did_clip:
                             last_tape_bonus_clipped = False
 
+                det_validation_triggered = is_deterministic_validation_trigger_episode(training_episode_count)
                 if deterministic_validation_checkpointing_enabled_cfg:
                     maybe_save_deterministic_validation_checkpoint(training_episode_count)
-                else:
-                    maybe_save_high_watermark_checkpoint(training_episode_count, metrics_current)
+                if high_watermark_checkpoint_enabled:
+                    if high_watermark_skip_on_det_validation_trigger and det_validation_triggered:
+                        pass
+                    else:
+                        maybe_save_high_watermark_checkpoint(training_episode_count, metrics_current)
                 obs, info = env_train.reset()
                 done = False
 
