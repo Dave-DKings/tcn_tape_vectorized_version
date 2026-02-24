@@ -1,0 +1,90 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.bbl
+*.blg
+*.out
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+*.toc
+*.lof
+*.lot
+
+# Model checkpoints and weights (large files)
+*.weights.h5
+*.h5
+tcn_results/
+tcn_results_01/
+mlp_results/
+output_logs/
+
+# Large result files (optional - comment out if you want to track these)
+results/model_outputs/stochastic/*.csv
+results/model_outputs/stochastic/*.xlsx
+
+# Archive (historical files not needed in repo)
+archive/
+
+# Temporary analysis files
+--*.csv
+*.tmp
+temp_*.py
+
+# Local bulky artifacts
+master_data.csv
+tcn_results00/
+tcn_fusion_results00/
+results/
+old_results/
+DAVID_DUSSEY-CV20260114.pdf
+
+tcn_documentation/related_works/_extracted/
+tcn_fusion_results_download.zip
+tcn_fusion_results_download_new.zip
+tcn_fusion_results_download_new2.zip
+tcn_fusion_results/
+tcn_fusion_results01/
+tcn_fusion_results_download_run01/
+data1.zip
+tcn_documentation/related_works/PPO KL Management for Portfolio Optimization.docx
+*.zip
+*.csv
+tcn_fusion_results_export/
+
+# Publish-safe exclusions (large artifacts / literature bundle)
+tcn_fusion_results_export.zip
+tcn_fusion_results*/
+data/master_features_NORMALIZED.csv
+data/daily_ohlcv_assets.csv
+tcn_documentation/related_works/
