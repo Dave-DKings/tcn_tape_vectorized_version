@@ -3,11 +3,13 @@ Complete TCN Documentation Builder
 Builds all 10 sections with mathematical rigor and references
 """
 import json
+from pathlib import Path
 
 def build_complete_tcn_docs():
     """Build comprehensive TCN documentation with all sections"""
     
-    notebook = json.load(open(r"c:\Users\Owner\adaptive_portfolio_rl_vectorized\tcn_documentation\03_tcn_architectures_and_variants_EXPANDED.ipynb"))
+    nb_path = Path(__file__).resolve().parent / "03_tcn_architectures_and_variants_EXPANDED.ipynb"
+    notebook = json.load(open(nb_path, encoding='utf-8'))
     
     # Section 2: Theoretical Foundations
     notebook["cells"].append({
@@ -159,7 +161,7 @@ def build_complete_tcn_docs():
     })
     
     # Save updated notebook
-    with open(r"c:\Users\Owner\adaptive_portfolio_rl_vectorized\tcn_documentation\03_tcn_architectures_and_variants_EXPANDED.ipynb", 'w') as f:
+    with open(nb_path, 'w', encoding='utf-8') as f:
         json.dump(notebook, f, indent=1)
     
     print(f"✓ Added sections 2-3. Total cells: {len(notebook['cells'])}")

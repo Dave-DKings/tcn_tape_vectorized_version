@@ -3,7 +3,10 @@
 Test the FINAL corrected approach using terminal_observation from info dict
 """
 import sys
-sys.path.insert(0, r'C:\Users\Owner\adaptive_portfolio_rl_vectorized')
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 import pandas as pd

@@ -2,6 +2,7 @@
 Script to build comprehensive TCN documentation notebook
 """
 import json
+from pathlib import Path
 
 # Build the expanded notebook structure
 notebook = {
@@ -136,7 +137,7 @@ notebook["cells"].append({
 })
 
 # Save the notebook
-output_path = r"c:\\Users\\Owner\\adaptive_portfolio_rl_vectorized\\tcn_documentation\\03_tcn_architectures_and_variants_v2.ipynb"
+output_path = Path(__file__).resolve().parent / "03_tcn_architectures_and_variants_v2.ipynb"
 with open(output_path, 'w', encoding='utf-8') as f:
     json.dump(notebook, f, indent=2, ensure_ascii=False)
 

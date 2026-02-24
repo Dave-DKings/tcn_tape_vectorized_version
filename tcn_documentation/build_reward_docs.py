@@ -3,6 +3,7 @@ Reward System Documentation Builder
 Builds comprehensive TAPE reward system documentation
 """
 import json
+from pathlib import Path
 
 def build_reward_docs():
     """Build comprehensive TAPE reward system documentation"""
@@ -260,7 +261,7 @@ def build_reward_docs():
 
 if __name__ == "__main__":
     nb = build_reward_docs()
-    output_path = r"c:\Users\Owner\adaptive_portfolio_rl_vectorized\tcn_documentation\01_reward_system_full.ipynb"
+    output_path = Path(__file__).resolve().parent / "01_reward_system_full.ipynb"
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(nb, f, indent=1)
     print(f"Created reward docs with {len(nb['cells'])} cells")

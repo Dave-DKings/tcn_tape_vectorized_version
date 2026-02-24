@@ -3,6 +3,7 @@ Research Outline Builder
 Builds the State-of-the-Art Research Paper Outline notebook
 """
 import json
+from pathlib import Path
 
 def build_research_outline():
     """Build publication-ready research outline"""
@@ -212,7 +213,7 @@ def build_research_outline():
 
 if __name__ == "__main__":
     nb = build_research_outline()
-    output_path = r"c:\Users\Owner\adaptive_portfolio_rl_vectorized\tcn_documentation\10_research_paper_outline.ipynb"
+    output_path = Path(__file__).resolve().parent / "10_research_paper_outline.ipynb"
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(nb, f, indent=1)
     print(f"Created research outline with {len(nb['cells'])} cells")

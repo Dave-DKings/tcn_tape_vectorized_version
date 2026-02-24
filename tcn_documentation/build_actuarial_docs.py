@@ -3,6 +3,7 @@ Actuarial Documentation Builder
 Builds comprehensive Actuarial Features documentation
 """
 import json
+from pathlib import Path
 
 def build_actuarial_docs():
     """Build comprehensive Actuarial Features documentation"""
@@ -173,7 +174,7 @@ def build_actuarial_docs():
 
 if __name__ == "__main__":
     nb = build_actuarial_docs()
-    output_path = r"c:\Users\Owner\adaptive_portfolio_rl_vectorized\tcn_documentation\08_actuarial_features_reference.ipynb"
+    output_path = Path(__file__).resolve().parent / "08_actuarial_features_reference.ipynb"
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(nb, f, indent=1)
     print(f"Created actuarial docs with {len(nb['cells'])} cells")

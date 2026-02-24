@@ -30,7 +30,7 @@ Profiling scripts are used to:
 
 To run profiling:
 ```bash
-cd C:\Users\Owner\adaptive_portfolio_rl_vectorized
+cd <path-to-project-root>
 python tests/profiling/profile_tcn_detail.py
 ```
 

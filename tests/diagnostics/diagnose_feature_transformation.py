@@ -18,7 +18,11 @@ This script traces the exact transformation step-by-step.
 import numpy as np
 import pandas as pd
 import sys
-sys.path.append(r'C:\Users\Owner\adaptive_portfolio_rl_vectorized')
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from src.data_utils import DataProcessor
 
@@ -34,7 +38,7 @@ data_processor = DataProcessor()
 
 # Load raw OHLCV
 raw_data = data_processor.load_ohlcv_data(
-    data_path=r'C:\Users\Owner\adaptive_portfolio_rl_vectorized\data',
+    data_path=str(REPO_ROOT / 'data'),
     num_assets=5,
     cache_filename='daily_ohlcv_5_assets.csv'
 )

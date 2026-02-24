@@ -1,7 +1,8 @@
 """Complete remaining sections 6-10 of TCN documentation"""
 import json
+from pathlib import Path
 
-nb_path = r"c:\Users\Owner\adaptive_portfolio_rl_vectorized\tcn_documentation\03_tcn_architectures_and_variants_EXPANDED.ipynb"
+nb_path = Path(__file__).resolve().parent / "03_tcn_architectures_and_variants_EXPANDED.ipynb"
 with open(nb_path, 'r', encoding='utf-8') as f:
     nb = json.load(f)
 

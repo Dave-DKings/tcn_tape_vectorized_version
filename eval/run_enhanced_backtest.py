@@ -10,11 +10,14 @@ All evaluations use the same test data and transaction costs for fair comparison
 """
 
 import sys
-sys.path.append(r'C:\Users\Owner\adaptive_portfolio_rl_vectorized')
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 import pandas as pd
-from pathlib import Path
 from typing import Dict, List, Tuple
 import matplotlib.pyplot as plt
 import seaborn as sns

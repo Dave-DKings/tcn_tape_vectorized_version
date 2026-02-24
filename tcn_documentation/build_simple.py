@@ -3,6 +3,7 @@ Generates expanded notebook programmatically to avoid token limits
 """
 import json
 import os
+from pathlib import Path
 
 def create_comprehensive_tcn_docs():
     """Build full TCN documentation notebook"""
@@ -54,7 +55,8 @@ def create_comprehensive_tcn_docs():
 
 if __name__ == "__main__":
     nb = create_comprehensive_tcn_docs()
-    output = r"c:\Users\Owner\adaptive_portfolio_rl_vectorized\tcn_documentation\03_tcn_expanded_temp.ipynb"
-    with open(output, 'w') as f:
+    docs_dir = Path(__file__).resolve().parent
+    output = docs_dir / "03_tcn_expanded_temp.ipynb"
+    with open(output, 'w', encoding='utf-8') as f:
         json.dump(nb, f, indent=1)
     print(f"Created {len(nb['cells'])} cells in {output}")

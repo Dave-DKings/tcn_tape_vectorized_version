@@ -46,7 +46,7 @@ Most of these scripts are **one-time diagnostics** that have already served thei
 
 To run any diagnostic:
 ```bash
-cd C:\Users\Owner\adaptive_portfolio_rl_vectorized
+cd <path-to-project-root>
 python tests/diagnostics/<script_name>.py
 ```
 

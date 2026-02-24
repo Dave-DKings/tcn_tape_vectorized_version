@@ -2,6 +2,7 @@
 import json
 import re
 import os
+from pathlib import Path
 
 def convert_md_to_ipynb(input_path, output_path):
     with open(input_path, 'r', encoding='utf-8') as f:
@@ -104,6 +105,7 @@ def convert_md_to_ipynb(input_path, output_path):
     print(f"Successfully converted {input_path} to {output_path}")
 
 if __name__ == "__main__":
-    input_file = r"c:\Users\Owner\adaptive_portfolio_rl_vectorized\RL Portfolio Optimization Feature Engineering.md"
-    output_file = r"c:\Users\Owner\adaptive_portfolio_rl_vectorized\RL_Portfolio_Optimization_Feature_Engineering.ipynb"
-    convert_md_to_ipynb(input_file, output_file)
+    repo_root = Path(__file__).resolve().parent
+    input_file = repo_root / "RL Portfolio Optimization Feature Engineering.md"
+    output_file = repo_root / "RL_Portfolio_Optimization_Feature_Engineering.ipynb"
+    convert_md_to_ipynb(str(input_file), str(output_file))
