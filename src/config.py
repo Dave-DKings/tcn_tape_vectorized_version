@@ -630,12 +630,12 @@ PHASE1_CONFIG = {
         "entropy_coefficient": 0.10,  # Diversification bonus weight (10x stronger for meaningful impact)
         
         # STATE-OF-THE-ART FIX #3: Position Size Constraints
-        "max_single_position": 25.00,  # Maximum allocation to any single asset (25%)
+        "max_single_position": 20.00,  # Maximum allocation to any single asset (20%)
         
         # Alternative: Curriculum schedule for max single position
         # Start strict, relax as agent learns 
         #"max_single_position_curriculum": {
-        #    0: 25.0,        # First 30k steps: Learn diversification
+        #    0: 20.0,        # First 30k steps: Learn diversification
         #    30_000: 30.0,   # 30k-60k: Allow more concentration
         #    60_000: 35.0,   # 60k-100k: Further relaxation
         #    100_000: 40.0,  # Final: Full flexibility
@@ -933,7 +933,7 @@ PHASE2_CONFIG = {
         "entropy_coefficient": 0.10,  # Diversification bonus weight (10x stronger for meaningful impact)
         
         # STATE-OF-THE-ART FIX #3: Position Size Constraints
-        "max_single_position": 25.00,  # Maximum allocation to any single asset (25%)
+        "max_single_position": 20.00,  # Maximum allocation to any single asset (20%)
         "min_cash_position": 0.05,    # Minimum cash buffer (5%)
 
         # STATE-OF-THE-ART FIX #4: Curriculum Learning
