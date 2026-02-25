@@ -1655,6 +1655,9 @@ def prepare_phase1_dataset(
         ti_configs=ti_configs,
     )
 
+    print("\n🕯️ Adding candlestick geometry features (if enabled)")
+    df_with_indicators = processor.add_candlestick_features(df_with_indicators)
+
     print("\n📊 Computing dynamic covariance features")
     master_df = processor.calculate_dynamic_covariance_features(df_with_indicators)
 
