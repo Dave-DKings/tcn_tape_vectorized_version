@@ -63,6 +63,15 @@ TECHNICAL_INDICATORS_CONFIG = [
     {"name": "MFI", "params": {"length": 14}, "output_cols": ["MFI_14"]}
 ]
 
+CANDLESTICK_FEATURES_CONFIG = {
+    "enabled": True,
+    # Numeric safety epsilon for divide operations (range/body ratios).
+    "eps": 1e-8,
+    # Winsor-like clipping to keep tails bounded before normalization.
+    "clip_abs": 5.0,
+    "include_gap_open": True,
+}
+
 TEMPORAL_FORECAST_PARAMS = {
     "sequence_length": 20, "epochs": 2, "batch_size": 32, "learning_rate": 0.01,  # Reduced epochs for faster testing "dropout_rate": 0.2
 }
@@ -108,7 +117,7 @@ PHASE12_REDUNDANT_FEATURES_TO_DISABLE = [
 ]
 
 # Feature-audit pruning (2026-02-22):
-# Target active feature space: 45 non-actuarial features (+4 actuarial = 49).
+# Target active feature space: 52 non-actuarial features (+4 actuarial = 56).
 # Notes:
 # - Keeps VIX_zscore (implied-vol context), while dropping VIX_level.
 # - Applies high-confidence redundancy/noise removals from audit.
@@ -148,7 +157,7 @@ PHASE12_AUDIT_FEATURES_TO_DISABLE = [
     "HY_Credit_level",
 ]
 
-# Canonical Exp6 feature-audit active set (49 non-actuarial features).
+# Canonical Exp6 feature-audit active set (52 non-actuarial features).
 # This is enforced via allowlist to keep training/evaluation deterministic.
 PHASE12_AUDIT_ACTIVE_FEATURES_NON_ACTUARIAL = [
     # Returns + risk moments
@@ -167,6 +176,14 @@ PHASE12_AUDIT_ACTIVE_FEATURES_NON_ACTUARIAL = [
     "ADX_14",
     "NATR_14",
     "MFI_14",
+    # Candlestick geometry
+    "Candle_Body",
+    "Candle_UpperWick",
+    "Candle_LowerWick",
+    "Candle_Range",
+    "Candle_BodyToRange",
+    "Candle_CloseLocation",
+    "Candle_GapOpen",
     # Regime/cross-sectional alpha
     "Regime_Volatility_Ratio",
     "Regime_Price_vs_SMA_Short",
@@ -441,6 +458,7 @@ PHASE1_CONFIG = {
     "ANALYSIS_END_DATE": ANALYSIS_END_DATE,
     "feature_params": {
         "technical_indicators": TECHNICAL_INDICATORS_CONFIG,
+        "candlestick_features": copy.deepcopy(CANDLESTICK_FEATURES_CONFIG),
         "include_log_returns": True,
         "log_return_col_name": "Daily_LogReturn",
         # Dynamic covariance enabled for portfolio correlation insights
@@ -795,6 +813,7 @@ PHASE2_CONFIG = {
     "ANALYSIS_END_DATE": ANALYSIS_END_DATE,
     "feature_params": {
         "technical_indicators": TECHNICAL_INDICATORS_CONFIG,
+        "candlestick_features": copy.deepcopy(CANDLESTICK_FEATURES_CONFIG),
         "include_log_returns": True,
         "log_return_col_name": "Daily_LogReturn",
         "temporal_forecast": None,  # Disabled for testing - TCN rolling forecast is too slow (4000+ models to train)

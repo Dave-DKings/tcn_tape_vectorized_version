@@ -209,6 +209,7 @@ class DataProcessor:
         self._regime_feature_names: List[str] = []
         self._quant_feature_names: List[str] = []
         self._actuarial_feature_names: List[str] = []
+        self._candlestick_feature_names: List[str] = []
         
         # Initialize Actuarial Estimator
         self.actuarial_estimator = DrawdownReserveEstimator(config)
@@ -1103,6 +1104,79 @@ class DataProcessor:
         logger.info(f"  ✅ Regime features added - columns: {len(new_cols)}")
         return df_sorted
 
+    def add_candlestick_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add continuous candlestick geometry features per ticker/day.
+
+        Uses numeric bar structure (body/wicks/range/location/gap) instead of
+        brittle discrete pattern labels.
+        """
+        cand_cfg = self.config.get("feature_params", {}).get("candlestick_features", {})
+        self._candlestick_feature_names = []
+        if not cand_cfg or not cand_cfg.get("enabled", False):
+            return df
+
+        required = [self.open_col, self.high_col, self.low_col, self.close_col, self.ticker_col, self.date_col]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            logger.warning("Candlestick features requested but missing columns: %s", missing)
+            return df
+
+        eps = float(cand_cfg.get("eps", 1e-8))
+        clip_abs = float(cand_cfg.get("clip_abs", 5.0))
+        include_gap_open = bool(cand_cfg.get("include_gap_open", True))
+
+        out = df.sort_values([self.ticker_col, self.date_col]).copy()
+        grouped = out.groupby(self.ticker_col, group_keys=False)
+
+        o = pd.to_numeric(out[self.open_col], errors="coerce")
+        h = pd.to_numeric(out[self.high_col], errors="coerce")
+        l = pd.to_numeric(out[self.low_col], errors="coerce")
+        c = pd.to_numeric(out[self.close_col], errors="coerce")
+
+        open_safe = o.replace(0.0, np.nan)
+        true_range = (h - l).astype(float)
+        max_oc = np.maximum(o, c)
+        min_oc = np.minimum(o, c)
+
+        out["Candle_Body"] = (c - o) / open_safe
+        out["Candle_UpperWick"] = (h - max_oc) / open_safe
+        out["Candle_LowerWick"] = (min_oc - l) / open_safe
+        out["Candle_Range"] = true_range / open_safe
+        out["Candle_BodyToRange"] = out["Candle_Body"] / (out["Candle_Range"].abs() + eps)
+        out["Candle_CloseLocation"] = (c - l) / (true_range + eps)
+
+        new_cols = [
+            "Candle_Body",
+            "Candle_UpperWick",
+            "Candle_LowerWick",
+            "Candle_Range",
+            "Candle_BodyToRange",
+            "Candle_CloseLocation",
+        ]
+
+        if include_gap_open:
+            prev_close = grouped[self.close_col].shift(1).astype(float)
+            prev_close_safe = prev_close.replace(0.0, np.nan)
+            out["Candle_GapOpen"] = (o - prev_close) / prev_close_safe
+            new_cols.append("Candle_GapOpen")
+
+        filled_count = 0
+        for col in new_cols:
+            vals = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+            vals = vals.groupby(out[self.ticker_col]).transform(lambda s: s.ffill())
+            n_nans = int(vals.isna().sum())
+            if n_nans > 0:
+                filled_count += n_nans
+            vals = vals.fillna(0.0).clip(-clip_abs, clip_abs)
+            out[col] = vals.astype(np.float32)
+
+        self._candlestick_feature_names = new_cols.copy()
+        if filled_count > 0:
+            logger.info("  ℹ️  Filled %d candlestick NaNs via per-ticker forward-fill", filled_count)
+        logger.info("  ✅ Candlestick features added - columns: %d", len(new_cols))
+        return out.sort_index()
+
     def add_quant_alpha_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Compute cross-sectional and alpha-style features.
@@ -1503,6 +1577,8 @@ class DataProcessor:
             return True
         if "Rank" in column:
             return True
+        if column.startswith("Candle_CloseLocation"):
+            return True
         bounded_prefixes = ("RSI_", "STOCHk_", "STOCHd_", "WILLR_", "MFI_")
         return column.startswith(bounded_prefixes)
 
@@ -1557,6 +1633,7 @@ class DataProcessor:
             "Covariance_Eigenvalue_",
             "Fundamental_",
             "Actuarial_",
+            "Candle_",
         )
         if column.startswith(heavy_prefixes):
             return True
@@ -2194,6 +2271,9 @@ class DataProcessor:
         # Step 3: Calculate technical indicators
         logger.info("Step 3: Calculating technical indicators...")
         df = self.calculate_technical_indicators(df)
+
+        logger.info("Step 3.2: Adding candlestick geometry features (if enabled)...")
+        df = self.add_candlestick_features(df)
         
         # Step 3.5: Calculate dynamic covariance features
         logger.info("Step 3.5: Calculating dynamic covariance features...")
@@ -2349,6 +2429,10 @@ class DataProcessor:
         logger.info("Step 3: Calculating technical indicators...")
         df = self.calculate_technical_indicators(df)
         logger.info(f"  ✅ Technical indicators added - shape: {df.shape}")
+
+        logger.info("Step 3.2: Adding candlestick geometry features (if enabled)...")
+        df = self.add_candlestick_features(df)
+        logger.info(f"  ✅ Candlestick features processed - shape: {df.shape}")
         
         # Step 3.5: Calculate dynamic covariance features
         logger.info("Step 3.5: Calculating dynamic covariance features...")
@@ -2520,6 +2604,9 @@ class DataProcessor:
             
         if self._actuarial_feature_names:
             feature_cols.extend(self._actuarial_feature_names)
+
+        if self._candlestick_feature_names:
+            feature_cols.extend(self._candlestick_feature_names)
         
         # Macro economic features (available to both phases)
         macro_config = self.config.get('feature_params', {}).get('macro_data')
