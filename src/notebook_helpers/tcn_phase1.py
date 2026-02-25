@@ -322,6 +322,49 @@ def _infer_fusion_input_signature_from_actor_weights(actor_weights_path: Union[s
         return None
 
 
+def _infer_distributional_critic_quantiles_from_weights(
+    critic_weights_path: Union[str, Path]
+) -> Optional[int]:
+    """
+    Inspect critic output layer kernel to infer quantile count.
+
+    Returns:
+      - int > 1 : distributional critic with that many quantiles
+      - 1       : scalar critic
+      - None    : could not infer
+    """
+    path = Path(critic_weights_path)
+    if not path.exists():
+        return None
+
+    try:
+        with h5py.File(path, "r") as handle:
+            layers_group = handle.get("layers")
+            if layers_group is None:
+                return None
+
+            candidate_units: List[int] = []
+            for layer_name in layers_group.keys():
+                name = str(layer_name).lower()
+                if "critic" not in name or not name.endswith("_output"):
+                    continue
+                layer_group = layers_group.get(layer_name)
+                if layer_group is None:
+                    continue
+                vars_group = layer_group.get("vars")
+                if vars_group is None or "0" not in vars_group:
+                    continue
+                kernel = vars_group["0"]
+                if len(kernel.shape) >= 2:
+                    candidate_units.append(int(kernel.shape[-1]))
+
+            if candidate_units:
+                return int(max(candidate_units))
+    except Exception:
+        return None
+    return None
+
+
 @dataclass
 class Phase1Dataset:
     """Container for the processed feature set used in Phase 1 analysis."""
@@ -550,6 +593,15 @@ def _extract_effective_agent_params(
         "dirichlet_adaptive_temperature_min",
         "dirichlet_adaptive_temperature_max",
         "dirichlet_alpha_cap",
+        "recurrent_memory_enabled",
+        "recurrent_memory_units",
+        "recurrent_memory_dropout",
+        "regime_conditioning_enabled",
+        "regime_conditioning_hidden_dim",
+        "regime_conditioning_dropout",
+        "state_augmentation_enabled",
+        "distributional_critic_enabled",
+        "distributional_num_quantiles",
         "logit_temperature",
         "alpha_cap",
         "num_assets",
@@ -769,7 +821,22 @@ TRAINING_FIELDNAMES: List[str] = [
     "risk_aux_sharpe_proxy",
     "risk_aux_sharpe_loss",
     "risk_aux_mvo_loss",
+    "risk_aux_cvar_proxy",
+    "risk_aux_cvar_loss",
+    "risk_aux_cvar_coef",
     "mean_advantage",
+    "mean_reward_raw",
+    "mean_reward_shaped",
+    "multi_horizon_reward_bonus_mean",
+    "multi_horizon_reward_bonus_std",
+    "multi_horizon_reward_bonus_max",
+    "reward_running_mean",
+    "reward_running_std",
+    "returns_running_mean",
+    "returns_running_std",
+    "popart_enabled",
+    "ppo_gamma_active",
+    "ppo_gae_lambda_active",
     "policy_entropy",
     "policy_loss",
     "entropy_loss",
@@ -1008,6 +1075,19 @@ def create_experiment6_result_stub(
             "actor_lr": 0.00005,
             "critic_lr": 0.0005,
             "max_grad_norm": 0.5,
+            "risk_aux_cvar_adaptive_enabled": False,
+            "risk_aux_cvar_target": 0.02,
+            "risk_aux_cvar_adapt_lr": 0.05,
+            "risk_aux_cvar_min_coef": 0.0,
+            "risk_aux_cvar_max_coef": 0.05,
+            "popart_enabled": False,
+            "popart_min_std": 1e-3,
+            "multi_horizon_reward_enabled": False,
+            "multi_horizon_reward_coef": 0.0,
+            "multi_horizon_reward_horizons": [21, 63, 126, 252],
+            "multi_horizon_reward_weights": [0.25, 0.25, 0.25, 0.25],
+            "distributional_huber_kappa": 1.0,
+            "distributional_mean_loss_coef": 0.1,
         },
         "debug_prints": False,
         "dirichlet_epsilon": {
@@ -1029,6 +1109,15 @@ def create_experiment6_result_stub(
         "fusion_cross_asset_mixer_dropout": 0.1,
         "fusion_alpha_head_hidden_dims": [],
         "fusion_alpha_head_dropout": 0.1,
+        "recurrent_memory_enabled": False,
+        "recurrent_memory_units": 64,
+        "recurrent_memory_dropout": 0.1,
+        "regime_conditioning_enabled": False,
+        "regime_conditioning_hidden_dim": 32,
+        "regime_conditioning_dropout": 0.0,
+        "state_augmentation_enabled": False,
+        "distributional_critic_enabled": False,
+        "distributional_num_quantiles": 17,
         "max_total_timesteps": max_total_timesteps,
     }
 
@@ -1132,6 +1221,12 @@ def create_experiment6_result_stub(
                 dilations = dilations[: len(inferred_filters)]
             resolved_agent_config["tcn_dilations"] = dilations
 
+    critic_candidate = Path(f"{resolved_checkpoint_path}_critic.weights.h5")
+    inferred_quantiles = _infer_distributional_critic_quantiles_from_weights(critic_candidate)
+    if inferred_quantiles is not None and int(inferred_quantiles) > 1:
+        resolved_agent_config["distributional_critic_enabled"] = True
+        resolved_agent_config["distributional_num_quantiles"] = int(inferred_quantiles)
+
     resolved_actor_lr_schedule = []
     schedule_source = actor_lr_schedule or [{"threshold": 0, "lr": resolved_agent_config["ppo_params"].get("actor_lr", 0.001)}]
     for entry in schedule_source:
@@ -1227,6 +1322,8 @@ def load_training_metadata_into_config(
         "max_total_timesteps",
         "timesteps_per_ppo_update",
         "timesteps_per_ppo_update_schedule",
+        "ppo_gamma_schedule",
+        "ppo_gae_lambda_schedule",
         "batch_size_ppo",
         "batch_size_ppo_schedule",
         "action_execution_beta_curriculum",
@@ -1253,6 +1350,9 @@ def load_training_metadata_into_config(
         schedule = train_meta.get("episode_length_curriculum_schedule")
         if isinstance(schedule, list):
             training_params["episode_length_curriculum_schedule"] = copy.deepcopy(schedule)
+    for key in ("episode_length_curriculum_smooth_enabled", "episode_length_curriculum_overlap_steps"):
+        if key in train_meta:
+            training_params[key] = copy.deepcopy(train_meta[key])
 
     for key in (
         "dsr_scalar",
@@ -1289,6 +1389,15 @@ def load_training_metadata_into_config(
         "deterministic_validation_sharpe_min_delta",
         "deterministic_validation_seed_offset",
         "deterministic_validation_log_alpha_stats",
+        "deterministic_validation_multi_horizon_enabled",
+        "deterministic_validation_multi_horizon_limits",
+        "deterministic_validation_multi_horizon_weights",
+        "deterministic_validation_multi_horizon_dd_penalty_coef",
+        "deterministic_validation_stochastic_sanity_enabled",
+        "deterministic_validation_stochastic_sanity_runs",
+        "deterministic_validation_stochastic_sanity_episode_length_limit",
+        "deterministic_validation_stochastic_sanity_min_mean_sharpe",
+        "deterministic_validation_stochastic_sanity_max_sharpe_std",
         "high_watermark_checkpoint_enabled",
         "high_watermark_sharpe_threshold",
         "high_watermark_max_drawdown_abs_threshold",
@@ -1969,6 +2078,84 @@ def run_experiment6_tape(
                 break
         return max(1, int(active_rollout))
 
+    ppo_params_root = config.get("agent_params", {}).get("ppo_params", {})
+    base_ppo_gamma = float(ppo_params_root.get("gamma", 0.99))
+    base_ppo_gae_lambda = float(ppo_params_root.get("gae_lambda", 0.90))
+
+    def _parse_float_schedule(
+        raw_schedule_cfg: Any,
+        *,
+        value_key: str,
+        fallback_value: float,
+    ) -> List[Dict[str, float]]:
+        parsed: List[Dict[str, float]] = []
+        if isinstance(raw_schedule_cfg, dict):
+            for threshold_raw, value_raw in raw_schedule_cfg.items():
+                try:
+                    threshold_val = max(0, int(threshold_raw))
+                    value_val = float(value_raw)
+                except (TypeError, ValueError):
+                    continue
+                parsed.append({"threshold": threshold_val, value_key: value_val})
+        elif isinstance(raw_schedule_cfg, list):
+            for entry in raw_schedule_cfg:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    threshold_val = max(0, int(entry.get("threshold", 0)))
+                except (TypeError, ValueError):
+                    continue
+                raw_val = entry.get(value_key, entry.get("value"))
+                if raw_val is None:
+                    continue
+                try:
+                    value_val = float(raw_val)
+                except (TypeError, ValueError):
+                    continue
+                parsed.append({"threshold": threshold_val, value_key: value_val})
+
+        if not parsed:
+            parsed = [{"threshold": 0, value_key: float(fallback_value)}]
+
+        by_threshold: Dict[int, float] = {}
+        for entry in sorted(parsed, key=lambda item: item["threshold"]):
+            by_threshold[int(entry["threshold"])] = float(entry[value_key])
+        if 0 not in by_threshold:
+            by_threshold[0] = float(fallback_value)
+        return [
+            {"threshold": int(th), value_key: float(v)}
+            for th, v in sorted(by_threshold.items(), key=lambda item: item[0])
+        ]
+
+    gamma_schedule = _parse_float_schedule(
+        training_params.get("ppo_gamma_schedule", []),
+        value_key="gamma",
+        fallback_value=base_ppo_gamma,
+    )
+    gae_lambda_schedule = _parse_float_schedule(
+        training_params.get("ppo_gae_lambda_schedule", []),
+        value_key="gae_lambda",
+        fallback_value=base_ppo_gae_lambda,
+    )
+
+    def determine_ppo_gamma(current_step: int) -> float:
+        active_gamma = float(gamma_schedule[0]["gamma"])
+        for entry in gamma_schedule:
+            if current_step >= int(entry["threshold"]):
+                active_gamma = float(entry["gamma"])
+            else:
+                break
+        return active_gamma
+
+    def determine_ppo_gae_lambda(current_step: int) -> float:
+        active_lambda = float(gae_lambda_schedule[0]["gae_lambda"])
+        for entry in gae_lambda_schedule:
+            if current_step >= int(entry["threshold"]):
+                active_lambda = float(entry["gae_lambda"])
+            else:
+                break
+        return active_lambda
+
     arch_upper = architecture.upper()
     use_attention_flag = bool(config.get("agent_params", {}).get("use_attention", False))
     use_fusion_flag = bool(config.get("agent_params", {}).get("use_fusion", False))
@@ -2134,7 +2321,7 @@ def run_experiment6_tape(
             1.0,
         )
     )
-    gamma_cfg = float(config.get("agent_params", {}).get("ppo_params", {}).get("gamma", 0.99))
+    gamma_cfg = float(determine_ppo_gamma(0))
     train_turnover_default = float(env_params.get("turnover_penalty_scalar", 2.0))
     eval_turnover_scalar = float(training_params.get("evaluation_turnover_penalty_scalar", train_turnover_default))
 
@@ -2205,6 +2392,13 @@ def run_experiment6_tape(
     print("   ✅ Retroactive episode-wide reward rescaling: disabled in notebook helper path")
 
     use_episode_length_curriculum = bool(training_params.get("use_episode_length_curriculum", False))
+    episode_length_curriculum_smooth_enabled = bool(
+        training_params.get("episode_length_curriculum_smooth_enabled", False)
+    )
+    episode_length_curriculum_overlap_steps = max(
+        0,
+        int(training_params.get("episode_length_curriculum_overlap_steps", 0) or 0),
+    )
 
     default_schedule = [
         {"threshold": 0, "limit": 504},
@@ -2219,18 +2413,53 @@ def run_experiment6_tape(
     # Sort schedule by threshold to ensure deterministic behavior
     curriculum_schedule = sorted(curriculum_schedule, key=lambda item: item["threshold"])
 
+    def _resolve_numeric_episode_limit(limit_value: Optional[int], total_days: int) -> int:
+        if limit_value is None:
+            return int(total_days)
+        return int(min(max(1, int(limit_value)), total_days))
+
     def determine_episode_limit(current_timestep: int, total_days: int) -> Optional[int]:
         if not use_episode_length_curriculum:
             return None
-        active_limit = curriculum_schedule[0]["limit"]
-        for entry in curriculum_schedule:
-            if current_timestep >= entry["threshold"]:
-                active_limit = entry["limit"]
+        active_idx = 0
+        for idx, entry in enumerate(curriculum_schedule):
+            if current_timestep >= int(entry["threshold"]):
+                active_idx = idx
             else:
                 break
-        if active_limit is None:
+
+        active_limit_raw = curriculum_schedule[active_idx]["limit"]
+        if (
+            not episode_length_curriculum_smooth_enabled
+            or episode_length_curriculum_overlap_steps <= 0
+            or active_idx >= (len(curriculum_schedule) - 1)
+        ):
+            if active_limit_raw is None:
+                return None
+            return _resolve_numeric_episode_limit(active_limit_raw, total_days)
+
+        next_entry = curriculum_schedule[active_idx + 1]
+        next_threshold = int(next_entry["threshold"])
+        current_threshold = int(curriculum_schedule[active_idx]["threshold"])
+        if current_timestep >= next_threshold:
+            next_limit_raw = next_entry["limit"]
+            if next_limit_raw is None:
+                return None
+            return _resolve_numeric_episode_limit(next_limit_raw, total_days)
+
+        if active_limit_raw is None:
             return None
-        return min(int(active_limit), total_days)
+
+        ramp_start = max(current_threshold, next_threshold - episode_length_curriculum_overlap_steps)
+        if current_timestep < ramp_start:
+            return _resolve_numeric_episode_limit(active_limit_raw, total_days)
+
+        active_limit_num = _resolve_numeric_episode_limit(active_limit_raw, total_days)
+        next_limit_num = _resolve_numeric_episode_limit(next_entry["limit"], total_days)
+        ramp_span = max(1, next_threshold - ramp_start)
+        blend = float(np.clip((current_timestep - ramp_start) / ramp_span, 0.0, 1.0))
+        blended_limit = int(round((1.0 - blend) * active_limit_num + blend * next_limit_num))
+        return int(min(max(1, blended_limit), total_days))
 
     episode_horizon_start = determine_episode_limit(0, experiment_train_df["Date"].nunique())
 
@@ -2386,9 +2615,12 @@ def run_experiment6_tape(
                 agent_config["state_layout"] = copy.deepcopy(state_layout)
         except Exception:
             pass
+    initial_ppo_gamma = determine_ppo_gamma(0)
+    initial_ppo_gae_lambda = determine_ppo_gae_lambda(0)
     agent_config.setdefault("debug_prints", False)
     agent_config.setdefault("ppo_params", {})
-    agent_config["ppo_params"].setdefault("gamma", gamma_cfg)
+    agent_config["ppo_params"]["gamma"] = float(initial_ppo_gamma)
+    agent_config["ppo_params"]["gae_lambda"] = float(initial_ppo_gae_lambda)
 
     print(f"\n🤖 Creating {arch_upper} agent with Dirichlet distribution for Exp {exp_idx}...")
     agent = agent_cls(
@@ -2521,6 +2753,27 @@ def run_experiment6_tape(
             f"dropout={agent_config.get('fusion_alpha_head_dropout', agent_config.get('fusion_dropout'))}"
         )
     print(
+        "   🧠 Recurrent memory: "
+        f"enabled={bool(agent_config.get('recurrent_memory_enabled', False))} | "
+        f"units={agent_config.get('recurrent_memory_units', 64)} | "
+        f"dropout={agent_config.get('recurrent_memory_dropout', 0.1)}"
+    )
+    print(
+        "   🌐 Regime conditioning: "
+        f"enabled={bool(agent_config.get('regime_conditioning_enabled', False))} | "
+        f"hidden_dim={agent_config.get('regime_conditioning_hidden_dim', 32)} | "
+        f"dropout={agent_config.get('regime_conditioning_dropout', 0.0)}"
+    )
+    print(
+        "   🧬 State augmentation: "
+        f"enabled={bool(agent_config.get('state_augmentation_enabled', False))}"
+    )
+    print(
+        "   📉 Distributional critic: "
+        f"enabled={bool(agent_config.get('distributional_critic_enabled', False))} | "
+        f"num_quantiles={agent_config.get('distributional_num_quantiles', 17)}"
+    )
+    print(
         "   🎛️ Dirichlet controls: "
         f"activation={agent_config.get('dirichlet_alpha_activation')} | "
         f"temperature={agent_config.get('dirichlet_logit_temperature', agent_config.get('logit_temperature', 1.0))} | "
@@ -2538,6 +2791,14 @@ def run_experiment6_tape(
         f"epochs={num_ppo_epochs}, batch_size={initial_batch_size}, "
         f"target_kl={agent.target_kl:.4f}, entropy_coef={agent.entropy_coef:.4f}"
     )
+    gamma_schedule_pretty = " → ".join(
+        f"{entry['gamma']:.4f}@{entry['threshold']:,}" for entry in gamma_schedule
+    )
+    gae_schedule_pretty = " → ".join(
+        f"{entry['gae_lambda']:.4f}@{entry['threshold']:,}" for entry in gae_lambda_schedule
+    )
+    print(f"   📉 PPO gamma schedule: {gamma_schedule_pretty}")
+    print(f"   📉 PPO GAE-λ schedule: {gae_schedule_pretty}")
     if len(timestep_update_schedule) > 1:
         rollout_schedule_pretty = " → ".join(
             f"{entry['timesteps_per_update']}@{entry['threshold']:,}"
@@ -2920,6 +3181,75 @@ def run_experiment6_tape(
     deterministic_validation_log_alpha_stats_cfg = bool(
         training_params.get("deterministic_validation_log_alpha_stats", True)
     )
+    deterministic_validation_multi_horizon_enabled_cfg = bool(
+        training_params.get("deterministic_validation_multi_horizon_enabled", False)
+    )
+    multi_horizon_limits_raw = training_params.get(
+        "deterministic_validation_multi_horizon_limits",
+        [252, 504, 756, 1008],
+    )
+    multi_horizon_limits_cfg: List[int] = []
+    if isinstance(multi_horizon_limits_raw, (list, tuple)):
+        for limit_raw in multi_horizon_limits_raw:
+            try:
+                limit_val = int(limit_raw)
+            except (TypeError, ValueError):
+                continue
+            if limit_val > 0:
+                multi_horizon_limits_cfg.append(limit_val)
+    multi_horizon_limits_cfg = sorted(set(multi_horizon_limits_cfg))
+    if not multi_horizon_limits_cfg:
+        deterministic_validation_multi_horizon_enabled_cfg = False
+
+    multi_horizon_weights_raw = training_params.get(
+        "deterministic_validation_multi_horizon_weights",
+        [],
+    )
+    multi_horizon_weights_cfg: List[float] = []
+    if isinstance(multi_horizon_weights_raw, (list, tuple)):
+        for w in multi_horizon_weights_raw:
+            try:
+                multi_horizon_weights_cfg.append(float(w))
+            except (TypeError, ValueError):
+                continue
+    if len(multi_horizon_weights_cfg) != len(multi_horizon_limits_cfg) or sum(multi_horizon_weights_cfg) <= 0.0:
+        if multi_horizon_limits_cfg:
+            equal_w = 1.0 / float(len(multi_horizon_limits_cfg))
+            multi_horizon_weights_cfg = [equal_w] * len(multi_horizon_limits_cfg)
+        else:
+            multi_horizon_weights_cfg = []
+    else:
+        total_w = float(sum(multi_horizon_weights_cfg))
+        multi_horizon_weights_cfg = [max(0.0, w) / total_w for w in multi_horizon_weights_cfg]
+    deterministic_validation_multi_horizon_dd_penalty_coef_cfg = float(
+        max(training_params.get("deterministic_validation_multi_horizon_dd_penalty_coef", 0.25), 0.0)
+    )
+
+    deterministic_validation_stochastic_sanity_enabled_cfg = bool(
+        training_params.get("deterministic_validation_stochastic_sanity_enabled", False)
+    )
+    deterministic_validation_stochastic_sanity_runs_cfg = max(
+        1, int(training_params.get("deterministic_validation_stochastic_sanity_runs", 3))
+    )
+    deterministic_validation_stochastic_sanity_episode_length_limit_cfg = training_params.get(
+        "deterministic_validation_stochastic_sanity_episode_length_limit",
+        252,
+    )
+    if deterministic_validation_stochastic_sanity_episode_length_limit_cfg is None:
+        pass
+    else:
+        try:
+            deterministic_validation_stochastic_sanity_episode_length_limit_cfg = max(
+                1, int(deterministic_validation_stochastic_sanity_episode_length_limit_cfg)
+            )
+        except (TypeError, ValueError):
+            deterministic_validation_stochastic_sanity_episode_length_limit_cfg = 252
+    deterministic_validation_stochastic_sanity_min_mean_sharpe_cfg = float(
+        training_params.get("deterministic_validation_stochastic_sanity_min_mean_sharpe", 0.0)
+    )
+    deterministic_validation_stochastic_sanity_max_sharpe_std_cfg = float(
+        max(training_params.get("deterministic_validation_stochastic_sanity_max_sharpe_std", 1.5), 0.0)
+    )
 
     # Legacy routes disabled by default; deterministic validation is now primary selector.
     high_watermark_checkpoint_enabled_cfg = bool(training_params.get("high_watermark_checkpoint_enabled", False))
@@ -2941,6 +3271,7 @@ def run_experiment6_tape(
         tape_checkpoint_threshold_cfg = 999.0
 
     deterministic_validation_best_sharpe = -np.inf
+    deterministic_validation_best_score = -np.inf
     deterministic_validation_best_episode: Optional[int] = None
     deterministic_validation_best_path: Optional[str] = None
     deterministic_validation_last_metrics: Dict[str, float] = {}
@@ -2955,7 +3286,13 @@ def run_experiment6_tape(
                 break
         return active_limit
 
-    def run_deterministic_validation_metrics(episode_idx: int) -> Dict[str, float]:
+    def run_deterministic_validation_metrics(
+        episode_idx: int,
+        *,
+        episode_length_limit_override: Optional[int] = None,
+        seed_offset_extra: int = 0,
+        log_alpha_stats_override: Optional[bool] = None,
+    ) -> Dict[str, float]:
         """Run deterministic policy on validation env and return episode metrics."""
         env_eval = env_test_deterministic
         state_history_backup = None
@@ -2977,12 +3314,23 @@ def run_experiment6_tape(
 
         prev_eval_limit = getattr(env_eval, "episode_length_limit", None)
         current_step_for_validation = int(step) if "step" in locals() else 0
-        active_eval_limit = determine_deterministic_validation_episode_limit(current_step_for_validation)
+        active_eval_limit = (
+            max(1, int(episode_length_limit_override))
+            if episode_length_limit_override is not None
+            else determine_deterministic_validation_episode_limit(current_step_for_validation)
+        )
+        log_alpha_stats = (
+            bool(deterministic_validation_log_alpha_stats_cfg)
+            if log_alpha_stats_override is None
+            else bool(log_alpha_stats_override)
+        )
         try:
             agent.reset_state_history()
             if active_eval_limit is not None:
                 env_eval.set_episode_length_limit(active_eval_limit)
-            obs_eval, _ = env_eval.reset(seed=experiment_seed + deterministic_validation_seed_offset_cfg + int(episode_idx))
+            obs_eval, _ = env_eval.reset(
+                seed=experiment_seed + deterministic_validation_seed_offset_cfg + int(seed_offset_extra) + int(episode_idx)
+            )
             done_eval = False
             truncated_eval = False
             while not (done_eval or truncated_eval):
@@ -2991,7 +3339,7 @@ def run_experiment6_tape(
                     deterministic=True,
                     evaluation_mode=deterministic_validation_mode_cfg,
                 )
-                if deterministic_validation_log_alpha_stats_cfg:
+                if log_alpha_stats:
                     try:
                         if getattr(agent, "is_sequential", False) and getattr(agent, "_latest_sequence", None) is not None:
                             alpha_state_input, _ = agent.prepare_state_input(agent._latest_sequence)
@@ -3022,6 +3370,8 @@ def run_experiment6_tape(
                 )
             if alpha_diag_error is not None:
                 metrics_eval["validation_alpha_diag_error"] = alpha_diag_error
+            if active_eval_limit is not None:
+                metrics_eval["validation_episode_length_limit"] = int(active_eval_limit)
             return metrics_eval
         finally:
             if active_eval_limit is not None:
@@ -3034,10 +3384,153 @@ def run_experiment6_tape(
             if hasattr(agent, "_latest_sequence"):
                 agent._latest_sequence = latest_sequence_backup
 
+    def run_multi_horizon_deterministic_validation(episode_idx: int) -> Dict[str, Any]:
+        """
+        Evaluate deterministic policy across multiple horizons and compute a composite score.
+        Score = sum_i w_i * (Sharpe_i - dd_coef * MaxDD_i).
+        """
+        horizon_records: List[Dict[str, Any]] = []
+        composite_score = 0.0
+        sharpe_values: List[float] = []
+        dd_values: List[float] = []
+        valid_count = 0
+
+        for idx, horizon in enumerate(multi_horizon_limits_cfg):
+            metrics_h = run_deterministic_validation_metrics(
+                episode_idx,
+                episode_length_limit_override=int(horizon),
+                seed_offset_extra=idx * 100,
+                log_alpha_stats_override=(idx == 0),
+            )
+            sharpe_h = float(to_scalar(metrics_h.get("sharpe_ratio", np.nan)) or np.nan)
+            dd_h = float(to_scalar(metrics_h.get("max_drawdown_abs", np.nan)) or np.nan)
+            total_ret_scalar = to_scalar(metrics_h.get("total_return", np.nan))
+            total_ret_h = float(total_ret_scalar) if total_ret_scalar is not None and np.isfinite(total_ret_scalar) else None
+            weight_h = float(multi_horizon_weights_cfg[idx]) if idx < len(multi_horizon_weights_cfg) else 0.0
+            score_h = np.nan
+            if np.isfinite(sharpe_h) and np.isfinite(dd_h):
+                score_h = sharpe_h - deterministic_validation_multi_horizon_dd_penalty_coef_cfg * dd_h
+                composite_score += weight_h * score_h
+                sharpe_values.append(sharpe_h)
+                dd_values.append(dd_h)
+                valid_count += 1
+
+            horizon_records.append(
+                {
+                    "horizon": int(horizon),
+                    "weight": weight_h,
+                    "score": float(score_h) if np.isfinite(score_h) else None,
+                    "sharpe": float(sharpe_h) if np.isfinite(sharpe_h) else None,
+                    "max_drawdown_abs": float(dd_h) if np.isfinite(dd_h) else None,
+                    "total_return": total_ret_h,
+                    "metrics": metrics_h,
+                }
+            )
+
+        primary_record = max(horizon_records, key=lambda rec: int(rec.get("horizon", 0))) if horizon_records else None
+        primary_metrics = primary_record.get("metrics", {}) if isinstance(primary_record, dict) else {}
+        return {
+            "horizon_records": horizon_records,
+            "primary_metrics": primary_metrics,
+            "composite_score": float(composite_score) if valid_count > 0 else np.nan,
+            "mean_sharpe": float(np.mean(sharpe_values)) if sharpe_values else np.nan,
+            "mean_max_drawdown_abs": float(np.mean(dd_values)) if dd_values else np.nan,
+            "valid_count": int(valid_count),
+        }
+
+    def run_stochastic_validation_sanity(episode_idx: int) -> Dict[str, Any]:
+        """
+        Optional stochastic sanity gate to reject brittle deterministic winners.
+        """
+        if not deterministic_validation_stochastic_sanity_enabled_cfg:
+            return {
+                "enabled": False,
+                "passed": True,
+                "mean_sharpe": np.nan,
+                "std_sharpe": np.nan,
+                "runs": 0,
+                "sharpes": [],
+            }
+
+        env_eval = env_test_random if env_test_random is not None else env_test_deterministic
+        state_history_backup = None
+        latest_sequence_backup = None
+        if getattr(agent, "state_history", None) is not None:
+            state_history_backup = [np.array(x, copy=True) for x in list(agent.state_history)]
+        if hasattr(agent, "_latest_sequence"):
+            latest_sequence_backup = (
+                np.array(agent._latest_sequence, copy=True)
+                if isinstance(agent._latest_sequence, np.ndarray)
+                else agent._latest_sequence
+            )
+
+        prev_eval_limit = getattr(env_eval, "episode_length_limit", None)
+        sharpes: List[float] = []
+        try:
+            for run_idx in range(deterministic_validation_stochastic_sanity_runs_cfg):
+                agent.reset_state_history()
+                if deterministic_validation_stochastic_sanity_episode_length_limit_cfg is not None:
+                    env_eval.set_episode_length_limit(deterministic_validation_stochastic_sanity_episode_length_limit_cfg)
+                obs_eval, _ = env_eval.reset(
+                    seed=experiment_seed
+                    + deterministic_validation_seed_offset_cfg
+                    + 50_000
+                    + int(episode_idx) * 17
+                    + run_idx
+                )
+                done_eval = False
+                truncated_eval = False
+                while not (done_eval or truncated_eval):
+                    action_eval, _, _ = agent.get_action_and_value(
+                        obs_eval,
+                        deterministic=False,
+                        stochastic=True,
+                    )
+                    obs_eval, _, done_eval, truncated_eval, _ = env_eval.step(action_eval)
+                metrics_eval = compute_episode_metrics(env_eval)
+                sharpe_eval = float(to_scalar(metrics_eval.get("sharpe_ratio", np.nan)) or np.nan)
+                if np.isfinite(sharpe_eval):
+                    sharpes.append(sharpe_eval)
+        finally:
+            if deterministic_validation_stochastic_sanity_episode_length_limit_cfg is not None:
+                env_eval.set_episode_length_limit(prev_eval_limit)
+            agent.reset_state_history()
+            if state_history_backup is not None and getattr(agent, "state_history", None) is not None:
+                agent.state_history.clear()
+                for row in state_history_backup:
+                    agent.state_history.append(row)
+            if hasattr(agent, "_latest_sequence"):
+                agent._latest_sequence = latest_sequence_backup
+
+        if sharpes:
+            mean_sharpe = float(np.mean(sharpes))
+            std_sharpe = float(np.std(sharpes))
+        else:
+            mean_sharpe = np.nan
+            std_sharpe = np.nan
+
+        passed = bool(
+            np.isfinite(mean_sharpe)
+            and np.isfinite(std_sharpe)
+            and mean_sharpe >= deterministic_validation_stochastic_sanity_min_mean_sharpe_cfg
+            and std_sharpe <= deterministic_validation_stochastic_sanity_max_sharpe_std_cfg
+        )
+        return {
+            "enabled": True,
+            "passed": passed,
+            "runs": int(len(sharpes)),
+            "sharpes": [float(x) for x in sharpes],
+            "mean_sharpe": float(mean_sharpe) if np.isfinite(mean_sharpe) else np.nan,
+            "std_sharpe": float(std_sharpe) if np.isfinite(std_sharpe) else np.nan,
+            "min_mean_sharpe": float(deterministic_validation_stochastic_sanity_min_mean_sharpe_cfg),
+            "max_sharpe_std": float(deterministic_validation_stochastic_sanity_max_sharpe_std_cfg),
+        }
+
     def maybe_save_deterministic_validation_checkpoint(
         episode_idx: int,
     ) -> None:
         nonlocal deterministic_validation_best_sharpe
+        nonlocal deterministic_validation_best_score
         nonlocal deterministic_validation_best_episode
         nonlocal deterministic_validation_best_path
         nonlocal deterministic_validation_last_metrics
@@ -3047,8 +3540,24 @@ def run_experiment6_tape(
         if episode_idx % deterministic_validation_eval_every_episodes_cfg != 0:
             return
 
-        val_metrics = run_deterministic_validation_metrics(episode_idx)
-        deterministic_validation_last_metrics = val_metrics
+        multi_horizon_summary: Optional[Dict[str, Any]] = None
+        if deterministic_validation_multi_horizon_enabled_cfg:
+            multi_horizon_summary = run_multi_horizon_deterministic_validation(episode_idx)
+            val_metrics = dict(multi_horizon_summary.get("primary_metrics", {}))
+            val_selection_score = float(
+                to_scalar(multi_horizon_summary.get("composite_score", np.nan)) or np.nan
+            )
+        else:
+            val_metrics = run_deterministic_validation_metrics(episode_idx)
+            val_selection_score = float(to_scalar(val_metrics.get("sharpe_ratio", np.nan)) or np.nan)
+
+        deterministic_validation_last_metrics = dict(val_metrics)
+        deterministic_validation_last_metrics["validation_selection_score"] = (
+            float(val_selection_score) if np.isfinite(val_selection_score) else None
+        )
+        if multi_horizon_summary is not None:
+            deterministic_validation_last_metrics["validation_multi_horizon_summary"] = _json_ready(multi_horizon_summary)
+
         val_sharpe = float(to_scalar(val_metrics.get("sharpe_ratio", np.nan)) or np.nan)
         val_mdd = float(to_scalar(val_metrics.get("max_drawdown_abs", np.nan)) or np.nan)
         val_ret = float(to_scalar(val_metrics.get("total_return", np.nan)) or np.nan)
@@ -3062,6 +3571,21 @@ def run_experiment6_tape(
             "      🧪 Deterministic validation: "
             f"Sharpe={val_sharpe:.3f} | Return={val_ret*100.0:+.2f}% | DD={val_mdd*100.0:.2f}%"
         )
+        if deterministic_validation_multi_horizon_enabled_cfg and multi_horizon_summary is not None:
+            horizon_lines = []
+            for rec in multi_horizon_summary.get("horizon_records", []):
+                h = int(rec.get("horizon", 0))
+                h_sh = rec.get("sharpe")
+                h_dd = rec.get("max_drawdown_abs")
+                if h_sh is None or h_dd is None:
+                    horizon_lines.append(f"{h}:n/a")
+                else:
+                    horizon_lines.append(f"{h}:{float(h_sh):.3f}/{float(h_dd)*100.0:.1f}%")
+            print(
+                "         Multi-horizon: "
+                f"score={val_selection_score:.3f} | "
+                f"details={', '.join(horizon_lines)}"
+            )
         if np.isfinite(val_alpha_spread):
             print(
                 "         Alpha diagnostics: "
@@ -3074,11 +3598,26 @@ def run_experiment6_tape(
                     "         ⚠️ Mode fallback detected: "
                     f"alpha<=1 on {val_mode_vertex_fraction*100.0:.1f}% of validation steps."
                 )
-        if not np.isfinite(val_sharpe):
+        if not np.isfinite(val_sharpe) or not np.isfinite(val_selection_score):
             return
         if val_sharpe < deterministic_validation_sharpe_min_cfg:
             return
-        if val_sharpe <= (deterministic_validation_best_sharpe + deterministic_validation_sharpe_min_delta_cfg):
+        if val_selection_score <= (deterministic_validation_best_score + deterministic_validation_sharpe_min_delta_cfg):
+            return
+
+        sanity_result = run_stochastic_validation_sanity(episode_idx)
+        if sanity_result.get("enabled", False):
+            sanity_mean = float(to_scalar(sanity_result.get("mean_sharpe", np.nan)) or np.nan)
+            sanity_std = float(to_scalar(sanity_result.get("std_sharpe", np.nan)) or np.nan)
+            print(
+                "         Stochastic sanity: "
+                f"mean_sharpe={sanity_mean:.3f} | std={sanity_std:.3f} | runs={int(sanity_result.get('runs', 0))}"
+            )
+            if not bool(sanity_result.get("passed", False)):
+                print("         ⚠️ Sanity gate rejected checkpoint (stochastic robustness failed).")
+                return
+        elif deterministic_validation_stochastic_sanity_enabled_cfg:
+            # Enabled but no valid sanity metric available.
             return
 
         high_watermark_checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -3089,9 +3628,10 @@ def run_experiment6_tape(
         agent.save_models(str(prefix))
         print(
             "      💾 Deterministic-validation checkpoint saved: "
-            f"{prefix}_actor.weights.h5 (val_sharpe={val_sharpe:.3f})"
+            f"{prefix}_actor.weights.h5 (val_sharpe={val_sharpe:.3f}, score={val_selection_score:.3f})"
         )
         deterministic_validation_best_sharpe = val_sharpe
+        deterministic_validation_best_score = val_selection_score
         deterministic_validation_best_episode = int(episode_idx)
         deterministic_validation_best_path = str(prefix)
         saved_checkpoint_records.append(
@@ -3108,6 +3648,12 @@ def run_experiment6_tape(
                 "validation_alpha_mode_vertex_fraction": (
                     float(val_mode_vertex_fraction) if np.isfinite(val_mode_vertex_fraction) else None
                 ),
+                "validation_selection_score": float(val_selection_score),
+                "validation_multi_horizon_enabled": bool(deterministic_validation_multi_horizon_enabled_cfg),
+                "validation_multi_horizon_summary": (
+                    _json_ready(multi_horizon_summary) if multi_horizon_summary is not None else None
+                ),
+                "validation_stochastic_sanity": _json_ready(sanity_result),
                 "actor_path": f"{prefix}_actor.weights.h5",
                 "critic_path": f"{prefix}_critic.weights.h5",
             }
@@ -3137,12 +3683,21 @@ def run_experiment6_tape(
         print(f"   PPO batch_size: scheduled{auto_note}")
         for entry in batch_size_schedule:
             print(f"      {entry['threshold']:,}+ steps: batch_size={entry['batch_size']}")
+    print(f"   PPO gamma schedule: {gamma_schedule_pretty}")
+    print(f"   PPO GAE-λ schedule: {gae_schedule_pretty}")
     if use_episode_length_curriculum:
         print(f"   📚 Episode Length Curriculum:")
         for entry in curriculum_schedule:
             limit = entry.get("limit")
             limit_label = "full" if limit is None else str(limit)
             print(f"      {entry.get('threshold', 0):,}+ steps: limit={limit_label}")
+        if episode_length_curriculum_smooth_enabled and episode_length_curriculum_overlap_steps > 0:
+            print(
+                "      ↳ smooth ramp: "
+                f"enabled (overlap={episode_length_curriculum_overlap_steps:,} steps)"
+            )
+        else:
+            print("      ↳ smooth ramp: disabled")
     else:
         print(f"   📚 Episode Length Curriculum: disabled (full horizon)")
     print(f"   📚 Turnover Scalar Curriculum:")
@@ -3173,6 +3728,28 @@ def run_experiment6_tape(
             f"alpha_diag={bool(deterministic_validation_log_alpha_stats_cfg)} | "
             f"horizon={val_limit_label})"
         )
+        if deterministic_validation_multi_horizon_enabled_cfg:
+            mh_pairs = ", ".join(
+                f"{h}:{w:.2f}" for h, w in zip(multi_horizon_limits_cfg, multi_horizon_weights_cfg)
+            )
+            print(
+                "      ↳ Multi-horizon selector: "
+                f"enabled ({mh_pairs}) | dd_penalty_coef={deterministic_validation_multi_horizon_dd_penalty_coef_cfg:.3f}"
+            )
+        else:
+            print("      ↳ Multi-horizon selector: disabled")
+        if deterministic_validation_stochastic_sanity_enabled_cfg:
+            sanity_horizon = deterministic_validation_stochastic_sanity_episode_length_limit_cfg
+            sanity_horizon_label = "full" if sanity_horizon is None else str(int(sanity_horizon))
+            print(
+                "      ↳ Stochastic sanity gate: "
+                f"enabled (runs={deterministic_validation_stochastic_sanity_runs_cfg}, "
+                f"horizon={sanity_horizon_label}, "
+                f"min_mean_sharpe={deterministic_validation_stochastic_sanity_min_mean_sharpe_cfg:.2f}, "
+                f"max_std={deterministic_validation_stochastic_sanity_max_sharpe_std_cfg:.2f})"
+            )
+        else:
+            print("      ↳ Stochastic sanity gate: disabled")
     else:
         print("   🏆 Deterministic-validation checkpoints: disabled")
     if deterministic_validation_checkpointing_only_cfg:
@@ -3180,7 +3757,10 @@ def run_experiment6_tape(
     else:
         print("   🧷 Legacy checkpoint routes: configurable")
     if deterministic_validation_checkpointing_enabled_cfg:
-        print("   ✅ Checkpoint selector default: deterministic validation Sharpe improvement")
+        if deterministic_validation_multi_horizon_enabled_cfg:
+            print("   ✅ Checkpoint selector default: deterministic validation multi-horizon composite score")
+        else:
+            print("   ✅ Checkpoint selector default: deterministic validation Sharpe improvement")
     else:
         print("   ⚠️ Checkpoint selector default: legacy high-watermark path")
     if high_watermark_checkpoint_enabled_cfg:
@@ -3238,7 +3818,11 @@ def run_experiment6_tape(
     )
     checkpoint_strategy = {
         "normal_checkpoint_naming": "exp{exp_idx}_tape_hw_ep{episode:05d}_sh{tag}",
-        "normal_checkpoint_selection": "best_deterministic_validation_sharpe",
+        "normal_checkpoint_selection": (
+            "best_deterministic_validation_multi_horizon_score"
+            if deterministic_validation_multi_horizon_enabled_cfg
+            else "best_deterministic_validation_sharpe"
+        ),
         "rare_checkpoint_selection": "disabled",
         "legacy_final_alias_supported": True,
         "deterministic_validation_checkpointing_enabled": bool(deterministic_validation_checkpointing_enabled_cfg),
@@ -3251,6 +3835,31 @@ def run_experiment6_tape(
         "deterministic_validation_sharpe_min_delta": float(deterministic_validation_sharpe_min_delta_cfg),
         "deterministic_validation_seed_offset": int(deterministic_validation_seed_offset_cfg),
         "deterministic_validation_log_alpha_stats": bool(deterministic_validation_log_alpha_stats_cfg),
+        "deterministic_validation_multi_horizon_enabled": bool(
+            deterministic_validation_multi_horizon_enabled_cfg
+        ),
+        "deterministic_validation_multi_horizon_limits": copy.deepcopy(multi_horizon_limits_cfg),
+        "deterministic_validation_multi_horizon_weights": copy.deepcopy(multi_horizon_weights_cfg),
+        "deterministic_validation_multi_horizon_dd_penalty_coef": float(
+            deterministic_validation_multi_horizon_dd_penalty_coef_cfg
+        ),
+        "deterministic_validation_stochastic_sanity_enabled": bool(
+            deterministic_validation_stochastic_sanity_enabled_cfg
+        ),
+        "deterministic_validation_stochastic_sanity_runs": int(
+            deterministic_validation_stochastic_sanity_runs_cfg
+        ),
+        "deterministic_validation_stochastic_sanity_episode_length_limit": (
+            int(deterministic_validation_stochastic_sanity_episode_length_limit_cfg)
+            if deterministic_validation_stochastic_sanity_episode_length_limit_cfg is not None
+            else None
+        ),
+        "deterministic_validation_stochastic_sanity_min_mean_sharpe": float(
+            deterministic_validation_stochastic_sanity_min_mean_sharpe_cfg
+        ),
+        "deterministic_validation_stochastic_sanity_max_sharpe_std": float(
+            deterministic_validation_stochastic_sanity_max_sharpe_std_cfg
+        ),
         "tape_checkpoint_threshold_bonus": None,
         "periodic_checkpoint_every_steps": int(periodic_checkpoint_every_steps_cfg),
         "high_watermark_checkpoint_enabled": bool(high_watermark_checkpoint_enabled_cfg),
@@ -3359,6 +3968,15 @@ def run_experiment6_tape(
             "fusion_alpha_head_dropout": copy.deepcopy(
                 agent_config.get("fusion_alpha_head_dropout", agent_config.get("fusion_dropout"))
             ),
+            "recurrent_memory_enabled": bool(agent_config.get("recurrent_memory_enabled", False)),
+            "recurrent_memory_units": copy.deepcopy(agent_config.get("recurrent_memory_units", 64)),
+            "recurrent_memory_dropout": copy.deepcopy(agent_config.get("recurrent_memory_dropout", 0.1)),
+            "regime_conditioning_enabled": bool(agent_config.get("regime_conditioning_enabled", False)),
+            "regime_conditioning_hidden_dim": copy.deepcopy(agent_config.get("regime_conditioning_hidden_dim", 32)),
+            "regime_conditioning_dropout": copy.deepcopy(agent_config.get("regime_conditioning_dropout", 0.0)),
+            "state_augmentation_enabled": bool(agent_config.get("state_augmentation_enabled", False)),
+            "distributional_critic_enabled": bool(agent_config.get("distributional_critic_enabled", False)),
+            "distributional_num_quantiles": copy.deepcopy(agent_config.get("distributional_num_quantiles", 17)),
             "tcn_hidden_activation": agent_config.get("tcn_activation", "relu"),
             "agent_params_template": template_agent_params,
             "agent_params_effective": effective_agent_params,
@@ -3381,6 +3999,8 @@ def run_experiment6_tape(
             "max_total_timesteps": max_total_timesteps,
             "timesteps_per_ppo_update": timestep_update_schedule[0]["timesteps_per_update"],
             "timesteps_per_ppo_update_schedule": timestep_update_schedule,
+            "ppo_gamma_schedule": copy.deepcopy(gamma_schedule),
+            "ppo_gae_lambda_schedule": copy.deepcopy(gae_lambda_schedule),
             "num_parallel_envs": int(num_parallel_envs),
             "actor_lr_schedule": actor_lr_schedule,
             "num_ppo_epochs": num_ppo_epochs,
@@ -3389,12 +4009,39 @@ def run_experiment6_tape(
             "batch_size_ppo_auto_from_rollout_schedule": batch_size_auto_from_rollout,
             "use_episode_length_curriculum": use_episode_length_curriculum,
             "episode_length_curriculum_schedule": curriculum_schedule,
+            "episode_length_curriculum_smooth_enabled": bool(episode_length_curriculum_smooth_enabled),
+            "episode_length_curriculum_overlap_steps": int(episode_length_curriculum_overlap_steps),
             "episode_length_limit_initial": episode_horizon_start,
             "turnover_penalty_curriculum": turnover_curriculum,
             "action_execution_beta_curriculum": action_execution_beta_curriculum,
             "evaluation_action_execution_beta": eval_action_execution_beta,
             "evaluation_turnover_penalty_scalar": eval_turnover_scalar,
             "deterministic_validation_episode_length_limit_curriculum": deterministic_validation_episode_length_limit_schedule,
+            "deterministic_validation_multi_horizon_enabled": bool(
+                deterministic_validation_multi_horizon_enabled_cfg
+            ),
+            "deterministic_validation_multi_horizon_limits": copy.deepcopy(multi_horizon_limits_cfg),
+            "deterministic_validation_multi_horizon_weights": copy.deepcopy(multi_horizon_weights_cfg),
+            "deterministic_validation_multi_horizon_dd_penalty_coef": float(
+                deterministic_validation_multi_horizon_dd_penalty_coef_cfg
+            ),
+            "deterministic_validation_stochastic_sanity_enabled": bool(
+                deterministic_validation_stochastic_sanity_enabled_cfg
+            ),
+            "deterministic_validation_stochastic_sanity_runs": int(
+                deterministic_validation_stochastic_sanity_runs_cfg
+            ),
+            "deterministic_validation_stochastic_sanity_episode_length_limit": (
+                int(deterministic_validation_stochastic_sanity_episode_length_limit_cfg)
+                if deterministic_validation_stochastic_sanity_episode_length_limit_cfg is not None
+                else None
+            ),
+            "deterministic_validation_stochastic_sanity_min_mean_sharpe": float(
+                deterministic_validation_stochastic_sanity_min_mean_sharpe_cfg
+            ),
+            "deterministic_validation_stochastic_sanity_max_sharpe_std": float(
+                deterministic_validation_stochastic_sanity_max_sharpe_std_cfg
+            ),
             "high_watermark_checkpoint_enabled": bool(high_watermark_checkpoint_enabled_cfg),
             "high_watermark_sharpe_threshold": float(high_watermark_sharpe_threshold_cfg),
             "high_watermark_max_drawdown_abs_threshold": float(high_watermark_max_drawdown_abs_threshold_cfg),
@@ -3530,6 +4177,10 @@ def run_experiment6_tape(
     ratio_std_value = 0.0
 
     current_episode_limit = episode_horizon_start if episode_horizon_start is not None else env_train.total_days
+    current_ppo_gamma = float(determine_ppo_gamma(0))
+    current_ppo_gae_lambda = float(determine_ppo_gae_lambda(0))
+    agent.gamma = current_ppo_gamma
+    agent.gae_lambda = current_ppo_gae_lambda
     current_timestep_rollout = determine_timesteps_per_update(0)
     current_batch_size_ppo = determine_batch_size_ppo(0, current_timestep_rollout)
     update_count = 0
@@ -3543,6 +4194,8 @@ def run_experiment6_tape(
 
         active_timestep_rollout = determine_timesteps_per_update(step)
         active_batch_size_ppo = determine_batch_size_ppo(step, active_timestep_rollout)
+        active_ppo_gamma = float(determine_ppo_gamma(step))
+        active_ppo_gae_lambda = float(determine_ppo_gae_lambda(step))
 
         if active_timestep_rollout != current_timestep_rollout:
             current_timestep_rollout = active_timestep_rollout
@@ -3552,6 +4205,16 @@ def run_experiment6_tape(
             current_batch_size_ppo = active_batch_size_ppo
             print(f"\n📚 PPO BATCH SIZE UPDATE at {step:,} steps:")
             print(f"   Batch size: {current_batch_size_ppo}")
+        if not np.isclose(active_ppo_gamma, current_ppo_gamma):
+            current_ppo_gamma = active_ppo_gamma
+            agent.gamma = current_ppo_gamma
+            print(f"\n📉 PPO GAMMA UPDATE at {step:,} steps:")
+            print(f"   gamma: {current_ppo_gamma:.4f}")
+        if not np.isclose(active_ppo_gae_lambda, current_ppo_gae_lambda):
+            current_ppo_gae_lambda = active_ppo_gae_lambda
+            agent.gae_lambda = current_ppo_gae_lambda
+            print(f"\n📉 PPO GAE-λ UPDATE at {step:,} steps:")
+            print(f"   gae_lambda: {current_ppo_gae_lambda:.4f}")
 
         steps_this_update = min(active_timestep_rollout, max_total_timesteps - step)
         precomputed_gae_data: Optional[Tuple[np.ndarray, np.ndarray]] = None
@@ -3742,7 +4405,8 @@ def run_experiment6_tape(
                     agent.memory[key].extend(buffer[key])
 
                 rewards_raw = np.asarray(buffer["rewards"], dtype=np.float32)
-                rewards_norm = np.clip((rewards_raw - prev_reward_mean) / prev_reward_std, -5.0, 5.0)
+                rewards_shaped, _ = agent.shape_rewards_for_update(rewards_raw)
+                rewards_norm = np.clip((rewards_shaped - prev_reward_mean) / prev_reward_std, -5.0, 5.0)
                 values_arr = np.asarray(buffer["values"], dtype=np.float32)
                 dones_arr = np.asarray(buffer["dones"], dtype=bool)
 
@@ -3758,7 +4422,9 @@ def run_experiment6_tape(
                     else:
                         state_for_value, _ = agent.prepare_state_input(obs_for_value)
                     next_value_tensor = tf.cast(agent.critic(state_for_value, training=False), tf.float32)
-                    next_value_env = float(np.asarray(next_value_tensor.numpy()).reshape(-1)[0])
+                    next_value_scalar = agent._critic_values_to_scalar(next_value_tensor)
+                    next_value_scalar = agent._denormalize_value(next_value_scalar)
+                    next_value_env = float(np.asarray(next_value_scalar.numpy()).reshape(-1)[0])
 
                 advantages_env, returns_env = agent.compute_gae(
                     rewards_norm,
@@ -4035,6 +4701,19 @@ def run_experiment6_tape(
         risk_aux_sharpe_proxy_value = update_metrics.get("risk_aux_sharpe_proxy", 0.0)
         risk_aux_sharpe_loss_value = update_metrics.get("risk_aux_sharpe_loss", 0.0)
         risk_aux_mvo_loss_value = update_metrics.get("risk_aux_mvo_loss", 0.0)
+        risk_aux_cvar_proxy_value = update_metrics.get("risk_aux_cvar_proxy", 0.0)
+        risk_aux_cvar_loss_value = update_metrics.get("risk_aux_cvar_loss", 0.0)
+        risk_aux_cvar_coef_value = update_metrics.get("risk_aux_cvar_coef", 0.0)
+        mean_reward_raw_value = update_metrics.get("mean_reward_raw", 0.0)
+        mean_reward_shaped_value = update_metrics.get("mean_reward_shaped", 0.0)
+        multi_horizon_reward_bonus_mean_value = update_metrics.get("multi_horizon_reward_bonus_mean", 0.0)
+        multi_horizon_reward_bonus_std_value = update_metrics.get("multi_horizon_reward_bonus_std", 0.0)
+        multi_horizon_reward_bonus_max_value = update_metrics.get("multi_horizon_reward_bonus_max", 0.0)
+        reward_running_mean_value = update_metrics.get("reward_running_mean", 0.0)
+        reward_running_std_value = update_metrics.get("reward_running_std", 1.0)
+        returns_running_mean_value = update_metrics.get("returns_running_mean", 0.0)
+        returns_running_std_value = update_metrics.get("returns_running_std", 1.0)
+        popart_enabled_value = update_metrics.get("popart_enabled", 0.0)
         policy_entropy_value = update_metrics.get("entropy", 0.0)
         policy_loss_value = update_metrics.get("policy_loss", 0.0)
         entropy_loss_value = update_metrics.get("entropy_loss", 0.0)
@@ -4133,6 +4812,19 @@ def run_experiment6_tape(
             risk_aux_sharpe_proxy_val = to_scalar(risk_aux_sharpe_proxy_value)
             risk_aux_sharpe_loss_val = to_scalar(risk_aux_sharpe_loss_value)
             risk_aux_mvo_loss_val = to_scalar(risk_aux_mvo_loss_value)
+            risk_aux_cvar_proxy_val = to_scalar(risk_aux_cvar_proxy_value)
+            risk_aux_cvar_loss_val = to_scalar(risk_aux_cvar_loss_value)
+            risk_aux_cvar_coef_val = to_scalar(risk_aux_cvar_coef_value)
+            mean_reward_raw_val = to_scalar(mean_reward_raw_value)
+            mean_reward_shaped_val = to_scalar(mean_reward_shaped_value)
+            multi_horizon_reward_bonus_mean_val = to_scalar(multi_horizon_reward_bonus_mean_value)
+            multi_horizon_reward_bonus_std_val = to_scalar(multi_horizon_reward_bonus_std_value)
+            multi_horizon_reward_bonus_max_val = to_scalar(multi_horizon_reward_bonus_max_value)
+            reward_running_mean_val = to_scalar(reward_running_mean_value)
+            reward_running_std_val = to_scalar(reward_running_std_value)
+            returns_running_mean_val = to_scalar(returns_running_mean_value)
+            returns_running_std_val = to_scalar(returns_running_std_value)
+            popart_enabled_val = to_scalar(popart_enabled_value)
             mean_advantage_val = to_scalar(update_metrics.get("mean_advantage", 0.0))
             policy_entropy_val = to_scalar(policy_entropy_value)
             policy_loss_val = to_scalar(policy_loss_value)
@@ -4201,12 +4893,16 @@ def run_experiment6_tape(
                 f"risk_aux_total={risk_aux_total_val:.4f} | "
                 f"sharpe_proxy={risk_aux_sharpe_proxy_val:.4f} | "
                 f"sharpe_loss={risk_aux_sharpe_loss_val:.4f} | "
-                f"mvo_loss={risk_aux_mvo_loss_val:.4f}"
+                f"mvo_loss={risk_aux_mvo_loss_val:.4f} | "
+                f"cvar_proxy={risk_aux_cvar_proxy_val:.4f} | "
+                f"cvar_loss={risk_aux_cvar_loss_val:.4f} | "
+                f"cvar_coef={risk_aux_cvar_coef_val:.4f}"
             )
             print(
                 f"   ⚙️ Optimizer: actor_lr={agent.get_actor_lr():.6f} | "
                 f"critic_lr={agent.get_critic_lr():.6f} | target_kl={agent.target_kl:.4f} | "
-                f"rollout={current_timestep_rollout} | batch_size={current_batch_size_ppo}"
+                f"rollout={current_timestep_rollout} | batch_size={current_batch_size_ppo} | "
+                f"gamma={current_ppo_gamma:.4f} | gae_lambda={current_ppo_gae_lambda:.4f}"
             )
             if ra_kl_enabled:
                 effective_kl_threshold = float(agent.target_kl * agent.kl_stop_multiplier)
@@ -4289,7 +4985,22 @@ def run_experiment6_tape(
                 "risk_aux_sharpe_proxy": risk_aux_sharpe_proxy_val,
                 "risk_aux_sharpe_loss": risk_aux_sharpe_loss_val,
                 "risk_aux_mvo_loss": risk_aux_mvo_loss_val,
+                "risk_aux_cvar_proxy": risk_aux_cvar_proxy_val,
+                "risk_aux_cvar_loss": risk_aux_cvar_loss_val,
+                "risk_aux_cvar_coef": risk_aux_cvar_coef_val,
                 "mean_advantage": mean_advantage_val,
+                "mean_reward_raw": mean_reward_raw_val,
+                "mean_reward_shaped": mean_reward_shaped_val,
+                "multi_horizon_reward_bonus_mean": multi_horizon_reward_bonus_mean_val,
+                "multi_horizon_reward_bonus_std": multi_horizon_reward_bonus_std_val,
+                "multi_horizon_reward_bonus_max": multi_horizon_reward_bonus_max_val,
+                "reward_running_mean": reward_running_mean_val,
+                "reward_running_std": reward_running_std_val,
+                "returns_running_mean": returns_running_mean_val,
+                "returns_running_std": returns_running_std_val,
+                "popart_enabled": popart_enabled_val,
+                "ppo_gamma_active": float(current_ppo_gamma),
+                "ppo_gae_lambda_active": float(current_ppo_gae_lambda),
                 "profile_name": last_profile_name,
                 "turnover_scalar": current_turnover_scalar,
             }
@@ -4409,10 +5120,17 @@ def run_experiment6_tape(
             "🎯 Default selected checkpoint (best deterministic validation): "
             f"{selected_checkpoint_prefix_path}"
         )
-        print(
-            "   ↳ Selection basis: deterministic validation Sharpe "
-            f"{deterministic_validation_best_sharpe:.3f} at episode {deterministic_validation_best_episode}"
-        )
+        if deterministic_validation_multi_horizon_enabled_cfg:
+            print(
+                "   ↳ Selection basis: deterministic validation multi-horizon composite score "
+                f"{deterministic_validation_best_score:.3f} (primary Sharpe {deterministic_validation_best_sharpe:.3f}) "
+                f"at episode {deterministic_validation_best_episode}"
+            )
+        else:
+            print(
+                "   ↳ Selection basis: deterministic validation Sharpe "
+                f"{deterministic_validation_best_sharpe:.3f} at episode {deterministic_validation_best_episode}"
+            )
     else:
         print("🎯 Default selected checkpoint: final high-watermark-style checkpoint")
 
@@ -4430,11 +5148,19 @@ def run_experiment6_tape(
             seen_actor_paths.add(actor_path)
             unique_records.append(rec)
         if deterministic_validation_best_episode is not None and np.isfinite(deterministic_validation_best_sharpe):
-            checkpoint_description = (
-                f"Best deterministic-validation checkpoint episode {deterministic_validation_best_episode} "
-                f"(Val Sharpe={deterministic_validation_best_sharpe:.3f}); "
-                f"final checkpoint episode {training_episode_count} (Train Sharpe={final_sharpe:.3f})"
-            )
+            if deterministic_validation_multi_horizon_enabled_cfg and np.isfinite(deterministic_validation_best_score):
+                checkpoint_description = (
+                    f"Best deterministic-validation checkpoint episode {deterministic_validation_best_episode} "
+                    f"(Composite Score={deterministic_validation_best_score:.3f}, "
+                    f"Primary Val Sharpe={deterministic_validation_best_sharpe:.3f}); "
+                    f"final checkpoint episode {training_episode_count} (Train Sharpe={final_sharpe:.3f})"
+                )
+            else:
+                checkpoint_description = (
+                    f"Best deterministic-validation checkpoint episode {deterministic_validation_best_episode} "
+                    f"(Val Sharpe={deterministic_validation_best_sharpe:.3f}); "
+                    f"final checkpoint episode {training_episode_count} (Train Sharpe={final_sharpe:.3f})"
+                )
         else:
             checkpoint_description = (
                 f"Final high-watermark-style checkpoint episode {training_episode_count} "
@@ -4454,6 +5180,11 @@ def run_experiment6_tape(
                 "deterministic_validation_best_sharpe": (
                     float(deterministic_validation_best_sharpe)
                     if np.isfinite(deterministic_validation_best_sharpe)
+                    else None
+                ),
+                "deterministic_validation_best_score": (
+                    float(deterministic_validation_best_score)
+                    if np.isfinite(deterministic_validation_best_score)
                     else None
                 ),
                 "deterministic_validation_best_checkpoint_prefix": deterministic_validation_best_path,
@@ -4909,6 +5640,11 @@ def evaluate_experiment6_checkpoint(
         except Exception:
             pass
 
+    inferred_eval_quantiles = _infer_distributional_critic_quantiles_from_weights(critic_weights_path)
+    if inferred_eval_quantiles is not None and int(inferred_eval_quantiles) > 1:
+        agent_config_eval["distributional_critic_enabled"] = True
+        agent_config_eval["distributional_num_quantiles"] = int(inferred_eval_quantiles)
+
     print(
         "   🧭 Checkpoint architecture: "
         f"{agent_config_eval.get('actor_critic_type')} "
@@ -4941,6 +5677,23 @@ def evaluate_experiment6_checkpoint(
             f"dims={agent_config_eval.get('fusion_alpha_head_hidden_dims', [])} | "
             f"dropout={agent_config_eval.get('fusion_alpha_head_dropout', agent_config_eval.get('fusion_dropout'))}"
         )
+    print(
+        "   🧠 Eval recurrent memory: "
+        f"enabled={bool(agent_config_eval.get('recurrent_memory_enabled', False))} | "
+        f"units={agent_config_eval.get('recurrent_memory_units', 64)} | "
+        f"dropout={agent_config_eval.get('recurrent_memory_dropout', 0.1)}"
+    )
+    print(
+        "   🌐 Eval regime conditioning: "
+        f"enabled={bool(agent_config_eval.get('regime_conditioning_enabled', False))} | "
+        f"hidden_dim={agent_config_eval.get('regime_conditioning_hidden_dim', 32)} | "
+        f"dropout={agent_config_eval.get('regime_conditioning_dropout', 0.0)}"
+    )
+    print(
+        "   📉 Eval distributional critic: "
+        f"enabled={bool(agent_config_eval.get('distributional_critic_enabled', False))} | "
+        f"num_quantiles={agent_config_eval.get('distributional_num_quantiles', 17)}"
+    )
     print(
         "   🎛️ Eval dirichlet: "
         f"activation={agent_config_eval.get('dirichlet_alpha_activation')} | "

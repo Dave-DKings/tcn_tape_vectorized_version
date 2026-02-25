@@ -178,11 +178,68 @@ class PPOAgentTF:
         self.risk_aux_cash_return = float(ppo_params.get('risk_aux_cash_return', 0.0))
         self.risk_aux_sharpe_coef = float(ppo_params.get('risk_aux_sharpe_coef', 0.0))
         self.risk_aux_mvo_coef = float(ppo_params.get('risk_aux_mvo_coef', 0.0))
+        self.risk_aux_cvar_coef = float(max(ppo_params.get('risk_aux_cvar_coef', 0.0), 0.0))
+        self.risk_aux_cvar_coef_base = float(self.risk_aux_cvar_coef)
+        self.risk_aux_cvar_alpha = float(
+            np.clip(ppo_params.get('risk_aux_cvar_alpha', 0.05), 1e-3, 0.5)
+        )
+        self.risk_aux_cvar_adaptive_enabled = bool(ppo_params.get('risk_aux_cvar_adaptive_enabled', False))
+        self.risk_aux_cvar_target = float(ppo_params.get('risk_aux_cvar_target', 0.02))
+        self.risk_aux_cvar_adapt_lr = float(max(ppo_params.get('risk_aux_cvar_adapt_lr', 0.05), 0.0))
+        self.risk_aux_cvar_min_coef = float(max(ppo_params.get('risk_aux_cvar_min_coef', 0.0), 0.0))
+        self.risk_aux_cvar_max_coef = float(
+            max(
+                ppo_params.get(
+                    'risk_aux_cvar_max_coef',
+                    max(self.risk_aux_cvar_coef_base * 5.0, self.risk_aux_cvar_coef_base + 1e-6),
+                ),
+                self.risk_aux_cvar_min_coef,
+            )
+        )
         self.risk_aux_mvo_cov_ridge = float(ppo_params.get('risk_aux_mvo_cov_ridge', 1e-3))
         self.risk_aux_mvo_long_only = bool(ppo_params.get('risk_aux_mvo_long_only', True))
         self.risk_aux_mvo_risky_budget = float(
             np.clip(ppo_params.get('risk_aux_mvo_risky_budget', 0.95), 0.0, 1.0)
         )
+        self.distributional_critic_enabled = bool(config.get('distributional_critic_enabled', False))
+        self.distributional_num_quantiles = int(max(2, config.get('distributional_num_quantiles', 17)))
+        self.distributional_huber_kappa = float(max(ppo_params.get('distributional_huber_kappa', 1.0), 1e-3))
+        self.distributional_mean_loss_coef = float(max(ppo_params.get('distributional_mean_loss_coef', 0.1), 0.0))
+        self.popart_enabled = bool(ppo_params.get('popart_enabled', False))
+        self.popart_min_std = float(max(ppo_params.get('popart_min_std', 1e-3), 1e-6))
+        self.multi_horizon_reward_enabled = bool(ppo_params.get('multi_horizon_reward_enabled', False))
+        self.multi_horizon_reward_coef = float(max(ppo_params.get('multi_horizon_reward_coef', 0.0), 0.0))
+        raw_mh_horizons = ppo_params.get('multi_horizon_reward_horizons', [21, 63, 126, 252])
+        self.multi_horizon_reward_horizons = []
+        if isinstance(raw_mh_horizons, (list, tuple)):
+            for horizon in raw_mh_horizons:
+                try:
+                    h = int(horizon)
+                except (TypeError, ValueError):
+                    continue
+                if h > 0:
+                    self.multi_horizon_reward_horizons.append(h)
+        self.multi_horizon_reward_horizons = sorted(set(self.multi_horizon_reward_horizons))
+        raw_mh_weights = ppo_params.get('multi_horizon_reward_weights', [])
+        self.multi_horizon_reward_weights = []
+        if isinstance(raw_mh_weights, (list, tuple)):
+            for w in raw_mh_weights:
+                try:
+                    self.multi_horizon_reward_weights.append(float(w))
+                except (TypeError, ValueError):
+                    continue
+        if (
+            len(self.multi_horizon_reward_weights) != len(self.multi_horizon_reward_horizons)
+            or sum(self.multi_horizon_reward_weights) <= 0.0
+        ):
+            if self.multi_horizon_reward_horizons:
+                equal_w = 1.0 / float(len(self.multi_horizon_reward_horizons))
+                self.multi_horizon_reward_weights = [equal_w] * len(self.multi_horizon_reward_horizons)
+            else:
+                self.multi_horizon_reward_weights = []
+        else:
+            total_w = float(sum(self.multi_horizon_reward_weights))
+            self.multi_horizon_reward_weights = [max(0.0, w) / total_w for w in self.multi_horizon_reward_weights]
         
         # Create networks using architecture factory
         logger.info(f"Creating {self.architecture} actor-critic networks...")
@@ -225,11 +282,31 @@ class PPOAgentTF:
             f"value_clip={self.value_clip_range}, target_kl={self.target_kl:.4f}"
         )
         logger.info(
-            "  Risk aux: enabled=%s, sharpe_coef=%.4f, mvo_coef=%.4f, return_feature_idx=%d",
+            "  Risk aux: enabled=%s, sharpe_coef=%.4f, mvo_coef=%.4f, cvar_coef=%.4f, cvar_alpha=%.3f, cvar_adaptive=%s, return_feature_idx=%d",
             self.use_risk_aux_loss,
             self.risk_aux_sharpe_coef,
             self.risk_aux_mvo_coef,
+            self.risk_aux_cvar_coef,
+            self.risk_aux_cvar_alpha,
+            self.risk_aux_cvar_adaptive_enabled,
             self.risk_aux_return_feature_index,
+        )
+        logger.info(
+            "  Critic head: distributional=%s, quantiles=%d",
+            self.distributional_critic_enabled,
+            self.distributional_num_quantiles,
+        )
+        logger.info(
+            "  PopArt: enabled=%s, min_std=%.6f",
+            self.popart_enabled,
+            self.popart_min_std,
+        )
+        logger.info(
+            "  Multi-horizon reward decomposition: enabled=%s, coef=%.4f, horizons=%s, weights=%s",
+            self.multi_horizon_reward_enabled,
+            self.multi_horizon_reward_coef,
+            self.multi_horizon_reward_horizons,
+            [round(float(w), 4) for w in self.multi_horizon_reward_weights],
         )
         logger.info(
             f"  Learning rates (init): actor={self.get_actor_lr():.6f}, critic={self.get_critic_lr():.6f}"
@@ -523,6 +600,165 @@ class PPOAgentTF:
                 history.append(np.asarray(row, dtype=np.float32))
 
         return sequence
+
+    def _critic_values_to_scalar(self, critic_output):
+        """
+        Convert critic output to scalar value per sample.
+        Supports scalar critic (batch, 1) and distributional critic (batch, num_quantiles).
+        """
+        values = _to_tensor_with_cast(critic_output, tf.float32)
+        if values.shape.rank is None:
+            values = tf.reshape(values, (-1,))
+            return values
+        if values.shape.rank == 1:
+            return values
+        if values.shape.rank >= 2:
+            last_dim = values.shape[-1]
+            if self.distributional_critic_enabled or (last_dim is not None and int(last_dim) > 1):
+                return tf.reduce_mean(values, axis=-1)
+        if values.shape.rank >= 2:
+            return tf.squeeze(values, axis=-1)
+        return tf.squeeze(values, axis=-1)
+
+    def _denormalize_value(self, value, mean=None, std=None):
+        """Convert normalized critic output back to unnormalized value when PopArt is enabled."""
+        if not self.popart_enabled:
+            return value
+        if isinstance(value, tf.Tensor):
+            if mean is None:
+                mean_tf = tf.cast(self._returns_mean, value.dtype)
+            else:
+                mean_tf = _to_tensor_with_cast(mean, value.dtype)
+            if std is None:
+                std_tf = tf.cast(max(self._returns_std, self.popart_min_std), value.dtype)
+            else:
+                std_tf = tf.maximum(_to_tensor_with_cast(std, value.dtype), tf.cast(self.popart_min_std, value.dtype))
+            return value * std_tf + mean_tf
+        mean = float(self._returns_mean if mean is None else mean)
+        std = float(max(self._returns_std if std is None else std, self.popart_min_std))
+        return np.asarray(value, dtype=np.float32) * std + mean
+
+    def _get_critic_output_layer(self):
+        """Best-effort access to the critic output Dense layer for PopArt rescaling."""
+        direct = getattr(self.critic, "output_layer", None)
+        if isinstance(direct, tf.keras.layers.Dense):
+            return direct
+        for layer in reversed(getattr(self.critic, "layers", [])):
+            if isinstance(layer, tf.keras.layers.Dense):
+                return layer
+        return None
+
+    def _apply_popart_rescale(self, old_mean, old_std, new_mean, new_std):
+        """Rescale critic output layer so unnormalized value predictions stay consistent."""
+        if not self.popart_enabled:
+            return
+        layer = self._get_critic_output_layer()
+        if layer is None:
+            return
+        try:
+            weights = layer.get_weights()
+            if len(weights) < 2:
+                return
+            kernel, bias = weights[0], weights[1]
+            scale = float(old_std) / float(max(new_std, self.popart_min_std))
+            kernel = np.asarray(kernel, dtype=np.float32) * scale
+            bias = (
+                float(old_std) * np.asarray(bias, dtype=np.float32)
+                + float(old_mean)
+                - float(new_mean)
+            ) / float(max(new_std, self.popart_min_std))
+            layer.set_weights([kernel, bias])
+        except Exception as exc:
+            logger.debug("PopArt rescale skipped: %s", exc)
+
+    def _update_returns_stats(self, returns):
+        """Update return running statistics and apply PopArt rescaling if enabled."""
+        std_floor = self.popart_min_std if self.popart_enabled else 1e-6
+        old_mean = float(self._returns_mean)
+        old_std = float(max(self._returns_std, std_floor))
+
+        self.returns_rms.update(returns)
+        new_mean = float(self.returns_rms.mean)
+        new_std = float(max(self.returns_rms.std, std_floor))
+
+        self._apply_popart_rescale(old_mean, old_std, new_mean, new_std)
+        self._returns_mean = new_mean
+        self._returns_std = new_std
+
+    def _apply_multi_horizon_reward_decomposition(self, raw_rewards):
+        """
+        Add sparse milestone bonuses from multiple sub-episode horizons.
+        """
+        rewards = np.asarray(raw_rewards, dtype=np.float32).reshape(-1)
+        bonus = np.zeros_like(rewards, dtype=np.float32)
+        if (
+            rewards.size == 0
+            or not self.multi_horizon_reward_enabled
+            or self.multi_horizon_reward_coef <= 0.0
+            or not self.multi_horizon_reward_horizons
+        ):
+            return rewards, bonus
+
+        csum = np.concatenate(([0.0], np.cumsum(rewards, dtype=np.float64)))
+        n = int(rewards.shape[0])
+        for horizon, weight in zip(self.multi_horizon_reward_horizons, self.multi_horizon_reward_weights):
+            if horizon <= 0 or weight <= 0.0:
+                continue
+            milestone_indices = list(range(horizon - 1, n, horizon))
+            if (n - 1) not in milestone_indices:
+                milestone_indices.append(n - 1)
+            for idx in milestone_indices:
+                start = max(0, idx - horizon + 1)
+                window_return = float(csum[idx + 1] - csum[start])
+                bonus[idx] += float(weight) * window_return
+
+        shaped_rewards = rewards + float(self.multi_horizon_reward_coef) * bonus
+        return shaped_rewards.astype(np.float32), bonus.astype(np.float32)
+
+    def shape_rewards_for_update(self, raw_rewards):
+        """Public wrapper used by external rollout collectors for GAE consistency."""
+        return self._apply_multi_horizon_reward_decomposition(raw_rewards)
+
+    def _distributional_quantile_loss(self, pred_quantiles, target_values):
+        """
+        Quantile Huber loss for distributional critic.
+
+        Args:
+            pred_quantiles: (batch, num_quantiles) normalized predictions
+            target_values: (batch,) normalized scalar returns
+        """
+        pred_quantiles = _to_tensor_with_cast(pred_quantiles, tf.float32)
+        target_values = _to_tensor_with_cast(target_values, tf.float32)
+        target_values = tf.reshape(target_values, (-1, 1))
+
+        num_q = tf.maximum(tf.shape(pred_quantiles)[-1], 1)
+        tau = (tf.cast(tf.range(num_q), tf.float32) + 0.5) / tf.cast(num_q, tf.float32)
+        tau = tf.reshape(tau, (1, -1))
+
+        td_error = target_values - pred_quantiles
+        abs_td = tf.abs(td_error)
+        kappa = tf.cast(self.distributional_huber_kappa, tf.float32)
+        huber = tf.where(
+            abs_td <= kappa,
+            0.5 * tf.square(td_error),
+            kappa * (abs_td - 0.5 * kappa),
+        )
+        quantile_weight = tf.abs(tau - tf.cast(td_error < 0.0, tf.float32))
+        return tf.reduce_mean(quantile_weight * huber)
+
+    def _update_adaptive_cvar_coef(self, observed_cvar_proxy):
+        """
+        Adapt CVaR auxiliary coefficient toward target tail-risk level.
+        """
+        if not self.risk_aux_cvar_adaptive_enabled:
+            return
+        observed = float(observed_cvar_proxy)
+        if not np.isfinite(observed):
+            return
+        error = observed - float(self.risk_aux_cvar_target)
+        new_coef = float(self.risk_aux_cvar_coef) + float(self.risk_aux_cvar_adapt_lr) * error
+        new_coef = float(np.clip(new_coef, self.risk_aux_cvar_min_coef, self.risk_aux_cvar_max_coef))
+        self.risk_aux_cvar_coef = new_coef
     
     def get_action_and_value(self, state, deterministic=False, stochastic=False, evaluation_mode='mean_plus_noise'):
         """
@@ -618,8 +854,9 @@ class PPOAgentTF:
         
         # Get value estimate
         value = self.critic(state_input, training=False)
-        value = _to_tensor_with_cast(value, tf.float32)
-        
+        value = self._critic_values_to_scalar(value)
+        value = self._denormalize_value(value)
+
         # Squeeze batch dimension if needed
         if needs_squeeze:
             action = tf.squeeze(action, 0)
@@ -710,8 +947,8 @@ class PPOAgentTF:
 
         log_prob = dirichlet.log_prob(action)
         value = self.critic(prepared_state, training=False)
-        value = _to_tensor_with_cast(value, tf.float32)
-        value = tf.squeeze(value, axis=-1)
+        value = self._critic_values_to_scalar(value)
+        value = self._denormalize_value(value)
 
         return (
             np.asarray(action.numpy(), dtype=np.float32),
@@ -988,25 +1225,26 @@ class PPOAgentTF:
         Components:
           - Sharpe surrogate: maximize batch Sharpe of actor-implied one-step proxy returns.
           - MVO regularizer: pull actor risky weights toward a long-only MVO target.
+          - CVaR tail-risk penalty: minimize expected loss in worst alpha-fraction of samples.
         """
         zero = tf.constant(0.0, dtype=tf.float32)
         if not self.use_risk_aux_loss:
-            return zero, zero, zero, zero
+            return zero, zero, zero, zero, zero, zero
 
         asset_returns = self._extract_asset_return_proxy(states)
         if asset_returns is None:
-            return zero, zero, zero, zero
+            return zero, zero, zero, zero, zero, zero
 
         alpha = _to_tensor_with_cast(alpha, tf.float32)
         weights = alpha / tf.maximum(tf.reduce_sum(alpha, axis=-1, keepdims=True), 1e-8)
         risky_weights = weights[:, :self.num_assets]
         cash_weights = weights[:, self.num_assets]
+        cash_ret = tf.constant(self.risk_aux_cash_return, dtype=tf.float32)
+        portfolio_proxy_returns = tf.reduce_sum(risky_weights * asset_returns, axis=-1) + cash_weights * cash_ret
 
         sharpe_proxy = tf.constant(0.0, dtype=tf.float32)
         sharpe_loss = tf.constant(0.0, dtype=tf.float32)
         if self.risk_aux_sharpe_coef > 0.0:
-            cash_ret = tf.constant(self.risk_aux_cash_return, dtype=tf.float32)
-            portfolio_proxy_returns = tf.reduce_sum(risky_weights * asset_returns, axis=-1) + cash_weights * cash_ret
             mu_p = tf.reduce_mean(portfolio_proxy_returns)
             sigma_p = tf.math.reduce_std(portfolio_proxy_returns)
             sharpe_proxy = mu_p / (sigma_p + 1e-6)
@@ -1019,8 +1257,26 @@ class PPOAgentTF:
             cash_mse = tf.reduce_mean(tf.square(cash_weights - target_cash))
             mvo_loss = tf.constant(self.risk_aux_mvo_coef, dtype=tf.float32) * (risky_mse + cash_mse)
 
-        total_aux = sharpe_loss + mvo_loss
-        return total_aux, sharpe_proxy, sharpe_loss, mvo_loss
+        cvar_proxy = tf.constant(0.0, dtype=tf.float32)
+        cvar_loss = tf.constant(0.0, dtype=tf.float32)
+        if self.risk_aux_cvar_coef > 0.0:
+            # Tail losses: larger values mean worse outcomes. Penalize expected tail loss (CVaR).
+            losses = -portfolio_proxy_returns
+            sorted_losses = tf.sort(losses, direction="DESCENDING")
+            n_samples = tf.shape(sorted_losses)[0]
+            n_samples_safe = tf.maximum(n_samples, 1)
+            tail_frac = tf.constant(self.risk_aux_cvar_alpha, dtype=tf.float32)
+            tail_count = tf.cast(
+                tf.math.ceil(tail_frac * tf.cast(n_samples_safe, tf.float32)),
+                tf.int32,
+            )
+            tail_count = tf.clip_by_value(tail_count, 1, n_samples_safe)
+            tail_losses = sorted_losses[:tail_count]
+            cvar_proxy = tf.reduce_mean(tail_losses)
+            cvar_loss = tf.constant(self.risk_aux_cvar_coef, dtype=tf.float32) * cvar_proxy
+
+        total_aux = sharpe_loss + mvo_loss + cvar_loss
+        return total_aux, sharpe_proxy, sharpe_loss, mvo_loss, cvar_proxy, cvar_loss
 
     # @tf.function  # DISABLED: Causes weight caching issues with PPO ratio stuck at 1.0
     def _actor_loss(self, states, actions, log_probs_old, advantages):
@@ -1072,7 +1328,14 @@ class PPOAgentTF:
         entropy = tf.reduce_mean(dirichlet.entropy())
         entropy_loss = -self.entropy_coef * entropy
         
-        risk_aux_total, sharpe_aux_proxy, sharpe_aux_loss, mvo_aux_loss = self._compute_risk_aux_loss(states, alpha)
+        (
+            risk_aux_total,
+            sharpe_aux_proxy,
+            sharpe_aux_loss,
+            mvo_aux_loss,
+            cvar_aux_proxy,
+            cvar_aux_loss,
+        ) = self._compute_risk_aux_loss(states, alpha)
         total_loss = policy_loss + entropy_loss + risk_aux_total
         
         approx_kl = tf.reduce_mean(log_probs_old - log_probs_new)
@@ -1092,6 +1355,8 @@ class PPOAgentTF:
             sharpe_aux_proxy,
             sharpe_aux_loss,
             mvo_aux_loss,
+            cvar_aux_proxy,
+            cvar_aux_loss,
         )
     
     @tf.function(reduce_retracing=True)
@@ -1109,9 +1374,9 @@ class PPOAgentTF:
         Returns:
             critic_loss: MSE loss between predicted and target values
         """
-        values = self.critic(states, training=True)
-        values = _to_tensor_with_cast(values, tf.float32)
-        values = tf.squeeze(values, -1)  # Remove last dimension
+        values_raw = self.critic(states, training=True)
+        values_raw = _to_tensor_with_cast(values_raw, tf.float32)
+        values = self._critic_values_to_scalar(values_raw)
 
         returns_mean = _to_tensor_with_cast(returns_mean, tf.float32)
         returns_std = _to_tensor_with_cast(returns_std, tf.float32)
@@ -1121,33 +1386,49 @@ class PPOAgentTF:
         returns_centered = returns - returns_mean
         returns_norm = returns_centered / returns_std
 
-        values_centered = values - returns_mean
-        values_norm = values_centered / returns_std
+        if self.popart_enabled:
+            values_norm = values
+            values_unnorm = self._denormalize_value(values_norm, mean=returns_mean, std=returns_std)
+        else:
+            values_centered = values - returns_mean
+            values_norm = values_centered / returns_std
+            values_unnorm = values
 
         clip_fraction = tf.constant(0.0, dtype=tf.float32)
-        if (
-            self.value_clip_range is not None
-            and self.value_clip_range > 0.0
-            and old_values is not None
-        ):
-            old_values = _to_tensor_with_cast(old_values, tf.float32)
-            old_values = tf.reshape(old_values, tf.shape(values))
-            values_clipped = old_values + tf.clip_by_value(
-                values - old_values,
-                -self.value_clip_range,
-                self.value_clip_range
-            )
-            values_clipped_norm = (values_clipped - returns_mean) / returns_std
-            clip_fraction = tf.reduce_mean(
-                tf.cast(tf.abs(values - old_values) > self.value_clip_range, tf.float32)
-            )
-
-            loss_unclipped = tf.square(returns_norm - values_norm)
-            loss_clipped = tf.square(returns_norm - values_clipped_norm)
-            loss = tf.reduce_mean(tf.maximum(loss_unclipped, loss_clipped))
+        if self.distributional_critic_enabled:
+            if self.popart_enabled:
+                pred_quantiles_norm = values_raw
+            else:
+                pred_quantiles_norm = (values_raw - returns_mean) / returns_std
+            if pred_quantiles_norm.shape.rank == 1:
+                pred_quantiles_norm = tf.expand_dims(pred_quantiles_norm, axis=-1)
+            q_loss = self._distributional_quantile_loss(pred_quantiles_norm, returns_norm)
+            scalar_anchor_loss = tf.reduce_mean(tf.square(returns_norm - values_norm))
+            loss = q_loss + tf.cast(self.distributional_mean_loss_coef, tf.float32) * scalar_anchor_loss
         else:
-            # MSE loss on centered values
-            loss = tf.reduce_mean(tf.square(returns_norm - values_norm))
+            if (
+                self.value_clip_range is not None
+                and self.value_clip_range > 0.0
+                and old_values is not None
+            ):
+                old_values = _to_tensor_with_cast(old_values, tf.float32)
+                old_values = tf.reshape(old_values, tf.shape(values_unnorm))
+                values_clipped_unnorm = old_values + tf.clip_by_value(
+                    values_unnorm - old_values,
+                    -self.value_clip_range,
+                    self.value_clip_range
+                )
+                values_clipped_norm = (values_clipped_unnorm - returns_mean) / returns_std
+                clip_fraction = tf.reduce_mean(
+                    tf.cast(tf.abs(values_unnorm - old_values) > self.value_clip_range, tf.float32)
+                )
+
+                loss_unclipped = tf.square(returns_norm - values_norm)
+                loss_clipped = tf.square(returns_norm - values_clipped_norm)
+                loss = tf.reduce_mean(tf.maximum(loss_unclipped, loss_clipped))
+            else:
+                # MSE loss on centered values
+                loss = tf.reduce_mean(tf.square(returns_norm - values_norm))
         
         return loss, clip_fraction
     
@@ -1186,16 +1467,17 @@ class PPOAgentTF:
             print(f"   Values: min={values.min():.4f}, max={values.max():.4f}")
             print(f"   Value mean: {np.mean(values):.4f}, std: {np.std(values):.4f}")
 
-        # Apply running z-score normalization to rewards
+        # Optional multi-horizon sub-episode reward decomposition before normalization.
         raw_rewards = rewards.copy()
+        shaped_rewards, mh_bonus = self._apply_multi_horizon_reward_decomposition(raw_rewards)
         # Use previous running stats to normalize current batch
         prev_mean = self._reward_mean
         prev_std = max(self._reward_std, 1e-1)
-        rewards = (raw_rewards - prev_mean) / prev_std
+        rewards = (shaped_rewards - prev_mean) / prev_std
         rewards = np.clip(rewards, -5.0, 5.0)
 
         # Update running statistics AFTER normalization so the next batch sees updated stats
-        self.reward_rms.update(raw_rewards)
+        self.reward_rms.update(shaped_rewards)
         self._reward_mean = float(self.reward_rms.mean)
         self._reward_std = float(max(self.reward_rms.std, 1e-1))
 
@@ -1205,6 +1487,11 @@ class PPOAgentTF:
                 f"   Normalized rewards: min={rewards.min():.6f}, max={rewards.max():.6f}, "
                 f"mean={np.mean(rewards):.6f}, std={np.std(rewards):.6f}"
             )
+            if self.multi_horizon_reward_enabled and self.multi_horizon_reward_coef > 0.0:
+                print(
+                    f"   Multi-horizon bonus: mean={np.mean(mh_bonus):.6f}, std={np.std(mh_bonus):.6f}, "
+                    f"max={np.max(mh_bonus):.6f}"
+                )
         
         values_old = values.copy()
         if precomputed_gae is not None:
@@ -1244,9 +1531,7 @@ class PPOAgentTF:
             print(f"   Normalized adv mean: {np.mean(advantages):.6f}, std: {np.std(advantages):.6f}")
 
         # Update running statistics for critic targets before tensor conversion
-        self.returns_rms.update(returns)
-        self._returns_mean = float(self.returns_rms.mean)
-        self._returns_std = float(max(self.returns_rms.std, 1e-6))
+        self._update_returns_stats(returns)
         
         # Convert to tensors
         returns_np = returns.copy()
@@ -1270,12 +1555,19 @@ class PPOAgentTF:
             'risk_aux_sharpe_proxy': 0.0,
             'risk_aux_sharpe_loss': 0.0,
             'risk_aux_mvo_loss': 0.0,
+            'risk_aux_cvar_proxy': 0.0,
+            'risk_aux_cvar_loss': 0.0,
+            'risk_aux_cvar_coef': float(self.risk_aux_cvar_coef),
             'policy_loss': 0.0,
             'entropy_loss': 0.0,
             'entropy': 0.0,
             'mean_advantage': float(tf.reduce_mean(advantages)),
             'mean_return': float(tf.reduce_mean(returns)),
             'mean_reward_raw': float(np.mean(raw_rewards)),
+            'mean_reward_shaped': float(np.mean(shaped_rewards)),
+            'multi_horizon_reward_bonus_mean': float(np.mean(mh_bonus)),
+            'multi_horizon_reward_bonus_std': float(np.std(mh_bonus)),
+            'multi_horizon_reward_bonus_max': float(np.max(mh_bonus)) if mh_bonus.size > 0 else 0.0,
             'reward_running_mean': self._reward_mean,
             'reward_running_std': self._reward_std,
             # Diagnostic statistics (raw advantages before normalization)
@@ -1298,6 +1590,7 @@ class PPOAgentTF:
             # Running statistics for critic normalization
             'returns_running_mean': self._returns_mean,
             'returns_running_std': self._returns_std,
+            'popart_enabled': float(self.popart_enabled),
             'num_grad_updates': 0,
             'explained_variance': 0.0,
             'early_stop_kl_triggered': 0.0,
@@ -1350,6 +1643,8 @@ class PPOAgentTF:
                         sharpe_aux_proxy,
                         sharpe_aux_loss,
                         mvo_aux_loss,
+                        cvar_aux_proxy,
+                        cvar_aux_loss,
                     ) = self._actor_loss(
                         batch_states, batch_actions, batch_log_probs_old, batch_advantages
                     )
@@ -1396,6 +1691,11 @@ class PPOAgentTF:
                 stats['risk_aux_sharpe_proxy'] += float(sharpe_aux_proxy)
                 stats['risk_aux_sharpe_loss'] += float(sharpe_aux_loss)
                 stats['risk_aux_mvo_loss'] += float(mvo_aux_loss)
+                stats['risk_aux_cvar_proxy'] += float(cvar_aux_proxy)
+                stats['risk_aux_cvar_loss'] += float(cvar_aux_loss)
+                if self.risk_aux_cvar_adaptive_enabled:
+                    self._update_adaptive_cvar_coef(float(cvar_aux_proxy))
+                stats['risk_aux_cvar_coef'] = float(self.risk_aux_cvar_coef)
                 stats['policy_loss'] += float(policy_loss)
                 stats['entropy_loss'] += float(entropy_loss)
                 stats['entropy'] += float(entropy)
@@ -1447,6 +1747,7 @@ class PPOAgentTF:
         if num_updates > 0:
             for key in ['actor_loss', 'critic_loss', 'critic_loss_scaled',
                        'risk_aux_total', 'risk_aux_sharpe_proxy', 'risk_aux_sharpe_loss', 'risk_aux_mvo_loss',
+                       'risk_aux_cvar_proxy', 'risk_aux_cvar_loss',
                        'policy_loss', 'entropy_loss', 'entropy',
                        'actor_grad_norm', 'critic_grad_norm', 'alpha_min', 'alpha_max', 'alpha_mean', 'alpha_std',
                        'ratio_mean', 'ratio_std', 'approx_kl', 'clip_fraction', 'value_clip_fraction']:
@@ -1460,7 +1761,8 @@ class PPOAgentTF:
         
         values_post = self.critic(states, training=False)
         returns_np = np.asarray(returns_np, dtype=np.float32)
-        values_post = tf.squeeze(values_post, -1).numpy()
+        values_post = self._critic_values_to_scalar(values_post)
+        values_post = self._denormalize_value(values_post).numpy()
         returns_var = np.var(returns_np)
         if returns_var > 1e-8:
             stats['explained_variance'] = float(

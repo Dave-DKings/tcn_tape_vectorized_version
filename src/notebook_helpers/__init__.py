@@ -22,6 +22,13 @@ from .backtests import (
     run_backtest_walk_forward,
     describe_backtest_helpers,
 )
+from .feature_signal import (
+    FeatureSignalReport,
+    add_forward_returns,
+    compute_feature_signal_report,
+    save_feature_signal_report,
+    describe_top_features,
+)
 
 __all__ = [
     "configure_episode_length_curriculum",
@@ -42,4 +49,9 @@ __all__ = [
     "run_backtest_stochastic",
     "run_backtest_walk_forward",
     "describe_backtest_helpers",
+    "FeatureSignalReport",
+    "add_forward_returns",
+    "compute_feature_signal_report",
+    "save_feature_signal_report",
+    "describe_top_features",
 ]

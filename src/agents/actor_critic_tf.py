@@ -36,8 +36,18 @@ _DEFAULT_FUSION_CROSS_ASSET_MIXER_ENABLED = bool(_DEFAULT_AGENT_PARAMS.get('fusi
 _DEFAULT_FUSION_CROSS_ASSET_MIXER_LAYERS = int(_DEFAULT_AGENT_PARAMS.get('fusion_cross_asset_mixer_layers', 1))
 _DEFAULT_FUSION_CROSS_ASSET_MIXER_EXPANSION = float(_DEFAULT_AGENT_PARAMS.get('fusion_cross_asset_mixer_expansion', 2.0))
 _DEFAULT_FUSION_CROSS_ASSET_MIXER_DROPOUT = _DEFAULT_AGENT_PARAMS.get('fusion_cross_asset_mixer_dropout', _DEFAULT_FUSION_DROPOUT)
+_DEFAULT_RECURRENT_MEMORY_ENABLED = bool(_DEFAULT_AGENT_PARAMS.get('recurrent_memory_enabled', False))
+_DEFAULT_RECURRENT_MEMORY_UNITS = int(_DEFAULT_AGENT_PARAMS.get('recurrent_memory_units', 64))
+_DEFAULT_RECURRENT_MEMORY_DROPOUT = float(_DEFAULT_AGENT_PARAMS.get('recurrent_memory_dropout', _DEFAULT_TCN_DROPOUT))
+_DEFAULT_REGIME_CONDITIONING_ENABLED = bool(_DEFAULT_AGENT_PARAMS.get('regime_conditioning_enabled', False))
+_DEFAULT_REGIME_CONDITIONING_HIDDEN_DIM = int(_DEFAULT_AGENT_PARAMS.get('regime_conditioning_hidden_dim', 32))
+_DEFAULT_REGIME_CONDITIONING_DROPOUT = float(_DEFAULT_AGENT_PARAMS.get('regime_conditioning_dropout', 0.0))
+_DEFAULT_STATE_AUGMENTATION_ENABLED = bool(_DEFAULT_AGENT_PARAMS.get('state_augmentation_enabled', False))
+_DEFAULT_DISTRIBUTIONAL_CRITIC_ENABLED = bool(_DEFAULT_AGENT_PARAMS.get('distributional_critic_enabled', False))
+_DEFAULT_DISTRIBUTIONAL_NUM_QUANTILES = int(_DEFAULT_AGENT_PARAMS.get('distributional_num_quantiles', 17))
 _DEFAULT_ALPHA_ACTIVATION = _DEFAULT_AGENT_PARAMS.get('dirichlet_alpha_activation', 'elu')
 _DEFAULT_EXP_CLIP = tuple(_DEFAULT_AGENT_PARAMS.get('dirichlet_exp_clip', (-5.0, 3.0)))
+_RUNTIME_STATE_AUGMENTATION_ENABLED = _DEFAULT_STATE_AUGMENTATION_ENABLED
 
 
 def _to_tensor_with_cast(value: Any, dtype: Optional[tf.dtypes.DType] = None) -> tf.Tensor:
@@ -330,6 +340,65 @@ def _flatten_structured_sequence_input(state: Any) -> tf.Tensor:
     return tf.concat([asset_flat, context], axis=-1)
 
 
+def _compute_regime_summary_features(
+    sequence: tf.Tensor,
+    *,
+    include_state_augmentation: Optional[bool] = None,
+) -> tf.Tensor:
+    """
+    Compact regime descriptor from a sequence tensor of shape (batch, timesteps, features).
+    Produces a fixed-width summary per sample (5D base, 9D with augmentation).
+    """
+    x = _to_tensor_with_cast(sequence, tf.float32)
+    if x.shape.rank != 3:
+        raise ValueError(f"Regime summary expects rank-3 sequence, got {x.shape}")
+
+    mean_level = tf.reduce_mean(x, axis=[1, 2])
+    std_level = tf.math.reduce_std(x, axis=[1, 2])
+    first_step = tf.reduce_mean(x[:, 0, :], axis=-1)
+    last_step = tf.reduce_mean(x[:, -1, :], axis=-1)
+    trend_level = last_step - first_step
+    diffs = x[:, 1:, :] - x[:, :-1, :]
+    diff_count = tf.cast(tf.shape(diffs)[1] * tf.shape(diffs)[2], x.dtype)
+    diff_scale = tf.reduce_sum(tf.abs(diffs), axis=[1, 2]) / tf.maximum(diff_count, 1.0)
+    abs_level = tf.reduce_mean(tf.abs(x), axis=[1, 2])
+    base_features = [mean_level, std_level, trend_level, diff_scale, abs_level]
+
+    if include_state_augmentation is None:
+        include_state_augmentation = bool(_RUNTIME_STATE_AUGMENTATION_ENABLED)
+    if not include_state_augmentation:
+        return tf.stack(base_features, axis=-1)
+
+    # Augmentation proxies are derived from sequence-level dynamics, no env schema changes required.
+    step_signal = tf.reduce_mean(x, axis=-1)  # (batch, timesteps)
+    neg_signal = tf.minimum(step_signal, 0.0)
+    downside_semidev = tf.sqrt(tf.reduce_mean(tf.square(neg_signal), axis=1) + 1e-8)
+
+    cum_signal = tf.cumsum(step_signal, axis=1)
+    running_peak = tf.scan(
+        lambda prev, curr: tf.maximum(prev, curr),
+        tf.transpose(cum_signal, perm=[1, 0]),
+        initializer=cum_signal[:, 0],
+    )
+    running_peak = tf.transpose(running_peak, perm=[1, 0])
+    drawdown = cum_signal - running_peak
+    max_drawdown_proxy = tf.reduce_min(drawdown, axis=1)
+
+    drawdown_deltas = drawdown[:, 1:] - drawdown[:, :-1]
+    drawdown_velocity_proxy = tf.reduce_mean(drawdown_deltas, axis=1)
+
+    steps = tf.shape(step_signal)[1]
+    time_axis = tf.linspace(tf.cast(0.0, x.dtype), tf.cast(1.0, x.dtype), tf.maximum(steps, 1))
+    maturity_centered = (2.0 * time_axis) - 1.0
+    late_early_trend = tf.reduce_mean(step_signal * maturity_centered[tf.newaxis, :], axis=1)
+
+    return tf.stack(
+        base_features
+        + [downside_semidev, max_drawdown_proxy, drawdown_velocity_proxy, late_early_trend],
+        axis=-1,
+    )
+
+
 # ============================================================================
 # ACTOR NETWORKS
 # ============================================================================
@@ -488,6 +557,12 @@ class TCNActor(DirichletActor):
         kernel_size: int = None,
         dilations: List[int] = None,
         dropout: float = None,
+        recurrent_memory_enabled: Optional[bool] = None,
+        recurrent_memory_units: Optional[int] = None,
+        recurrent_memory_dropout: Optional[float] = None,
+        regime_conditioning_enabled: Optional[bool] = None,
+        regime_conditioning_hidden_dim: Optional[int] = None,
+        regime_conditioning_dropout: Optional[float] = None,
         name: str = "tcn_actor",
         epsilon_start: float = 0.5,
         epsilon_min: float = 0.1,
@@ -510,6 +585,18 @@ class TCNActor(DirichletActor):
             dilations = _DEFAULT_TCN_DILATIONS
         if dropout is None:
             dropout = _DEFAULT_TCN_DROPOUT
+        if recurrent_memory_enabled is None:
+            recurrent_memory_enabled = _DEFAULT_RECURRENT_MEMORY_ENABLED
+        if recurrent_memory_units is None:
+            recurrent_memory_units = _DEFAULT_RECURRENT_MEMORY_UNITS
+        if recurrent_memory_dropout is None:
+            recurrent_memory_dropout = _DEFAULT_RECURRENT_MEMORY_DROPOUT
+        if regime_conditioning_enabled is None:
+            regime_conditioning_enabled = _DEFAULT_REGIME_CONDITIONING_ENABLED
+        if regime_conditioning_hidden_dim is None:
+            regime_conditioning_hidden_dim = _DEFAULT_REGIME_CONDITIONING_HIDDEN_DIM
+        if regime_conditioning_dropout is None:
+            regime_conditioning_dropout = _DEFAULT_REGIME_CONDITIONING_DROPOUT
         
         super(TCNActor, self).__init__(
             name=name,
@@ -528,6 +615,8 @@ class TCNActor(DirichletActor):
         
         self.input_dim = input_dim
         self.num_actions = num_actions
+        self.recurrent_memory_enabled = bool(recurrent_memory_enabled)
+        self.regime_conditioning_enabled = bool(regime_conditioning_enabled)
         
         # Build TCN blocks
         self.tcn_blocks = []
@@ -541,9 +630,36 @@ class TCNActor(DirichletActor):
                     name=f'{name}_tcn_{i}'
                 )
             )
-        
+
+        self.memory_layer = None
+        if self.recurrent_memory_enabled:
+            self.memory_layer = layers.LSTM(
+                units=max(8, int(recurrent_memory_units)),
+                return_sequences=True,
+                dropout=float(max(0.0, recurrent_memory_dropout)),
+                name=f"{name}_memory_lstm",
+            )
+
         # Global pooling
         self.global_pool = layers.GlobalAveragePooling1D()
+        self.regime_encoder = None
+        self.regime_fusion = None
+        self.regime_dropout = None
+        if self.regime_conditioning_enabled:
+            hidden_dim = max(8, int(regime_conditioning_hidden_dim))
+            self.regime_encoder = tf.keras.Sequential(
+                [
+                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense1"),
+                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense2"),
+                ],
+                name=f"{name}_regime_encoder",
+            )
+            self.regime_fusion = layers.Dense(
+                int(tcn_filters[-1]),
+                activation="relu",
+                name=f"{name}_regime_fusion",
+            )
+            self.regime_dropout = layers.Dropout(float(max(0.0, regime_conditioning_dropout)))
         
         # Output layer
         self.output_layer = layers.Dense(
@@ -567,12 +683,24 @@ class TCNActor(DirichletActor):
         # TCN processing
         for block in self.tcn_blocks:
             x = block(x, training=training)
-        
+
+        if self.memory_layer is not None:
+            x = self.memory_layer(x, training=training)
+
+        regime_seq = x
+
         # x is now (batch, timesteps, tcn_filters[-1])
-        
+
         # Aggregate sequence
         x = self.global_pool(x)  # (batch, tcn_filters[-1])
-        
+
+        if self.regime_encoder is not None and self.regime_fusion is not None:
+            regime_summary = _compute_regime_summary_features(regime_seq)
+            regime_embed = self.regime_encoder(regime_summary, training=training)
+            x = self.regime_fusion(tf.concat([x, regime_embed], axis=-1), training=training)
+            if self.regime_dropout is not None:
+                x = self.regime_dropout(x, training=training)
+
         # Output
         logits = self.output_layer(x, training=training)
         return self._compute_alpha(logits)
@@ -598,6 +726,12 @@ class TCNAttentionActor(DirichletActor):
         attention_heads: int = None,
         attention_dim: int = None,
         dropout: float = None,
+        recurrent_memory_enabled: Optional[bool] = None,
+        recurrent_memory_units: Optional[int] = None,
+        recurrent_memory_dropout: Optional[float] = None,
+        regime_conditioning_enabled: Optional[bool] = None,
+        regime_conditioning_hidden_dim: Optional[int] = None,
+        regime_conditioning_dropout: Optional[float] = None,
         name: str = "tcn_attention_actor",
         epsilon_start: float = 0.5,
         epsilon_min: float = 0.1,
@@ -624,6 +758,18 @@ class TCNAttentionActor(DirichletActor):
             attention_dim = _DEFAULT_ATTENTION_DIM
         if dropout is None:
             dropout = _DEFAULT_TCN_DROPOUT
+        if recurrent_memory_enabled is None:
+            recurrent_memory_enabled = _DEFAULT_RECURRENT_MEMORY_ENABLED
+        if recurrent_memory_units is None:
+            recurrent_memory_units = _DEFAULT_RECURRENT_MEMORY_UNITS
+        if recurrent_memory_dropout is None:
+            recurrent_memory_dropout = _DEFAULT_RECURRENT_MEMORY_DROPOUT
+        if regime_conditioning_enabled is None:
+            regime_conditioning_enabled = _DEFAULT_REGIME_CONDITIONING_ENABLED
+        if regime_conditioning_hidden_dim is None:
+            regime_conditioning_hidden_dim = _DEFAULT_REGIME_CONDITIONING_HIDDEN_DIM
+        if regime_conditioning_dropout is None:
+            regime_conditioning_dropout = _DEFAULT_REGIME_CONDITIONING_DROPOUT
         
         super(TCNAttentionActor, self).__init__(
             name=name,
@@ -642,6 +788,8 @@ class TCNAttentionActor(DirichletActor):
         
         self.input_dim = input_dim
         self.num_actions = num_actions
+        self.recurrent_memory_enabled = bool(recurrent_memory_enabled)
+        self.regime_conditioning_enabled = bool(regime_conditioning_enabled)
         
         # TCN blocks
         self.tcn_blocks = []
@@ -666,9 +814,36 @@ class TCNAttentionActor(DirichletActor):
             dropout=dropout,
             name=f'{name}_attention'
         )
-        
+
+        self.memory_layer = None
+        if self.recurrent_memory_enabled:
+            self.memory_layer = layers.LSTM(
+                units=max(8, int(recurrent_memory_units)),
+                return_sequences=True,
+                dropout=float(max(0.0, recurrent_memory_dropout)),
+                name=f"{name}_memory_lstm",
+            )
+
         # Global pooling
         self.global_pool = layers.GlobalAveragePooling1D()
+        self.regime_encoder = None
+        self.regime_fusion = None
+        self.regime_dropout = None
+        if self.regime_conditioning_enabled:
+            hidden_dim = max(8, int(regime_conditioning_hidden_dim))
+            self.regime_encoder = tf.keras.Sequential(
+                [
+                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense1"),
+                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense2"),
+                ],
+                name=f"{name}_regime_encoder",
+            )
+            self.regime_fusion = layers.Dense(
+                int(attention_dim),
+                activation="relu",
+                name=f"{name}_regime_fusion",
+            )
+            self.regime_dropout = layers.Dropout(float(max(0.0, regime_conditioning_dropout)))
         
         # Output layer
         self.output_layer = layers.Dense(
@@ -698,10 +873,22 @@ class TCNAttentionActor(DirichletActor):
         
         # Apply attention
         x = self.attention(x, training=training)  # (batch, timesteps, attention_dim)
-        
+
+        if self.memory_layer is not None:
+            x = self.memory_layer(x, training=training)
+
+        regime_seq = x
+
         # Aggregate sequence
         x = self.global_pool(x)  # (batch, attention_dim)
-        
+
+        if self.regime_encoder is not None and self.regime_fusion is not None:
+            regime_summary = _compute_regime_summary_features(regime_seq)
+            regime_embed = self.regime_encoder(regime_summary, training=training)
+            x = self.regime_fusion(tf.concat([x, regime_embed], axis=-1), training=training)
+            if self.regime_dropout is not None:
+                x = self.regime_dropout(x, training=training)
+
         # Output
         logits = self.output_layer(x, training=training)
         return self._compute_alpha(logits)
@@ -739,6 +926,12 @@ class TCNFusionActor(DirichletActor):
         fusion_cross_asset_mixer_dropout: Optional[float] = None,
         fusion_alpha_head_hidden_dims: Optional[List[int]] = None,
         fusion_alpha_head_dropout: Optional[float] = None,
+        recurrent_memory_enabled: Optional[bool] = None,
+        recurrent_memory_units: Optional[int] = None,
+        recurrent_memory_dropout: Optional[float] = None,
+        regime_conditioning_enabled: Optional[bool] = None,
+        regime_conditioning_hidden_dim: Optional[int] = None,
+        regime_conditioning_dropout: Optional[float] = None,
         name: str = "tcn_fusion_actor",
         epsilon_start: float = 0.5,
         epsilon_min: float = 0.1,
@@ -778,6 +971,18 @@ class TCNFusionActor(DirichletActor):
             fusion_alpha_head_hidden_dims = _DEFAULT_FUSION_ALPHA_HEAD_HIDDEN_DIMS
         if fusion_alpha_head_dropout is None:
             fusion_alpha_head_dropout = _DEFAULT_FUSION_ALPHA_HEAD_DROPOUT
+        if recurrent_memory_enabled is None:
+            recurrent_memory_enabled = _DEFAULT_RECURRENT_MEMORY_ENABLED
+        if recurrent_memory_units is None:
+            recurrent_memory_units = _DEFAULT_RECURRENT_MEMORY_UNITS
+        if recurrent_memory_dropout is None:
+            recurrent_memory_dropout = _DEFAULT_RECURRENT_MEMORY_DROPOUT
+        if regime_conditioning_enabled is None:
+            regime_conditioning_enabled = _DEFAULT_REGIME_CONDITIONING_ENABLED
+        if regime_conditioning_hidden_dim is None:
+            regime_conditioning_hidden_dim = _DEFAULT_REGIME_CONDITIONING_HIDDEN_DIM
+        if regime_conditioning_dropout is None:
+            regime_conditioning_dropout = _DEFAULT_REGIME_CONDITIONING_DROPOUT
 
         super(TCNFusionActor, self).__init__(
             name=name,
@@ -808,6 +1013,8 @@ class TCNFusionActor(DirichletActor):
             self.global_feature_dim = max(0, int(self.input_dim) - self.local_flat_dim)
         self.expected_input_dim = self.local_flat_dim + self.global_feature_dim
         self.fusion_embed_dim = int(fusion_embed_dim)
+        self.recurrent_memory_enabled = bool(recurrent_memory_enabled)
+        self.regime_conditioning_enabled = bool(regime_conditioning_enabled)
 
         if self.fusion_embed_dim % fusion_attention_heads != 0:
             fusion_attention_heads = 1
@@ -823,6 +1030,23 @@ class TCNFusionActor(DirichletActor):
                     dropout=dropout,
                     name=f"{name}_asset_tcn_{i}",
                 )
+            )
+        self.asset_memory_layer = None
+        self.global_memory_layer = None
+        if self.recurrent_memory_enabled:
+            mem_units = max(8, int(recurrent_memory_units))
+            mem_dropout = float(max(0.0, recurrent_memory_dropout))
+            self.asset_memory_layer = layers.LSTM(
+                units=mem_units,
+                return_sequences=True,
+                dropout=mem_dropout,
+                name=f"{name}_asset_memory_lstm",
+            )
+            self.global_memory_layer = layers.LSTM(
+                units=mem_units,
+                return_sequences=True,
+                dropout=mem_dropout,
+                name=f"{name}_global_memory_lstm",
             )
 
         self.asset_time_pool = layers.GlobalAveragePooling1D()
@@ -856,6 +1080,24 @@ class TCNFusionActor(DirichletActor):
         self.global_dropout = layers.Dropout(fusion_dropout)
 
         self.gate_layer = layers.Dense(self.fusion_embed_dim, activation="sigmoid", name=f"{name}_gate")
+        self.regime_encoder = None
+        self.regime_fusion = None
+        self.regime_dropout = None
+        if self.regime_conditioning_enabled:
+            hidden_dim = max(8, int(regime_conditioning_hidden_dim))
+            self.regime_encoder = tf.keras.Sequential(
+                [
+                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense1"),
+                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense2"),
+                ],
+                name=f"{name}_regime_encoder",
+            )
+            self.regime_fusion = layers.Dense(
+                self.fusion_embed_dim,
+                activation="relu",
+                name=f"{name}_regime_fusion",
+            )
+            self.regime_dropout = layers.Dropout(float(max(0.0, regime_conditioning_dropout)))
         sanitized_alpha_head_dims = [int(x) for x in (fusion_alpha_head_hidden_dims or []) if int(x) > 0]
         self.use_richer_alpha_head = len(sanitized_alpha_head_dims) > 0
         self.alpha_pre_norm = None
@@ -948,6 +1190,11 @@ class TCNFusionActor(DirichletActor):
                 timesteps=timesteps,
                 fallback=tf.zeros((batch, timesteps, self.per_asset_dim), dtype=structured_assets.dtype),
             )
+            asset_flat_for_regime = tf.reshape(
+                structured_assets,
+                (batch, timesteps, self.num_assets * self.per_asset_dim),
+            )
+            regime_seq = tf.concat([asset_flat_for_regime, context_seq], axis=-1)
         else:
             x = self._align_feature_dim(state)
             batch = tf.shape(x)[0]
@@ -969,9 +1216,12 @@ class TCNFusionActor(DirichletActor):
                     timesteps=timesteps,
                     fallback=x_local,
                 )
+            regime_seq = x
 
         for block in self.asset_tcn_blocks:
             x_assets = block(x_assets, training=training)
+        if self.asset_memory_layer is not None:
+            x_assets = self.asset_memory_layer(x_assets, training=training)
 
         x_assets = self.asset_time_pool(x_assets)
         x_assets = self.asset_projection(x_assets)
@@ -981,12 +1231,20 @@ class TCNFusionActor(DirichletActor):
             x_assets = mixer_block(x_assets, training=training)
         asset_context = self.asset_pool(x_assets)
 
+        if self.global_memory_layer is not None:
+            context_seq = self.global_memory_layer(context_seq, training=training)
         global_context = self.global_time_pool(context_seq)
         global_context = self.global_projection(global_context)
         global_context = self.global_dropout(global_context, training=training)
 
         gate = self.gate_layer(tf.concat([asset_context, global_context], axis=-1))
         fused = gate * asset_context + (1.0 - gate) * global_context
+        if self.regime_encoder is not None and self.regime_fusion is not None:
+            regime_summary = _compute_regime_summary_features(regime_seq)
+            regime_embed = self.regime_encoder(regime_summary, training=training)
+            fused = self.regime_fusion(tf.concat([fused, regime_embed], axis=-1), training=training)
+            if self.regime_dropout is not None:
+                fused = self.regime_dropout(fused, training=training)
 
         if self.use_richer_alpha_head and self.alpha_pre_norm is not None:
             alpha_features = self.alpha_pre_norm(fused)
@@ -1018,6 +1276,14 @@ class TCNCritic(Model):
                  kernel_size: int = None,
                  dilations: List[int] = None,
                  dropout: float = None,
+                 recurrent_memory_enabled: Optional[bool] = None,
+                 recurrent_memory_units: Optional[int] = None,
+                 recurrent_memory_dropout: Optional[float] = None,
+                 regime_conditioning_enabled: Optional[bool] = None,
+                 regime_conditioning_hidden_dim: Optional[int] = None,
+                 regime_conditioning_dropout: Optional[float] = None,
+                 distributional_critic_enabled: Optional[bool] = None,
+                 distributional_num_quantiles: Optional[int] = None,
                  name: str = "tcn_critic"):
         super(TCNCritic, self).__init__(name=name)
         
@@ -1030,8 +1296,28 @@ class TCNCritic(Model):
             dilations = _DEFAULT_TCN_DILATIONS
         if dropout is None:
             dropout = _DEFAULT_TCN_DROPOUT
-        
+        if recurrent_memory_enabled is None:
+            recurrent_memory_enabled = _DEFAULT_RECURRENT_MEMORY_ENABLED
+        if recurrent_memory_units is None:
+            recurrent_memory_units = _DEFAULT_RECURRENT_MEMORY_UNITS
+        if recurrent_memory_dropout is None:
+            recurrent_memory_dropout = _DEFAULT_RECURRENT_MEMORY_DROPOUT
+        if regime_conditioning_enabled is None:
+            regime_conditioning_enabled = _DEFAULT_REGIME_CONDITIONING_ENABLED
+        if regime_conditioning_hidden_dim is None:
+            regime_conditioning_hidden_dim = _DEFAULT_REGIME_CONDITIONING_HIDDEN_DIM
+        if regime_conditioning_dropout is None:
+            regime_conditioning_dropout = _DEFAULT_REGIME_CONDITIONING_DROPOUT
+        if distributional_critic_enabled is None:
+            distributional_critic_enabled = _DEFAULT_DISTRIBUTIONAL_CRITIC_ENABLED
+        if distributional_num_quantiles is None:
+            distributional_num_quantiles = _DEFAULT_DISTRIBUTIONAL_NUM_QUANTILES
+
         self.input_dim = input_dim
+        self.recurrent_memory_enabled = bool(recurrent_memory_enabled)
+        self.regime_conditioning_enabled = bool(regime_conditioning_enabled)
+        self.distributional_critic_enabled = bool(distributional_critic_enabled)
+        self.distributional_num_quantiles = max(2, int(distributional_num_quantiles))
         
         # TCN blocks
         self.tcn_blocks = []
@@ -1045,13 +1331,42 @@ class TCNCritic(Model):
                     name=f'{name}_tcn_{i}'
                 )
             )
-        
+
+        self.memory_layer = None
+        if self.recurrent_memory_enabled:
+            self.memory_layer = layers.LSTM(
+                units=max(8, int(recurrent_memory_units)),
+                return_sequences=True,
+                dropout=float(max(0.0, recurrent_memory_dropout)),
+                name=f"{name}_memory_lstm",
+            )
+
         # Global pooling
         self.global_pool = layers.GlobalAveragePooling1D()
-        
+        self.regime_encoder = None
+        self.regime_fusion = None
+        self.regime_dropout = None
+        if self.regime_conditioning_enabled:
+            hidden_dim = max(8, int(regime_conditioning_hidden_dim))
+            self.regime_encoder = tf.keras.Sequential(
+                [
+                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense1"),
+                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense2"),
+                ],
+                name=f"{name}_regime_encoder",
+            )
+            self.regime_fusion = layers.Dense(
+                int(tcn_filters[-1]),
+                activation="relu",
+                name=f"{name}_regime_fusion",
+            )
+            self.regime_dropout = layers.Dropout(float(max(0.0, regime_conditioning_dropout)))
+
+        output_units = self.distributional_num_quantiles if self.distributional_critic_enabled else 1
+
         # Output layer
         self.output_layer = layers.Dense(
-            1,
+            output_units,
             activation=None,
             kernel_initializer='orthogonal',
             name=f'{name}_output'
@@ -1069,10 +1384,21 @@ class TCNCritic(Model):
         
         for block in self.tcn_blocks:
             x = block(x, training=training)
-        
+
+        if self.memory_layer is not None:
+            x = self.memory_layer(x, training=training)
+
+        regime_seq = x
+
         x = self.global_pool(x)
+        if self.regime_encoder is not None and self.regime_fusion is not None:
+            regime_summary = _compute_regime_summary_features(regime_seq)
+            regime_embed = self.regime_encoder(regime_summary, training=training)
+            x = self.regime_fusion(tf.concat([x, regime_embed], axis=-1), training=training)
+            if self.regime_dropout is not None:
+                x = self.regime_dropout(x, training=training)
         value = self.output_layer(x, training=training)
-        
+
         return value
 
 
@@ -1092,6 +1418,14 @@ class TCNAttentionCritic(Model):
                  attention_heads: int = None,
                  attention_dim: int = None,
                  dropout: float = None,
+                 recurrent_memory_enabled: Optional[bool] = None,
+                 recurrent_memory_units: Optional[int] = None,
+                 recurrent_memory_dropout: Optional[float] = None,
+                 regime_conditioning_enabled: Optional[bool] = None,
+                 regime_conditioning_hidden_dim: Optional[int] = None,
+                 regime_conditioning_dropout: Optional[float] = None,
+                 distributional_critic_enabled: Optional[bool] = None,
+                 distributional_num_quantiles: Optional[int] = None,
                  name: str = "tcn_attention_critic"):
         super(TCNAttentionCritic, self).__init__(name=name)
         
@@ -1108,8 +1442,28 @@ class TCNAttentionCritic(Model):
             attention_dim = _DEFAULT_ATTENTION_DIM
         if dropout is None:
             dropout = _DEFAULT_TCN_DROPOUT
-        
+        if recurrent_memory_enabled is None:
+            recurrent_memory_enabled = _DEFAULT_RECURRENT_MEMORY_ENABLED
+        if recurrent_memory_units is None:
+            recurrent_memory_units = _DEFAULT_RECURRENT_MEMORY_UNITS
+        if recurrent_memory_dropout is None:
+            recurrent_memory_dropout = _DEFAULT_RECURRENT_MEMORY_DROPOUT
+        if regime_conditioning_enabled is None:
+            regime_conditioning_enabled = _DEFAULT_REGIME_CONDITIONING_ENABLED
+        if regime_conditioning_hidden_dim is None:
+            regime_conditioning_hidden_dim = _DEFAULT_REGIME_CONDITIONING_HIDDEN_DIM
+        if regime_conditioning_dropout is None:
+            regime_conditioning_dropout = _DEFAULT_REGIME_CONDITIONING_DROPOUT
+        if distributional_critic_enabled is None:
+            distributional_critic_enabled = _DEFAULT_DISTRIBUTIONAL_CRITIC_ENABLED
+        if distributional_num_quantiles is None:
+            distributional_num_quantiles = _DEFAULT_DISTRIBUTIONAL_NUM_QUANTILES
+
         self.input_dim = input_dim
+        self.recurrent_memory_enabled = bool(recurrent_memory_enabled)
+        self.regime_conditioning_enabled = bool(regime_conditioning_enabled)
+        self.distributional_critic_enabled = bool(distributional_critic_enabled)
+        self.distributional_num_quantiles = max(2, int(distributional_num_quantiles))
         
         # TCN blocks
         self.tcn_blocks = []
@@ -1134,13 +1488,42 @@ class TCNAttentionCritic(Model):
             dropout=dropout,
             name=f'{name}_attention'
         )
-        
+
+        self.memory_layer = None
+        if self.recurrent_memory_enabled:
+            self.memory_layer = layers.LSTM(
+                units=max(8, int(recurrent_memory_units)),
+                return_sequences=True,
+                dropout=float(max(0.0, recurrent_memory_dropout)),
+                name=f"{name}_memory_lstm",
+            )
+
         # Global pooling
         self.global_pool = layers.GlobalAveragePooling1D()
-        
+        self.regime_encoder = None
+        self.regime_fusion = None
+        self.regime_dropout = None
+        if self.regime_conditioning_enabled:
+            hidden_dim = max(8, int(regime_conditioning_hidden_dim))
+            self.regime_encoder = tf.keras.Sequential(
+                [
+                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense1"),
+                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense2"),
+                ],
+                name=f"{name}_regime_encoder",
+            )
+            self.regime_fusion = layers.Dense(
+                int(attention_dim),
+                activation="relu",
+                name=f"{name}_regime_fusion",
+            )
+            self.regime_dropout = layers.Dropout(float(max(0.0, regime_conditioning_dropout)))
+
+        output_units = self.distributional_num_quantiles if self.distributional_critic_enabled else 1
+
         # Output layer
         self.output_layer = layers.Dense(
-            1,
+            output_units,
             activation=None,
             kernel_initializer='orthogonal',
             name=f'{name}_output'
@@ -1158,11 +1541,20 @@ class TCNAttentionCritic(Model):
         
         for block in self.tcn_blocks:
             x = block(x, training=training)
-        
+
         x = self.projection(x)
         x = self.attention(x, training=training)
+        if self.memory_layer is not None:
+            x = self.memory_layer(x, training=training)
+        regime_seq = x
         x = self.global_pool(x)
-        
+        if self.regime_encoder is not None and self.regime_fusion is not None:
+            regime_summary = _compute_regime_summary_features(regime_seq)
+            regime_embed = self.regime_encoder(regime_summary, training=training)
+            x = self.regime_fusion(tf.concat([x, regime_embed], axis=-1), training=training)
+            if self.regime_dropout is not None:
+                x = self.regime_dropout(x, training=training)
+
         value = self.output_layer(x, training=training)
         
         return value
@@ -1190,6 +1582,14 @@ class TCNFusionCritic(Model):
         fusion_cross_asset_mixer_layers: Optional[int] = None,
         fusion_cross_asset_mixer_expansion: Optional[float] = None,
         fusion_cross_asset_mixer_dropout: Optional[float] = None,
+        recurrent_memory_enabled: Optional[bool] = None,
+        recurrent_memory_units: Optional[int] = None,
+        recurrent_memory_dropout: Optional[float] = None,
+        regime_conditioning_enabled: Optional[bool] = None,
+        regime_conditioning_hidden_dim: Optional[int] = None,
+        regime_conditioning_dropout: Optional[float] = None,
+        distributional_critic_enabled: Optional[bool] = None,
+        distributional_num_quantiles: Optional[int] = None,
         name: str = "tcn_fusion_critic",
     ):
         super(TCNFusionCritic, self).__init__(name=name)
@@ -1216,6 +1616,22 @@ class TCNFusionCritic(Model):
             fusion_cross_asset_mixer_expansion = _DEFAULT_FUSION_CROSS_ASSET_MIXER_EXPANSION
         if fusion_cross_asset_mixer_dropout is None:
             fusion_cross_asset_mixer_dropout = _DEFAULT_FUSION_CROSS_ASSET_MIXER_DROPOUT
+        if recurrent_memory_enabled is None:
+            recurrent_memory_enabled = _DEFAULT_RECURRENT_MEMORY_ENABLED
+        if recurrent_memory_units is None:
+            recurrent_memory_units = _DEFAULT_RECURRENT_MEMORY_UNITS
+        if recurrent_memory_dropout is None:
+            recurrent_memory_dropout = _DEFAULT_RECURRENT_MEMORY_DROPOUT
+        if regime_conditioning_enabled is None:
+            regime_conditioning_enabled = _DEFAULT_REGIME_CONDITIONING_ENABLED
+        if regime_conditioning_hidden_dim is None:
+            regime_conditioning_hidden_dim = _DEFAULT_REGIME_CONDITIONING_HIDDEN_DIM
+        if regime_conditioning_dropout is None:
+            regime_conditioning_dropout = _DEFAULT_REGIME_CONDITIONING_DROPOUT
+        if distributional_critic_enabled is None:
+            distributional_critic_enabled = _DEFAULT_DISTRIBUTIONAL_CRITIC_ENABLED
+        if distributional_num_quantiles is None:
+            distributional_num_quantiles = _DEFAULT_DISTRIBUTIONAL_NUM_QUANTILES
 
         self.input_dim = int(input_dim)
         self.num_assets = int(num_assets) if num_assets is not None else 5
@@ -1230,6 +1646,10 @@ class TCNFusionCritic(Model):
             self.global_feature_dim = max(0, int(self.input_dim) - self.local_flat_dim)
         self.expected_input_dim = self.local_flat_dim + self.global_feature_dim
         self.fusion_embed_dim = int(fusion_embed_dim)
+        self.recurrent_memory_enabled = bool(recurrent_memory_enabled)
+        self.regime_conditioning_enabled = bool(regime_conditioning_enabled)
+        self.distributional_critic_enabled = bool(distributional_critic_enabled)
+        self.distributional_num_quantiles = max(2, int(distributional_num_quantiles))
 
         if self.fusion_embed_dim % fusion_attention_heads != 0:
             fusion_attention_heads = 1
@@ -1245,6 +1665,23 @@ class TCNFusionCritic(Model):
                     dropout=dropout,
                     name=f"{name}_asset_tcn_{i}",
                 )
+            )
+        self.asset_memory_layer = None
+        self.global_memory_layer = None
+        if self.recurrent_memory_enabled:
+            mem_units = max(8, int(recurrent_memory_units))
+            mem_dropout = float(max(0.0, recurrent_memory_dropout))
+            self.asset_memory_layer = layers.LSTM(
+                units=mem_units,
+                return_sequences=True,
+                dropout=mem_dropout,
+                name=f"{name}_asset_memory_lstm",
+            )
+            self.global_memory_layer = layers.LSTM(
+                units=mem_units,
+                return_sequences=True,
+                dropout=mem_dropout,
+                name=f"{name}_global_memory_lstm",
             )
 
         self.asset_time_pool = layers.GlobalAveragePooling1D()
@@ -1277,7 +1714,27 @@ class TCNFusionCritic(Model):
         self.global_projection = layers.Dense(self.fusion_embed_dim, activation="relu", name=f"{name}_global_projection")
         self.global_dropout = layers.Dropout(fusion_dropout)
         self.gate_layer = layers.Dense(self.fusion_embed_dim, activation="sigmoid", name=f"{name}_gate")
-        self.output_layer = layers.Dense(1, activation=None, kernel_initializer="orthogonal", name=f"{name}_output")
+        self.regime_encoder = None
+        self.regime_fusion = None
+        self.regime_dropout = None
+        if self.regime_conditioning_enabled:
+            hidden_dim = max(8, int(regime_conditioning_hidden_dim))
+            self.regime_encoder = tf.keras.Sequential(
+                [
+                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense1"),
+                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense2"),
+                ],
+                name=f"{name}_regime_encoder",
+            )
+            self.regime_fusion = layers.Dense(
+                self.fusion_embed_dim,
+                activation="relu",
+                name=f"{name}_regime_fusion",
+            )
+            self.regime_dropout = layers.Dropout(float(max(0.0, regime_conditioning_dropout)))
+
+        output_units = self.distributional_num_quantiles if self.distributional_critic_enabled else 1
+        self.output_layer = layers.Dense(output_units, activation=None, kernel_initializer="orthogonal", name=f"{name}_output")
 
     def _align_feature_dim(self, x: tf.Tensor) -> tf.Tensor:
         current_dim = tf.shape(x)[-1]
@@ -1346,6 +1803,11 @@ class TCNFusionCritic(Model):
                 timesteps=timesteps,
                 fallback=tf.zeros((batch, timesteps, self.per_asset_dim), dtype=structured_assets.dtype),
             )
+            asset_flat_for_regime = tf.reshape(
+                structured_assets,
+                (batch, timesteps, self.num_assets * self.per_asset_dim),
+            )
+            regime_seq = tf.concat([asset_flat_for_regime, context_seq], axis=-1)
         else:
             x = self._align_feature_dim(state)
             batch = tf.shape(x)[0]
@@ -1366,9 +1828,12 @@ class TCNFusionCritic(Model):
                     timesteps=timesteps,
                     fallback=x_local,
                 )
+            regime_seq = x
 
         for block in self.asset_tcn_blocks:
             x_assets = block(x_assets, training=training)
+        if self.asset_memory_layer is not None:
+            x_assets = self.asset_memory_layer(x_assets, training=training)
 
         x_assets = self.asset_time_pool(x_assets)
         x_assets = self.asset_projection(x_assets)
@@ -1378,12 +1843,20 @@ class TCNFusionCritic(Model):
             x_assets = mixer_block(x_assets, training=training)
         asset_context = self.asset_pool(x_assets)
 
+        if self.global_memory_layer is not None:
+            context_seq = self.global_memory_layer(context_seq, training=training)
         global_context = self.global_time_pool(context_seq)
         global_context = self.global_projection(global_context)
         global_context = self.global_dropout(global_context, training=training)
 
         gate = self.gate_layer(tf.concat([asset_context, global_context], axis=-1))
         fused = gate * asset_context + (1.0 - gate) * global_context
+        if self.regime_encoder is not None and self.regime_fusion is not None:
+            regime_summary = _compute_regime_summary_features(regime_seq)
+            regime_embed = self.regime_encoder(regime_summary, training=training)
+            fused = self.regime_fusion(tf.concat([fused, regime_embed], axis=-1), training=training)
+            if self.regime_dropout is not None:
+                fused = self.regime_dropout(fused, training=training)
         return self.output_layer(fused, training=training)
 
 
@@ -1438,10 +1911,38 @@ def create_actor_critic(architecture: str,
         Tuple of (actor_network, critic_network)
     """
     arch_upper = architecture.upper()
+    global _RUNTIME_STATE_AUGMENTATION_ENABLED
+    _RUNTIME_STATE_AUGMENTATION_ENABLED = bool(
+        config.get("state_augmentation_enabled", _DEFAULT_STATE_AUGMENTATION_ENABLED)
+    )
     epsilon_kwargs = _resolve_dirichlet_epsilon_kwargs(config)
     state_layout = config.get("state_layout", {}) if isinstance(config.get("state_layout", {}), dict) else {}
     resolved_asset_feature_dim = state_layout.get("asset_feature_dim", config.get("asset_feature_dim"))
     resolved_global_feature_dim = state_layout.get("global_feature_dim", config.get("global_feature_dim"))
+    recurrent_kwargs = {
+        "recurrent_memory_enabled": bool(config.get("recurrent_memory_enabled", _DEFAULT_RECURRENT_MEMORY_ENABLED)),
+        "recurrent_memory_units": int(config.get("recurrent_memory_units", _DEFAULT_RECURRENT_MEMORY_UNITS)),
+        "recurrent_memory_dropout": float(config.get("recurrent_memory_dropout", _DEFAULT_RECURRENT_MEMORY_DROPOUT)),
+    }
+    regime_kwargs = {
+        "regime_conditioning_enabled": bool(
+            config.get("regime_conditioning_enabled", _DEFAULT_REGIME_CONDITIONING_ENABLED)
+        ),
+        "regime_conditioning_hidden_dim": int(
+            config.get("regime_conditioning_hidden_dim", _DEFAULT_REGIME_CONDITIONING_HIDDEN_DIM)
+        ),
+        "regime_conditioning_dropout": float(
+            config.get("regime_conditioning_dropout", _DEFAULT_REGIME_CONDITIONING_DROPOUT)
+        ),
+    }
+    critic_distributional_kwargs = {
+        "distributional_critic_enabled": bool(
+            config.get("distributional_critic_enabled", _DEFAULT_DISTRIBUTIONAL_CRITIC_ENABLED)
+        ),
+        "distributional_num_quantiles": int(
+            config.get("distributional_num_quantiles", _DEFAULT_DISTRIBUTIONAL_NUM_QUANTILES)
+        ),
+    }
     if arch_upper == 'TCN':
         if config.get('use_fusion', False):
             resolved_num_assets = int(config.get('num_assets', max(1, num_actions - 1)))
@@ -1464,6 +1965,8 @@ def create_actor_critic(architecture: str,
                 fusion_cross_asset_mixer_dropout=config.get('fusion_cross_asset_mixer_dropout', _DEFAULT_FUSION_CROSS_ASSET_MIXER_DROPOUT),
                 fusion_alpha_head_hidden_dims=config.get('fusion_alpha_head_hidden_dims', _DEFAULT_FUSION_ALPHA_HEAD_HIDDEN_DIMS),
                 fusion_alpha_head_dropout=config.get('fusion_alpha_head_dropout', _DEFAULT_FUSION_ALPHA_HEAD_DROPOUT),
+                **recurrent_kwargs,
+                **regime_kwargs,
                 **epsilon_kwargs,
             )
             critic = TCNFusionCritic(
@@ -1482,6 +1985,9 @@ def create_actor_critic(architecture: str,
                 fusion_cross_asset_mixer_layers=config.get('fusion_cross_asset_mixer_layers', _DEFAULT_FUSION_CROSS_ASSET_MIXER_LAYERS),
                 fusion_cross_asset_mixer_expansion=config.get('fusion_cross_asset_mixer_expansion', _DEFAULT_FUSION_CROSS_ASSET_MIXER_EXPANSION),
                 fusion_cross_asset_mixer_dropout=config.get('fusion_cross_asset_mixer_dropout', _DEFAULT_FUSION_CROSS_ASSET_MIXER_DROPOUT),
+                **recurrent_kwargs,
+                **regime_kwargs,
+                **critic_distributional_kwargs,
             )
         elif config.get('use_attention', False):
             actor = TCNAttentionActor(
@@ -1493,6 +1999,8 @@ def create_actor_critic(architecture: str,
                 attention_heads=config.get('attention_heads', _DEFAULT_ATTENTION_HEADS),
                 attention_dim=config.get('attention_dim', _DEFAULT_ATTENTION_DIM),
                 dropout=config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT),
+                **recurrent_kwargs,
+                **regime_kwargs,
                 **epsilon_kwargs,
             )
             critic = TCNAttentionCritic(
@@ -1502,7 +2010,10 @@ def create_actor_critic(architecture: str,
                 dilations=config.get('tcn_dilations', _DEFAULT_TCN_DILATIONS),
                 attention_heads=config.get('attention_heads', _DEFAULT_ATTENTION_HEADS),
                 attention_dim=config.get('attention_dim', _DEFAULT_ATTENTION_DIM),
-                dropout=config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT)
+                dropout=config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT),
+                **recurrent_kwargs,
+                **regime_kwargs,
+                **critic_distributional_kwargs,
             )
         else:
             actor = TCNActor(
@@ -1512,6 +2023,8 @@ def create_actor_critic(architecture: str,
                 kernel_size=config.get('tcn_kernel_size', _DEFAULT_TCN_KERNEL_SIZE),
                 dilations=config.get('tcn_dilations', _DEFAULT_TCN_DILATIONS),
                 dropout=config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT),
+                **recurrent_kwargs,
+                **regime_kwargs,
                 **epsilon_kwargs,
             )
             critic = TCNCritic(
@@ -1519,7 +2032,10 @@ def create_actor_critic(architecture: str,
                 tcn_filters=config.get('tcn_filters', _DEFAULT_TCN_FILTERS),
                 kernel_size=config.get('tcn_kernel_size', _DEFAULT_TCN_KERNEL_SIZE),
                 dilations=config.get('tcn_dilations', _DEFAULT_TCN_DILATIONS),
-                dropout=config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT)
+                dropout=config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT),
+                **recurrent_kwargs,
+                **regime_kwargs,
+                **critic_distributional_kwargs,
             )
 
     elif arch_upper == 'TCN_FUSION':
@@ -1543,6 +2059,8 @@ def create_actor_critic(architecture: str,
             fusion_cross_asset_mixer_dropout=config.get('fusion_cross_asset_mixer_dropout', _DEFAULT_FUSION_CROSS_ASSET_MIXER_DROPOUT),
             fusion_alpha_head_hidden_dims=config.get('fusion_alpha_head_hidden_dims', _DEFAULT_FUSION_ALPHA_HEAD_HIDDEN_DIMS),
             fusion_alpha_head_dropout=config.get('fusion_alpha_head_dropout', _DEFAULT_FUSION_ALPHA_HEAD_DROPOUT),
+            **recurrent_kwargs,
+            **regime_kwargs,
             **epsilon_kwargs,
         )
         critic = TCNFusionCritic(
@@ -1561,6 +2079,9 @@ def create_actor_critic(architecture: str,
             fusion_cross_asset_mixer_layers=config.get('fusion_cross_asset_mixer_layers', _DEFAULT_FUSION_CROSS_ASSET_MIXER_LAYERS),
             fusion_cross_asset_mixer_expansion=config.get('fusion_cross_asset_mixer_expansion', _DEFAULT_FUSION_CROSS_ASSET_MIXER_EXPANSION),
             fusion_cross_asset_mixer_dropout=config.get('fusion_cross_asset_mixer_dropout', _DEFAULT_FUSION_CROSS_ASSET_MIXER_DROPOUT),
+            **recurrent_kwargs,
+            **regime_kwargs,
+            **critic_distributional_kwargs,
         )
 
     elif arch_upper == 'TCN_ATTENTION':
@@ -1573,6 +2094,8 @@ def create_actor_critic(architecture: str,
             attention_heads=config.get('attention_heads', _DEFAULT_ATTENTION_HEADS),
             attention_dim=config.get('attention_dim', _DEFAULT_ATTENTION_DIM),
             dropout=config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT),
+            **recurrent_kwargs,
+            **regime_kwargs,
             **epsilon_kwargs,
         )
         critic = TCNAttentionCritic(
@@ -1582,7 +2105,10 @@ def create_actor_critic(architecture: str,
             dilations=config.get('tcn_dilations', _DEFAULT_TCN_DILATIONS),
             attention_heads=config.get('attention_heads', _DEFAULT_ATTENTION_HEADS),
             attention_dim=config.get('attention_dim', _DEFAULT_ATTENTION_DIM),
-            dropout=config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT)
+            dropout=config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT),
+            **recurrent_kwargs,
+            **regime_kwargs,
+            **critic_distributional_kwargs,
         )
     
     else:

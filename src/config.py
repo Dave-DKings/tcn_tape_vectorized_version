@@ -568,6 +568,19 @@ PHASE1_CONFIG = {
         "fusion_cross_asset_mixer_dropout": 0.1,
         "fusion_alpha_head_hidden_dims": [],         # A3 toggle (empty = legacy direct logits head)
         "fusion_alpha_head_dropout": 0.1,
+        # Optional recurrent memory.
+        "recurrent_memory_enabled": True,
+        "recurrent_memory_units": 64,
+        "recurrent_memory_dropout": 0.1,
+        # Optional regime-aware conditioning.
+        "regime_conditioning_enabled": True,
+        "regime_conditioning_hidden_dim": 32,
+        "regime_conditioning_dropout": 0.0,
+        # Optional state augmentation for regime summary features.
+        "state_augmentation_enabled": True,
+        # Optional distributional critic head.
+        "distributional_critic_enabled": True,
+        "distributional_num_quantiles": 17,
 
         # Dirichlet alpha activation (controls action concentration)
         "dirichlet_alpha_activation": "softplus",  # Stable strictly-positive alpha map
@@ -601,16 +614,31 @@ PHASE1_CONFIG = {
             "batch_size_ppo": 252, "actor_lr": 0.00002, "critic_lr": 0.0003,
             "max_grad_norm": 0.5, "value_clip": 0.2, "target_kl": 0.015,
             "kl_stop_multiplier": 1.2, "minibatches_before_kl_stop": 1,
-            # Optional risk-aware actor auxiliaries (default disabled).
-            "use_risk_aux_loss": False,
+            # Optional risk-aware actor auxiliaries.
+            "use_risk_aux_loss": True,
             # Per-asset feature index used as one-step return proxy in structured state tensor.
             "risk_aux_return_feature_index": 0,
             "risk_aux_cash_return": 0.0,
             "risk_aux_sharpe_coef": 0.0,
             "risk_aux_mvo_coef": 0.0,
+            "risk_aux_cvar_coef": 0.01,
+            "risk_aux_cvar_alpha": 0.05,
+            "risk_aux_cvar_adaptive_enabled": True,
+            "risk_aux_cvar_target": 0.015,
+            "risk_aux_cvar_adapt_lr": 0.05,
+            "risk_aux_cvar_min_coef": 0.0,
+            "risk_aux_cvar_max_coef": 0.08,
             "risk_aux_mvo_cov_ridge": 1e-3,
             "risk_aux_mvo_long_only": True,
             "risk_aux_mvo_risky_budget": 0.95,
+            "distributional_huber_kappa": 1.0,
+            "distributional_mean_loss_coef": 0.1,
+            "popart_enabled": True,
+            "popart_min_std": 1e-3,
+            "multi_horizon_reward_enabled": True,
+            "multi_horizon_reward_coef": 0.20,
+            "multi_horizon_reward_horizons": [21, 63, 126, 252],
+            "multi_horizon_reward_weights": [0.15, 0.25, 0.30, 0.30],
         },
     },
     #================================================
@@ -650,13 +678,25 @@ PHASE1_CONFIG = {
             {"name": "all", "timesteps_fraction": 0.30}          # Final 30% on all data
         ],
 
-        # Disable episode-length curriculum: use full dataset horizon throughout.
-        "use_episode_length_curriculum": False,
+        # Enable episode-length curriculum with smooth overlap ramps.
+        "use_episode_length_curriculum": True,
         "episode_length_curriculum_schedule": [
             {"threshold": 0, "limit": 1500},
             {"threshold": 30_000, "limit": 2000},
             {"threshold": 60_000, "limit": 2500},
             {"threshold": 90_000, "limit": None},
+        ],
+        "episode_length_curriculum_smooth_enabled": True,
+        "episode_length_curriculum_overlap_steps": 10_000,
+        "ppo_gamma_schedule": [
+            {"threshold": 0, "gamma": 0.985},
+            {"threshold": 50_000, "gamma": 0.992},
+            {"threshold": 100_000, "gamma": 0.997},
+        ],
+        "ppo_gae_lambda_schedule": [
+            {"threshold": 0, "gae_lambda": 0.90},
+            {"threshold": 50_000, "gae_lambda": 0.94},
+            {"threshold": 100_000, "gae_lambda": 0.97},
         ],
         
         # PHASE 1: Progressive Threshold Curriculum
@@ -682,6 +722,15 @@ PHASE1_CONFIG = {
         "deterministic_validation_sharpe_min": 0.5,
         "deterministic_validation_sharpe_min_delta": 0.0,
         "deterministic_validation_seed_offset": 10_000,
+        "deterministic_validation_multi_horizon_enabled": True,
+        "deterministic_validation_multi_horizon_limits": [252, 504, 756, 1008],
+        "deterministic_validation_multi_horizon_weights": [0.35, 0.30, 0.20, 0.15],
+        "deterministic_validation_multi_horizon_dd_penalty_coef": 0.25,
+        "deterministic_validation_stochastic_sanity_enabled": True,
+        "deterministic_validation_stochastic_sanity_runs": 3,
+        "deterministic_validation_stochastic_sanity_episode_length_limit": 252,
+        "deterministic_validation_stochastic_sanity_min_mean_sharpe": 0.0,
+        "deterministic_validation_stochastic_sanity_max_sharpe_std": 1.5,
         # If True, legacy checkpoint routes remain disabled even if toggled elsewhere.
         "deterministic_validation_checkpointing_only": True,
 
@@ -877,6 +926,19 @@ PHASE2_CONFIG = {
         "fusion_cross_asset_mixer_dropout": 0.1,
         "fusion_alpha_head_hidden_dims": [],         # A3 toggle (empty = legacy direct logits head)
         "fusion_alpha_head_dropout": 0.1,
+        # Optional recurrent memory.
+        "recurrent_memory_enabled": True,
+        "recurrent_memory_units": 64,
+        "recurrent_memory_dropout": 0.1,
+        # Optional regime-aware conditioning.
+        "regime_conditioning_enabled": True,
+        "regime_conditioning_hidden_dim": 32,
+        "regime_conditioning_dropout": 0.0,
+        # Optional state augmentation for regime summary features.
+        "state_augmentation_enabled": True,
+        # Optional distributional critic head.
+        "distributional_critic_enabled": True,
+        "distributional_num_quantiles": 17,
 
         # Dirichlet alpha activation (controls action concentration)
         "dirichlet_alpha_activation": "softplus",  # Stable strictly-positive alpha map
@@ -909,15 +971,30 @@ PHASE2_CONFIG = {
             "batch_size_ppo": 256, "actor_lr": 0.00002, "critic_lr": 0.0003,
             "max_grad_norm": 0.5, "value_clip": 0.2, "target_kl": 0.015,
             "kl_stop_multiplier": 1.2, "minibatches_before_kl_stop": 1,
-            # Optional risk-aware actor auxiliaries (default disabled).
-            "use_risk_aux_loss": False,
+            # Optional risk-aware actor auxiliaries.
+            "use_risk_aux_loss": True,
             "risk_aux_return_feature_index": 0,
             "risk_aux_cash_return": 0.0,
             "risk_aux_sharpe_coef": 0.0,
             "risk_aux_mvo_coef": 0.0,
+            "risk_aux_cvar_coef": 0.01,
+            "risk_aux_cvar_alpha": 0.05,
+            "risk_aux_cvar_adaptive_enabled": True,
+            "risk_aux_cvar_target": 0.015,
+            "risk_aux_cvar_adapt_lr": 0.05,
+            "risk_aux_cvar_min_coef": 0.0,
+            "risk_aux_cvar_max_coef": 0.08,
             "risk_aux_mvo_cov_ridge": 1e-3,
             "risk_aux_mvo_long_only": True,
             "risk_aux_mvo_risky_budget": 0.95,
+            "distributional_huber_kappa": 1.0,
+            "distributional_mean_loss_coef": 0.1,
+            "popart_enabled": True,
+            "popart_min_std": 1e-3,
+            "multi_horizon_reward_enabled": True,
+            "multi_horizon_reward_coef": 0.20,
+            "multi_horizon_reward_horizons": [21, 63, 126, 252],
+            "multi_horizon_reward_weights": [0.15, 0.25, 0.30, 0.30],
         },
     },
     #================================================
@@ -944,8 +1021,8 @@ PHASE2_CONFIG = {
             {"name": "all", "timesteps_fraction": 0.30}          # Final 30% on all data
         ],
 
-        # Disable episode-length curriculum: use full dataset horizon throughout.
-        "use_episode_length_curriculum": False,
+        # Enable episode-length curriculum with smooth overlap ramps.
+        "use_episode_length_curriculum": True,
         "episode_length_curriculum_schedule": [
             {"threshold": 0, "limit": 504},
             {"threshold": 15_000, "limit": 756},
@@ -953,6 +1030,18 @@ PHASE2_CONFIG = {
             {"threshold": 45_000, "limit": 1_500},
             {"threshold": 60_000, "limit": 2_500},
             {"threshold": 75_000, "limit": None},
+        ],
+        "episode_length_curriculum_smooth_enabled": True,
+        "episode_length_curriculum_overlap_steps": 7_500,
+        "ppo_gamma_schedule": [
+            {"threshold": 0, "gamma": 0.985},
+            {"threshold": 40_000, "gamma": 0.992},
+            {"threshold": 80_000, "gamma": 0.997},
+        ],
+        "ppo_gae_lambda_schedule": [
+            {"threshold": 0, "gae_lambda": 0.90},
+            {"threshold": 40_000, "gae_lambda": 0.94},
+            {"threshold": 80_000, "gae_lambda": 0.97},
         ],
 
         # Turnover penalty schedule to match Phase 1 discipline
@@ -1006,6 +1095,15 @@ PHASE2_CONFIG = {
         "deterministic_validation_sharpe_min": 0.5,
         "deterministic_validation_sharpe_min_delta": 0.0,
         "deterministic_validation_seed_offset": 10_000,
+        "deterministic_validation_multi_horizon_enabled": False,
+        "deterministic_validation_multi_horizon_limits": [252, 504, 756, 1008],
+        "deterministic_validation_multi_horizon_weights": [0.35, 0.30, 0.20, 0.15],
+        "deterministic_validation_multi_horizon_dd_penalty_coef": 0.25,
+        "deterministic_validation_stochastic_sanity_enabled": False,
+        "deterministic_validation_stochastic_sanity_runs": 3,
+        "deterministic_validation_stochastic_sanity_episode_length_limit": 252,
+        "deterministic_validation_stochastic_sanity_min_mean_sharpe": 0.0,
+        "deterministic_validation_stochastic_sanity_max_sharpe_std": 1.5,
         "deterministic_validation_checkpointing_only": True,
 
         # Legacy checkpoint routes (disabled by default).
