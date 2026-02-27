@@ -6376,6 +6376,7 @@ def evaluate_experiment6_checkpoint(
         print(f"   Total Return: {total_return_run*100:+.2f}%")
         print(f"   Annualized Return: {annualized_return_run*100:+.2f}%")
         print(f"   Sharpe: {metrics_run['sharpe_ratio']:.4f}")
+        print(f"   Volatility (Ann.): {metrics_run['volatility']*100:.2f}%")
         print(f"   Max DD: {metrics_run['max_drawdown_abs']*100:.2f}%")
         print(
             "   Turnover (episode): "
@@ -6407,24 +6408,23 @@ def evaluate_experiment6_checkpoint(
         print("\n" + "=" * 80)
         print("SUMMARY: STOCHASTIC EVALUATION STATISTICS")
         print("=" * 80)
-        for label, column in [
-            ("Total Return (%)", "total_return"),
-            ("Annualized Return (%)", "annualized_return"),
-            ("Sharpe Ratio (annualized)", "sharpe_ratio"),
+        for label, column, as_percent in [
+            ("Total Return (%)", "total_return", True),
+            ("Annualized Return (%)", "annualized_return", True),
+            ("Sharpe Ratio (annualized)", "sharpe_ratio", False),
+            ("Volatility (Ann. %)", "volatility", True),
         ]:
             print(f"\n{label}:")
-            print(f"   Mean: {df_stochastic[column].mean()*100:+.2f}%" if "Return" in label else f"   Mean: {df_stochastic[column].mean():.4f}")
-            print(f"   Std:  {df_stochastic[column].std()*100:.2f}%" if "Return" in label else f"   Std:  {df_stochastic[column].std():.4f}")
-            print(
-                f"   Min:  {df_stochastic[column].min()*100:+.2f}%"
-                if "Return" in label
-                else f"   Min:  {df_stochastic[column].min():.4f}"
-            )
-            print(
-                f"   Max:  {df_stochastic[column].max()*100:+.2f}%"
-                if "Return" in label
-                else f"   Max:  {df_stochastic[column].max():.4f}"
-            )
+            if as_percent:
+                print(f"   Mean: {df_stochastic[column].mean()*100:+.2f}%")
+                print(f"   Std:  {df_stochastic[column].std()*100:.2f}%")
+                print(f"   Min:  {df_stochastic[column].min()*100:+.2f}%")
+                print(f"   Max:  {df_stochastic[column].max()*100:+.2f}%")
+            else:
+                print(f"   Mean: {df_stochastic[column].mean():.4f}")
+                print(f"   Std:  {df_stochastic[column].std():.4f}")
+                print(f"   Min:  {df_stochastic[column].min():.4f}")
+                print(f"   Max:  {df_stochastic[column].max():.4f}")
 
         print("\nMax Drawdown (%):")
         print(f"   Mean: {df_stochastic['max_drawdown'].mean()*100:.2f}%")
@@ -6613,6 +6613,7 @@ def build_ablation_table(
                 "sto_mean_sharpe": sto["sharpe_ratio"].mean() if "sharpe_ratio" in sto else np.nan,
                 "sto_std_sharpe": sto["sharpe_ratio"].std() if "sharpe_ratio" in sto else np.nan,
                 "sto_mean_return": sto["total_return"].mean() if "total_return" in sto else np.nan,
+                "sto_mean_volatility": sto["volatility"].mean() if "volatility" in sto else np.nan,
                 "sto_mean_max_drawdown": sto["max_drawdown"].mean() if "max_drawdown" in sto else np.nan,
             }
         )
