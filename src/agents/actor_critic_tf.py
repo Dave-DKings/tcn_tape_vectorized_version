@@ -47,6 +47,7 @@ _DEFAULT_DISTRIBUTIONAL_CRITIC_ENABLED = bool(_DEFAULT_AGENT_PARAMS.get('distrib
 _DEFAULT_DISTRIBUTIONAL_NUM_QUANTILES = int(_DEFAULT_AGENT_PARAMS.get('distributional_num_quantiles', 17))
 _DEFAULT_ALPHA_ACTIVATION = _DEFAULT_AGENT_PARAMS.get('dirichlet_alpha_activation', 'elu')
 _DEFAULT_EXP_CLIP = tuple(_DEFAULT_AGENT_PARAMS.get('dirichlet_exp_clip', (-5.0, 3.0)))
+_DEFAULT_DUAL_HEAD_ENABLED = bool(_DEFAULT_AGENT_PARAMS.get('dual_head_enabled', False))
 _RUNTIME_STATE_AUGMENTATION_ENABLED = _DEFAULT_STATE_AUGMENTATION_ENABLED
 
 
@@ -423,6 +424,7 @@ class DirichletActor(Model):
         adaptive_temperature_slope: float = 0.0,
         adaptive_temperature_min: float = 0.8,
         adaptive_temperature_max: float = 2.5,
+        dual_head_enabled: bool = False,
         **kwargs,
     ):
         super(DirichletActor, self).__init__(name=name, **kwargs)
@@ -447,6 +449,7 @@ class DirichletActor(Model):
         temp_max = float(max(adaptive_temperature_max, temp_min))
         self._adaptive_temperature_min = temp_min
         self._adaptive_temperature_max = temp_max
+        self._dual_head_enabled = bool(dual_head_enabled)
 
         self._dirichlet_epsilon = tf.Variable(
             float(epsilon_start),
@@ -538,6 +541,26 @@ class DirichletActor(Model):
         # Ensure strictly positive
         return tf.maximum(alpha, tf.cast(1e-6, alpha.dtype))
 
+    def _format_actor_output(
+        self,
+        *,
+        logits_for_alpha: tf.Tensor,
+        projection_logits: Optional[tf.Tensor] = None,
+    ):
+        """Return backward-compatible actor outputs.
+
+        Single-head mode returns alpha tensor (legacy behavior).
+        Dual-head mode returns dict with dirichlet alpha + softmax/projection logits.
+        """
+        alpha = self._compute_alpha(logits_for_alpha)
+        if not self._dual_head_enabled:
+            return alpha
+        proj_logits = logits_for_alpha if projection_logits is None else projection_logits
+        return {
+            "alpha": alpha,
+            "projection_logits": proj_logits,
+        }
+
 
 class TCNActor(DirichletActor):
     """
@@ -575,6 +598,7 @@ class TCNActor(DirichletActor):
         adaptive_temperature_slope: float = 0.0,
         adaptive_temperature_min: float = 0.8,
         adaptive_temperature_max: float = 2.5,
+        dual_head_enabled: Optional[bool] = None,
     ):
         # Apply config defaults
         if tcn_filters is None:
@@ -597,6 +621,8 @@ class TCNActor(DirichletActor):
             regime_conditioning_hidden_dim = _DEFAULT_REGIME_CONDITIONING_HIDDEN_DIM
         if regime_conditioning_dropout is None:
             regime_conditioning_dropout = _DEFAULT_REGIME_CONDITIONING_DROPOUT
+        if dual_head_enabled is None:
+            dual_head_enabled = _DEFAULT_DUAL_HEAD_ENABLED
         
         super(TCNActor, self).__init__(
             name=name,
@@ -611,6 +637,7 @@ class TCNActor(DirichletActor):
             adaptive_temperature_slope=adaptive_temperature_slope,
             adaptive_temperature_min=adaptive_temperature_min,
             adaptive_temperature_max=adaptive_temperature_max,
+            dual_head_enabled=bool(dual_head_enabled),
         )
         
         self.input_dim = input_dim
@@ -703,7 +730,7 @@ class TCNActor(DirichletActor):
 
         # Output
         logits = self.output_layer(x, training=training)
-        return self._compute_alpha(logits)
+        return self._format_actor_output(logits_for_alpha=logits)
 
 
 class TCNAttentionActor(DirichletActor):
@@ -744,6 +771,7 @@ class TCNAttentionActor(DirichletActor):
         adaptive_temperature_slope: float = 0.0,
         adaptive_temperature_min: float = 0.8,
         adaptive_temperature_max: float = 2.5,
+        dual_head_enabled: Optional[bool] = None,
     ):
         # Apply config defaults
         if tcn_filters is None:
@@ -770,6 +798,8 @@ class TCNAttentionActor(DirichletActor):
             regime_conditioning_hidden_dim = _DEFAULT_REGIME_CONDITIONING_HIDDEN_DIM
         if regime_conditioning_dropout is None:
             regime_conditioning_dropout = _DEFAULT_REGIME_CONDITIONING_DROPOUT
+        if dual_head_enabled is None:
+            dual_head_enabled = _DEFAULT_DUAL_HEAD_ENABLED
         
         super(TCNAttentionActor, self).__init__(
             name=name,
@@ -784,6 +814,7 @@ class TCNAttentionActor(DirichletActor):
             adaptive_temperature_slope=adaptive_temperature_slope,
             adaptive_temperature_min=adaptive_temperature_min,
             adaptive_temperature_max=adaptive_temperature_max,
+            dual_head_enabled=bool(dual_head_enabled),
         )
         
         self.input_dim = input_dim
@@ -891,7 +922,7 @@ class TCNAttentionActor(DirichletActor):
 
         # Output
         logits = self.output_layer(x, training=training)
-        return self._compute_alpha(logits)
+        return self._format_actor_output(logits_for_alpha=logits)
 
 
 class TCNFusionActor(DirichletActor):
@@ -944,6 +975,7 @@ class TCNFusionActor(DirichletActor):
         adaptive_temperature_slope: float = 0.0,
         adaptive_temperature_min: float = 0.8,
         adaptive_temperature_max: float = 2.5,
+        dual_head_enabled: Optional[bool] = None,
     ):
         if tcn_filters is None:
             tcn_filters = _DEFAULT_TCN_FILTERS
@@ -983,6 +1015,8 @@ class TCNFusionActor(DirichletActor):
             regime_conditioning_hidden_dim = _DEFAULT_REGIME_CONDITIONING_HIDDEN_DIM
         if regime_conditioning_dropout is None:
             regime_conditioning_dropout = _DEFAULT_REGIME_CONDITIONING_DROPOUT
+        if dual_head_enabled is None:
+            dual_head_enabled = _DEFAULT_DUAL_HEAD_ENABLED
 
         super(TCNFusionActor, self).__init__(
             name=name,
@@ -997,6 +1031,7 @@ class TCNFusionActor(DirichletActor):
             adaptive_temperature_slope=adaptive_temperature_slope,
             adaptive_temperature_min=adaptive_temperature_min,
             adaptive_temperature_max=adaptive_temperature_max,
+            dual_head_enabled=bool(dual_head_enabled),
         )
 
         self.input_dim = int(input_dim)
@@ -1255,7 +1290,7 @@ class TCNFusionActor(DirichletActor):
             alpha_features = fused
 
         logits = self.output_layer(alpha_features, training=training)
-        return self._compute_alpha(logits)
+        return self._format_actor_output(logits_for_alpha=logits)
 
 
 # ============================================================================
@@ -1943,6 +1978,7 @@ def create_actor_critic(architecture: str,
             config.get("distributional_num_quantiles", _DEFAULT_DISTRIBUTIONAL_NUM_QUANTILES)
         ),
     }
+    dual_head_enabled_cfg = bool(config.get("dual_head_enabled", _DEFAULT_DUAL_HEAD_ENABLED))
     if arch_upper == 'TCN':
         if config.get('use_fusion', False):
             resolved_num_assets = int(config.get('num_assets', max(1, num_actions - 1)))
@@ -1965,6 +2001,7 @@ def create_actor_critic(architecture: str,
                 fusion_cross_asset_mixer_dropout=config.get('fusion_cross_asset_mixer_dropout', _DEFAULT_FUSION_CROSS_ASSET_MIXER_DROPOUT),
                 fusion_alpha_head_hidden_dims=config.get('fusion_alpha_head_hidden_dims', _DEFAULT_FUSION_ALPHA_HEAD_HIDDEN_DIMS),
                 fusion_alpha_head_dropout=config.get('fusion_alpha_head_dropout', _DEFAULT_FUSION_ALPHA_HEAD_DROPOUT),
+                dual_head_enabled=dual_head_enabled_cfg,
                 **recurrent_kwargs,
                 **regime_kwargs,
                 **epsilon_kwargs,
@@ -1999,6 +2036,7 @@ def create_actor_critic(architecture: str,
                 attention_heads=config.get('attention_heads', _DEFAULT_ATTENTION_HEADS),
                 attention_dim=config.get('attention_dim', _DEFAULT_ATTENTION_DIM),
                 dropout=config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT),
+                dual_head_enabled=dual_head_enabled_cfg,
                 **recurrent_kwargs,
                 **regime_kwargs,
                 **epsilon_kwargs,
@@ -2023,6 +2061,7 @@ def create_actor_critic(architecture: str,
                 kernel_size=config.get('tcn_kernel_size', _DEFAULT_TCN_KERNEL_SIZE),
                 dilations=config.get('tcn_dilations', _DEFAULT_TCN_DILATIONS),
                 dropout=config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT),
+                dual_head_enabled=dual_head_enabled_cfg,
                 **recurrent_kwargs,
                 **regime_kwargs,
                 **epsilon_kwargs,
@@ -2059,6 +2098,7 @@ def create_actor_critic(architecture: str,
             fusion_cross_asset_mixer_dropout=config.get('fusion_cross_asset_mixer_dropout', _DEFAULT_FUSION_CROSS_ASSET_MIXER_DROPOUT),
             fusion_alpha_head_hidden_dims=config.get('fusion_alpha_head_hidden_dims', _DEFAULT_FUSION_ALPHA_HEAD_HIDDEN_DIMS),
             fusion_alpha_head_dropout=config.get('fusion_alpha_head_dropout', _DEFAULT_FUSION_ALPHA_HEAD_DROPOUT),
+            dual_head_enabled=dual_head_enabled_cfg,
             **recurrent_kwargs,
             **regime_kwargs,
             **epsilon_kwargs,
@@ -2094,6 +2134,7 @@ def create_actor_critic(architecture: str,
             attention_heads=config.get('attention_heads', _DEFAULT_ATTENTION_HEADS),
             attention_dim=config.get('attention_dim', _DEFAULT_ATTENTION_DIM),
             dropout=config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT),
+            dual_head_enabled=dual_head_enabled_cfg,
             **recurrent_kwargs,
             **regime_kwargs,
             **epsilon_kwargs,

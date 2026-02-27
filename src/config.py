@@ -599,6 +599,18 @@ PHASE1_CONFIG = {
         # Optional distributional critic head.
         "distributional_critic_enabled": True,
         "distributional_num_quantiles": 17,
+        # Dual-head policy (Dirichlet + softmax/projection).
+        "dual_head_enabled": False,
+        "dual_head_blend_schedule": [
+            {"threshold": 0, "rho": 0.35},
+            {"threshold": 30_000, "rho": 0.55},
+            {"threshold": 60_000, "rho": 0.70},
+        ],
+        "dual_head_eval_deterministic_rho": 0.90,
+        "dual_head_eval_stochastic_rho": 0.60,
+        "dual_head_projection_use_constraints": False,
+        "dual_head_projection_max_single_position": 0.20,
+        "dual_head_projection_min_cash_position": 0.05,
 
         # Dirichlet alpha activation (controls action concentration)
         "dirichlet_alpha_activation": "softplus",  # Stable strictly-positive alpha map
@@ -651,6 +663,7 @@ PHASE1_CONFIG = {
             "risk_aux_mvo_risky_budget": 0.95,
             "distributional_huber_kappa": 1.0,
             "distributional_mean_loss_coef": 0.1,
+            "dual_head_consistency_coef": 0.0,
             "popart_enabled": True,
             "popart_min_std": 1e-3,
             "multi_horizon_reward_enabled": True,
@@ -958,6 +971,18 @@ PHASE2_CONFIG = {
         # Optional distributional critic head.
         "distributional_critic_enabled": True,
         "distributional_num_quantiles": 17,
+        # Dual-head policy (Dirichlet + softmax/projection).
+        "dual_head_enabled": False,
+        "dual_head_blend_schedule": [
+            {"threshold": 0, "rho": 0.35},
+            {"threshold": 30_000, "rho": 0.55},
+            {"threshold": 60_000, "rho": 0.70},
+        ],
+        "dual_head_eval_deterministic_rho": 0.90,
+        "dual_head_eval_stochastic_rho": 0.60,
+        "dual_head_projection_use_constraints": False,
+        "dual_head_projection_max_single_position": 0.20,
+        "dual_head_projection_min_cash_position": 0.05,
 
         # Dirichlet alpha activation (controls action concentration)
         "dirichlet_alpha_activation": "softplus",  # Stable strictly-positive alpha map
@@ -1008,6 +1033,7 @@ PHASE2_CONFIG = {
             "risk_aux_mvo_risky_budget": 0.95,
             "distributional_huber_kappa": 1.0,
             "distributional_mean_loss_coef": 0.1,
+            "dual_head_consistency_coef": 0.0,
             "popart_enabled": True,
             "popart_min_std": 1e-3,
             "multi_horizon_reward_enabled": True,

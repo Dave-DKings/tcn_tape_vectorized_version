@@ -602,6 +602,13 @@ def _extract_effective_agent_params(
         "state_augmentation_enabled",
         "distributional_critic_enabled",
         "distributional_num_quantiles",
+        "dual_head_enabled",
+        "dual_head_blend_schedule",
+        "dual_head_eval_deterministic_rho",
+        "dual_head_eval_stochastic_rho",
+        "dual_head_projection_use_constraints",
+        "dual_head_projection_max_single_position",
+        "dual_head_projection_min_cash_position",
         "logit_temperature",
         "alpha_cap",
         "num_assets",
@@ -1088,6 +1095,7 @@ def create_experiment6_result_stub(
             "multi_horizon_reward_weights": [0.25, 0.25, 0.25, 0.25],
             "distributional_huber_kappa": 1.0,
             "distributional_mean_loss_coef": 0.1,
+            "dual_head_consistency_coef": 0.0,
         },
         "debug_prints": False,
         "dirichlet_epsilon": {
@@ -1118,6 +1126,17 @@ def create_experiment6_result_stub(
         "state_augmentation_enabled": False,
         "distributional_critic_enabled": False,
         "distributional_num_quantiles": 17,
+        "dual_head_enabled": False,
+        "dual_head_blend_schedule": [
+            {"threshold": 0, "rho": 0.35},
+            {"threshold": 30000, "rho": 0.55},
+            {"threshold": 60000, "rho": 0.70},
+        ],
+        "dual_head_eval_deterministic_rho": 0.90,
+        "dual_head_eval_stochastic_rho": 0.60,
+        "dual_head_projection_use_constraints": False,
+        "dual_head_projection_max_single_position": 0.20,
+        "dual_head_projection_min_cash_position": 0.05,
         "max_total_timesteps": max_total_timesteps,
     }
 
@@ -3348,7 +3367,15 @@ def run_experiment6_tape(
                             alpha_state_input, _ = agent.prepare_state_input(agent._latest_sequence)
                         else:
                             alpha_state_input, _ = agent.prepare_state_input(obs_eval)
-                        alpha_eval = agent.actor(alpha_state_input, training=False)
+                        actor_eval_out = agent.actor(alpha_state_input, training=False)
+                        if hasattr(agent, "_split_actor_outputs"):
+                            alpha_eval, _ = agent._split_actor_outputs(actor_eval_out)
+                        elif isinstance(actor_eval_out, dict):
+                            alpha_eval = actor_eval_out.get("alpha", actor_eval_out)
+                        elif isinstance(actor_eval_out, (tuple, list)) and len(actor_eval_out) > 0:
+                            alpha_eval = actor_eval_out[0]
+                        else:
+                            alpha_eval = actor_eval_out
                         alpha_eval = tf.convert_to_tensor(alpha_eval, dtype=tf.float32)
                         alpha_np = np.asarray(alpha_eval.numpy()).reshape(-1)
                         if alpha_np.size > 0:
@@ -5827,9 +5854,22 @@ def evaluate_experiment6_checkpoint(
         else:
             state_input, needs_squeeze = agent_eval.prepare_state_input(obs_tensor)
         
-        # Single actor forward pass to get alpha values
-        alpha_raw = agent_eval.actor(state_input, training=False)
-        alpha = tf.cast(alpha_raw, tf.float32)
+        # Single actor forward pass to get alpha values (+ optional projection logits)
+        actor_raw = agent_eval.actor(state_input, training=False)
+        projection_logits = None
+        if hasattr(agent_eval, "_split_actor_outputs"):
+            alpha, projection_logits = agent_eval._split_actor_outputs(actor_raw)
+        elif isinstance(actor_raw, dict):
+            alpha = tf.cast(actor_raw.get("alpha", actor_raw), tf.float32)
+            projection_logits = actor_raw.get("projection_logits")
+            if projection_logits is not None:
+                projection_logits = tf.cast(projection_logits, tf.float32)
+        elif isinstance(actor_raw, (tuple, list)) and len(actor_raw) > 0:
+            alpha = tf.cast(actor_raw[0], tf.float32)
+            if len(actor_raw) > 1:
+                projection_logits = tf.cast(actor_raw[1], tf.float32)
+        else:
+            alpha = tf.cast(actor_raw, tf.float32)
         alpha = tf.maximum(alpha, tf.constant(1e-6, dtype=alpha.dtype))  # Ensure alpha > 0
         alpha_values = alpha.numpy()[0] if needs_squeeze else alpha.numpy()  # Store for return
         
@@ -5871,6 +5911,15 @@ def evaluate_experiment6_checkpoint(
             
             action = tf.where(use_formula, mode_formula, mode_vertex)
         
+        if projection_logits is not None and hasattr(agent_eval, "_blend_action_with_projection"):
+            action = agent_eval._blend_action_with_projection(
+                action,
+                projection_logits,
+                deterministic=(mode_name != "sample"),
+                stochastic=(mode_name == "sample"),
+                use_eval_settings=True,
+            )
+
         # Get log probability
         log_prob = dirichlet.log_prob(action)
         
