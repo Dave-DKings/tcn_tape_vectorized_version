@@ -2486,22 +2486,23 @@ def run_experiment6_tape(
     episode_horizon_start = determine_episode_limit(0, experiment_train_df["Date"].nunique())
 
     drawdown_constraint_cfg = _prepare_drawdown_constraint(config, arch_upper)
-    if not drawdown_constraint_cfg or not drawdown_constraint_cfg.get("enabled", False):
-        raise ValueError(
-            "Drawdown constraint must be enabled for Experiment 6 runs. "
-            "Check PHASE1_CONFIG['environment_params']['drawdown_constraint']."
-        )
-    dd_target = drawdown_constraint_cfg.get("target", 0.0)
-    dd_tol = drawdown_constraint_cfg.get("tolerance", 0.0)
-    boundary = dd_target + dd_tol
-    print(
-        f"   🔒 Drawdown dual controller (requested): target={dd_target:.2%}, tolerance={dd_tol:.2%} "
-        f"(trigger boundary ≈ {boundary:.2%}), lr={drawdown_constraint_cfg.get('dual_learning_rate', 0.0):.3f}, "
-        f"λ_init={drawdown_constraint_cfg.get('lambda_init', 0.0):.2f}, "
-        f"λ_floor={drawdown_constraint_cfg.get('lambda_floor', 0.0):.2f}, "
-        f"λ_max={drawdown_constraint_cfg.get('lambda_max', 0.0):.2f}, "
-        f"penalty_coef={drawdown_constraint_cfg.get('penalty_coef', drawdown_constraint_cfg.get('base_coef', 0.0)):.2f}"
+    drawdown_controller_requested = bool(
+        drawdown_constraint_cfg and drawdown_constraint_cfg.get("enabled", False)
     )
+    if drawdown_controller_requested:
+        dd_target = drawdown_constraint_cfg.get("target", 0.0)
+        dd_tol = drawdown_constraint_cfg.get("tolerance", 0.0)
+        boundary = dd_target + dd_tol
+        print(
+            f"   🔒 Drawdown dual controller (requested): target={dd_target:.2%}, tolerance={dd_tol:.2%} "
+            f"(trigger boundary ≈ {boundary:.2%}), lr={drawdown_constraint_cfg.get('dual_learning_rate', 0.0):.3f}, "
+            f"λ_init={drawdown_constraint_cfg.get('lambda_init', 0.0):.2f}, "
+            f"λ_floor={drawdown_constraint_cfg.get('lambda_floor', 0.0):.2f}, "
+            f"λ_max={drawdown_constraint_cfg.get('lambda_max', 0.0):.2f}, "
+            f"penalty_coef={drawdown_constraint_cfg.get('penalty_coef', drawdown_constraint_cfg.get('base_coef', 0.0)):.2f}"
+        )
+    else:
+        print("   🔓 Drawdown dual controller: disabled (de-constrained mode)")
 
     def _create_train_env() -> PortfolioEnvTAPE:
         env_obj = PortfolioEnvTAPE(
@@ -2535,7 +2536,7 @@ def run_experiment6_tape(
         )
         if episode_horizon_start is not None:
             env_obj.set_episode_length_limit(episode_horizon_start)
-        if not getattr(env_obj, "drawdown_constraint_enabled", False):
+        if drawdown_controller_requested and not getattr(env_obj, "drawdown_constraint_enabled", False):
             raise RuntimeError("Drawdown controller is not enabled on env_train despite configuration.")
         return env_obj
 
@@ -2545,15 +2546,18 @@ def run_experiment6_tape(
         for _ in range(1, num_parallel_envs):
             train_envs.append(_create_train_env())
 
-    print(
-        "   ✅ Drawdown controller armed in env: "
-        f"target={env_train.drawdown_target:.2%}, "
-        f"trigger={env_train.drawdown_trigger_boundary:.2%}, "
-        f"λ_init={env_train.drawdown_lambda_init:.3f}, "
-        f"λ_floor={env_train.drawdown_lambda_floor:.3f}, "
-        f"λ_max={env_train.drawdown_lambda_max:.2f}, "
-        f"penalty_coef={env_train.drawdown_penalty_coef:.2f}"
-    )
+    if getattr(env_train, "drawdown_constraint_enabled", False):
+        print(
+            "   ✅ Drawdown controller armed in env: "
+            f"target={env_train.drawdown_target:.2%}, "
+            f"trigger={env_train.drawdown_trigger_boundary:.2%}, "
+            f"λ_init={env_train.drawdown_lambda_init:.3f}, "
+            f"λ_floor={env_train.drawdown_lambda_floor:.3f}, "
+            f"λ_max={env_train.drawdown_lambda_max:.2f}, "
+            f"penalty_coef={env_train.drawdown_penalty_coef:.2f}"
+        )
+    else:
+        print("   ✅ Drawdown controller disabled in env (as configured)")
 
     env_test_deterministic = PortfolioEnvTAPE(
         config=config,
@@ -4982,13 +4986,22 @@ def run_experiment6_tape(
                     episode_terminal_info.get("intra_step_tape_delta_reward", terminal_intra_step_tape_delta_reward)
                 )
                 tape_score_for_log = episode_terminal_info.get("tape_score", 0.0)
-                print(
-                    "   🔒 Drawdown λ "
-                    f"snapshot={snapshot_drawdown_lambda:.3f} (peak {snapshot_drawdown_lambda_peak:.3f}, "
-                    f"dd {snapshot_drawdown_current*100.0:.2f}% / trig {snapshot_drawdown_trigger_boundary*100.0:.2f}%) | "
-                    f"terminal={terminal_drawdown_lambda:.3f} (peak {terminal_drawdown_lambda_peak:.3f}) | "
-                    f"TAPE={tape_score_for_log:.4f}"
-                )
+                if getattr(env_train, "drawdown_constraint_enabled", False):
+                    snapshot_drawdown_lambda_disp = float(snapshot_drawdown_lambda or 0.0)
+                    snapshot_drawdown_lambda_peak_disp = float(snapshot_drawdown_lambda_peak or 0.0)
+                    snapshot_drawdown_current_disp = float(snapshot_drawdown_current or 0.0)
+                    snapshot_drawdown_trigger_boundary_disp = float(snapshot_drawdown_trigger_boundary or 0.0)
+                    terminal_drawdown_lambda_disp = float(terminal_drawdown_lambda or 0.0)
+                    terminal_drawdown_lambda_peak_disp = float(terminal_drawdown_lambda_peak or 0.0)
+                    print(
+                        "   🔒 Drawdown λ "
+                        f"snapshot={snapshot_drawdown_lambda_disp:.3f} (peak {snapshot_drawdown_lambda_peak_disp:.3f}, "
+                        f"dd {snapshot_drawdown_current_disp*100.0:.2f}% / trig {snapshot_drawdown_trigger_boundary_disp*100.0:.2f}%) | "
+                        f"terminal={terminal_drawdown_lambda_disp:.3f} (peak {terminal_drawdown_lambda_peak_disp:.3f}) | "
+                        f"TAPE={tape_score_for_log:.4f}"
+                    )
+                else:
+                    print(f"   🎚️ Terminal TAPE snapshot={tape_score_for_log:.4f}")
 
             training_row = {
                 "update": update_count,
