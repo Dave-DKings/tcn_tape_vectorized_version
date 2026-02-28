@@ -1450,12 +1450,17 @@ class DataProcessor:
 
             df.drop(columns=["Market_Return_RollingVar"], inplace=True, errors="ignore")
 
-        # OBV delta normalization
+        # OBV delta normalization.
+        # Build it directly from close/volume so the feature remains available
+        # even when raw OBV is pruned from technical-indicator outputs.
         obv_window = int(alpha_cfg.get("obv_window", 21))
-        if obv_window > 1 and "OBV" in df.columns:
-            obv_delta = df.groupby(self.ticker_col)["OBV"].diff()
-            obv_std = df.groupby(self.ticker_col)["OBV"].transform(
-                lambda s: s.diff().rolling(obv_window, min_periods=obv_window).std()
+        if obv_window > 1 and self.close_col in df.columns and self.volume_col in df.columns:
+            close_diff = df.groupby(self.ticker_col)[self.close_col].diff().fillna(0.0)
+            signed_volume = np.sign(close_diff) * pd.to_numeric(df[self.volume_col], errors="coerce").fillna(0.0)
+            obv_proxy = signed_volume.groupby(df[self.ticker_col]).cumsum()
+            obv_delta = obv_proxy.groupby(df[self.ticker_col]).diff()
+            obv_std = obv_delta.groupby(df[self.ticker_col]).transform(
+                lambda s: s.rolling(obv_window, min_periods=obv_window).std()
             )
             feature_name = f"OBV_Delta_Norm_{obv_window}"
             df[feature_name] = obv_delta / (obv_std + eps)
