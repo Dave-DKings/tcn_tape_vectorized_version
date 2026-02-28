@@ -1442,8 +1442,26 @@ class PPOAgentTF:
 
         alpha = _to_tensor_with_cast(alpha, tf.float32)
         weights = alpha / tf.maximum(tf.reduce_sum(alpha, axis=-1, keepdims=True), 1e-8)
-        risky_weights = weights[:, :self.num_assets]
-        cash_weights = weights[:, self.num_assets]
+
+        # Support both policy output formats:
+        #   1) risky-only simplex of size num_assets (cash is residual)
+        #   2) risky+cash simplex of size num_assets+1
+        asset_dim = tf.shape(asset_returns)[-1]
+        weight_dim = tf.shape(weights)[-1]
+        shared_dim = tf.minimum(weight_dim, asset_dim)
+        risky_weights = weights[:, :shared_dim]
+        # If actor emits fewer risky dimensions than asset returns, pad with zeros.
+        pad_dim = tf.maximum(asset_dim - shared_dim, 0)
+        risky_weights = tf.pad(risky_weights, paddings=[[0, 0], [0, pad_dim]])
+        risky_weights = risky_weights[:, :asset_dim]
+
+        def _cash_from_explicit():
+            return weights[:, asset_dim]
+
+        def _cash_from_residual():
+            return tf.maximum(1.0 - tf.reduce_sum(risky_weights, axis=-1), 0.0)
+
+        cash_weights = tf.cond(weight_dim > asset_dim, _cash_from_explicit, _cash_from_residual)
         cash_ret = tf.constant(self.risk_aux_cash_return, dtype=tf.float32)
         portfolio_proxy_returns = tf.reduce_sum(risky_weights * asset_returns, axis=-1) + cash_weights * cash_ret
 
