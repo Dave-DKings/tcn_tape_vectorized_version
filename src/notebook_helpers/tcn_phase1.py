@@ -656,6 +656,11 @@ def _extract_effective_agent_params(
                 "fusion_cross_asset_mixer_layers",
                 "fusion_cross_asset_mixer_expansion",
                 "fusion_cross_asset_mixer_dropout",
+                "fusion_asset_identity_enabled",
+                "fusion_context_cross_attention_enabled",
+                "fusion_context_cross_attention_heads",
+                "fusion_context_cross_attention_dropout",
+                "fusion_per_asset_alpha_head",
                 "fusion_alpha_head_hidden_dims",
                 "fusion_alpha_head_dropout",
             ]:
@@ -1115,16 +1120,21 @@ def create_experiment6_result_stub(
         "fusion_cross_asset_mixer_layers": 1,
         "fusion_cross_asset_mixer_expansion": 2.0,
         "fusion_cross_asset_mixer_dropout": 0.1,
+        "fusion_asset_identity_enabled": True,
+        "fusion_context_cross_attention_enabled": True,
+        "fusion_context_cross_attention_heads": 4,
+        "fusion_context_cross_attention_dropout": 0.1,
+        "fusion_per_asset_alpha_head": True,
         "fusion_alpha_head_hidden_dims": [],
         "fusion_alpha_head_dropout": 0.1,
-        "recurrent_memory_enabled": False,
+        "recurrent_memory_enabled": True,
         "recurrent_memory_units": 64,
         "recurrent_memory_dropout": 0.1,
-        "regime_conditioning_enabled": False,
+        "regime_conditioning_enabled": True,
         "regime_conditioning_hidden_dim": 32,
         "regime_conditioning_dropout": 0.0,
-        "state_augmentation_enabled": False,
-        "distributional_critic_enabled": False,
+        "state_augmentation_enabled": True,
+        "distributional_critic_enabled": True,
         "distributional_num_quantiles": 17,
         "dual_head_enabled": False,
         "dual_head_blend_schedule": [
@@ -1469,6 +1479,32 @@ def load_training_metadata_into_config(
                 f"dims={agent_params.get('fusion_alpha_head_hidden_dims', [])} | "
                 f"dropout={agent_params.get('fusion_alpha_head_dropout', agent_params.get('fusion_dropout'))}"
             )
+            print(
+                "   Fusion v2 cross-attn: "
+                f"asset_identity={bool(agent_params.get('fusion_asset_identity_enabled', False))} | "
+                f"context_cross_attn={bool(agent_params.get('fusion_context_cross_attention_enabled', False))} | "
+                f"ctx_heads={agent_params.get('fusion_context_cross_attention_heads', 4)} | "
+                f"ctx_dropout={agent_params.get('fusion_context_cross_attention_dropout', agent_params.get('fusion_dropout'))} | "
+                f"per_asset_alpha_head={bool(agent_params.get('fusion_per_asset_alpha_head', False))}"
+            )
+        print(
+            "   Recurrent memory: "
+            f"enabled={bool(agent_params.get('recurrent_memory_enabled', False))} | "
+            f"units={agent_params.get('recurrent_memory_units', 64)} | "
+            f"dropout={agent_params.get('recurrent_memory_dropout', 0.1)}"
+        )
+        print(
+            "   Regime conditioning: "
+            f"enabled={bool(agent_params.get('regime_conditioning_enabled', False))} | "
+            f"hidden_dim={agent_params.get('regime_conditioning_hidden_dim', 32)} | "
+            f"dropout={agent_params.get('regime_conditioning_dropout', 0.0)} | "
+            f"state_aug={bool(agent_params.get('state_augmentation_enabled', False))}"
+        )
+        print(
+            "   Distributional critic: "
+            f"enabled={bool(agent_params.get('distributional_critic_enabled', False))} | "
+            f"num_quantiles={agent_params.get('distributional_num_quantiles', 17)}"
+        )
         print(
             "   Dirichlet controls: "
             f"activation={agent_params.get('dirichlet_alpha_activation')} | "
@@ -1480,6 +1516,17 @@ def load_training_metadata_into_config(
             f"alpha_cap={agent_params.get('dirichlet_alpha_cap', agent_params.get('alpha_cap', None))} | "
             f"epsilon={agent_params.get('dirichlet_epsilon')}"
         )
+        print(
+            "   Dual-head: "
+            f"enabled={bool(agent_params.get('dual_head_enabled', False))} | "
+            f"blend_schedule={agent_params.get('dual_head_blend_schedule')} | "
+            f"eval_rho_det={agent_params.get('dual_head_eval_deterministic_rho', 0.90)} | "
+            f"eval_rho_stoch={agent_params.get('dual_head_eval_stochastic_rho', 0.60)} | "
+            f"use_constraints={bool(agent_params.get('dual_head_projection_use_constraints', False))}"
+        )
+        ppo_meta = agent_params.get("ppo_params", {}) if isinstance(agent_params.get("ppo_params"), dict) else {}
+        if "dual_head_consistency_coef" in ppo_meta:
+            print(f"   Dual-head consistency coef: {ppo_meta.get('dual_head_consistency_coef')}")
         print(f"   Turnover target: {env_params.get('target_turnover')}")
         print(f"   DSR scalar: {env_params.get('dsr_scalar')}")
         if training_params.get("timesteps_per_ppo_update_schedule"):
@@ -2778,6 +2825,14 @@ def run_experiment6_tape(
             f"dims={agent_config.get('fusion_alpha_head_hidden_dims', [])} | "
             f"dropout={agent_config.get('fusion_alpha_head_dropout', agent_config.get('fusion_dropout'))}"
         )
+        print(
+            "   🧭 Fusion v2 cross-attn: "
+            f"asset_identity={bool(agent_config.get('fusion_asset_identity_enabled', False))} | "
+            f"context_cross_attn={bool(agent_config.get('fusion_context_cross_attention_enabled', False))} | "
+            f"ctx_heads={agent_config.get('fusion_context_cross_attention_heads', 4)} | "
+            f"ctx_dropout={agent_config.get('fusion_context_cross_attention_dropout', agent_config.get('fusion_dropout'))} | "
+            f"per_asset_alpha_head={bool(agent_config.get('fusion_per_asset_alpha_head', False))}"
+        )
     print(
         "   🧠 Recurrent memory: "
         f"enabled={bool(agent_config.get('recurrent_memory_enabled', False))} | "
@@ -2810,6 +2865,16 @@ def run_experiment6_tape(
         f"alpha_cap={agent_config.get('dirichlet_alpha_cap', agent_config.get('alpha_cap', None))} | "
         f"epsilon={agent_config.get('dirichlet_epsilon')}"
     )
+    print(
+        "   🧷 Dual-head: "
+        f"enabled={bool(agent_config.get('dual_head_enabled', False))} | "
+        f"blend_schedule={agent_config.get('dual_head_blend_schedule')} | "
+        f"eval_rho_det={agent_config.get('dual_head_eval_deterministic_rho', 0.90)} | "
+        f"eval_rho_stoch={agent_config.get('dual_head_eval_stochastic_rho', 0.60)} | "
+        f"use_constraints={bool(agent_config.get('dual_head_projection_use_constraints', False))}"
+    )
+    if isinstance(agent_config.get("ppo_params"), dict):
+        print(f"   🧷 Dual-head consistency coef: {agent_config.get('ppo_params', {}).get('dual_head_consistency_coef', 0.0)}")
     initial_rollout_len = determine_timesteps_per_update(0)
     initial_batch_size = determine_batch_size_ppo(0, initial_rollout_len)
     print(
@@ -3998,9 +4063,44 @@ def run_experiment6_tape(
             "fusion_cross_asset_mixer_dropout": copy.deepcopy(
                 agent_config.get("fusion_cross_asset_mixer_dropout", agent_config.get("fusion_dropout"))
             ),
+            "fusion_asset_identity_enabled": bool(
+                agent_config.get("fusion_asset_identity_enabled", False)
+            ),
+            "fusion_context_cross_attention_enabled": bool(
+                agent_config.get("fusion_context_cross_attention_enabled", False)
+            ),
+            "fusion_context_cross_attention_heads": copy.deepcopy(
+                agent_config.get("fusion_context_cross_attention_heads", 4)
+            ),
+            "fusion_context_cross_attention_dropout": copy.deepcopy(
+                agent_config.get(
+                    "fusion_context_cross_attention_dropout",
+                    agent_config.get("fusion_dropout"),
+                )
+            ),
+            "fusion_per_asset_alpha_head": bool(
+                agent_config.get("fusion_per_asset_alpha_head", False)
+            ),
             "fusion_alpha_head_hidden_dims": copy.deepcopy(agent_config.get("fusion_alpha_head_hidden_dims", [])),
             "fusion_alpha_head_dropout": copy.deepcopy(
                 agent_config.get("fusion_alpha_head_dropout", agent_config.get("fusion_dropout"))
+            ),
+            "dual_head_enabled": bool(agent_config.get("dual_head_enabled", False)),
+            "dual_head_blend_schedule": copy.deepcopy(agent_config.get("dual_head_blend_schedule")),
+            "dual_head_eval_deterministic_rho": copy.deepcopy(
+                agent_config.get("dual_head_eval_deterministic_rho")
+            ),
+            "dual_head_eval_stochastic_rho": copy.deepcopy(
+                agent_config.get("dual_head_eval_stochastic_rho")
+            ),
+            "dual_head_projection_use_constraints": bool(
+                agent_config.get("dual_head_projection_use_constraints", False)
+            ),
+            "dual_head_projection_max_single_position": copy.deepcopy(
+                agent_config.get("dual_head_projection_max_single_position")
+            ),
+            "dual_head_projection_min_cash_position": copy.deepcopy(
+                agent_config.get("dual_head_projection_min_cash_position")
             ),
             "recurrent_memory_enabled": bool(agent_config.get("recurrent_memory_enabled", False)),
             "recurrent_memory_units": copy.deepcopy(agent_config.get("recurrent_memory_units", 64)),
@@ -5720,6 +5820,14 @@ def evaluate_experiment6_checkpoint(
             f"dims={agent_config_eval.get('fusion_alpha_head_hidden_dims', [])} | "
             f"dropout={agent_config_eval.get('fusion_alpha_head_dropout', agent_config_eval.get('fusion_dropout'))}"
         )
+        print(
+            "   🧭 Eval fusion v2 cross-attn: "
+            f"asset_identity={bool(agent_config_eval.get('fusion_asset_identity_enabled', False))} | "
+            f"context_cross_attn={bool(agent_config_eval.get('fusion_context_cross_attention_enabled', False))} | "
+            f"ctx_heads={agent_config_eval.get('fusion_context_cross_attention_heads', 4)} | "
+            f"ctx_dropout={agent_config_eval.get('fusion_context_cross_attention_dropout', agent_config_eval.get('fusion_dropout'))} | "
+            f"per_asset_alpha_head={bool(agent_config_eval.get('fusion_per_asset_alpha_head', False))}"
+        )
     print(
         "   🧠 Eval recurrent memory: "
         f"enabled={bool(agent_config_eval.get('recurrent_memory_enabled', False))} | "
@@ -5748,6 +5856,19 @@ def evaluate_experiment6_checkpoint(
         f"alpha_cap={agent_config_eval.get('dirichlet_alpha_cap', agent_config_eval.get('alpha_cap', None))} | "
         f"epsilon={agent_config_eval.get('dirichlet_epsilon')}"
     )
+    print(
+        "   🧷 Eval dual-head: "
+        f"enabled={bool(agent_config_eval.get('dual_head_enabled', False))} | "
+        f"blend_schedule={agent_config_eval.get('dual_head_blend_schedule')} | "
+        f"eval_rho_det={agent_config_eval.get('dual_head_eval_deterministic_rho', 0.90)} | "
+        f"eval_rho_stoch={agent_config_eval.get('dual_head_eval_stochastic_rho', 0.60)} | "
+        f"use_constraints={bool(agent_config_eval.get('dual_head_projection_use_constraints', False))}"
+    )
+    if isinstance(agent_config_eval.get("ppo_params"), dict):
+        print(
+            f"   🧷 Eval dual-head consistency coef: "
+            f"{agent_config_eval.get('ppo_params', {}).get('dual_head_consistency_coef', 0.0)}"
+        )
 
     agent_eval = PPOAgentTF(
         state_dim=state_dim,
