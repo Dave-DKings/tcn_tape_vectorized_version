@@ -46,21 +46,13 @@ EQUAL_WEIGHT_CASH_ALLOCATION = 1.0 / (NUM_ASSETS + 1)  # Equal split across asse
 
 # --- FEATURE ENGINEERING CONFIGURATION (TEMPLATES) ---
 TECHNICAL_INDICATORS_CONFIG = [
-    {"name": "EMA", "params": {"length": 12}, "output_cols": ["EMA_12"]},
-    {"name": "EMA", "params": {"length": 26}, "output_cols": ["EMA_26"]},
-    {"name": "BBANDS", "params": {"length": 20, "std": 2}, "output_cols": ["BBL_20_2.0", "BBM_20_2.0", "BBU_20_2.0"]},
-    {"name": "MACD", "params": {"fast": 12, "slow": 26, "signal": 9}, "output_cols": ["MACD_12_26_9", "MACDh_12_26_9", "MACDs_12_26_9"]},
+    # Retained technical indicators only (feature-audit active set).
+    {"name": "MACD", "params": {"fast": 12, "slow": 26, "signal": 9}, "output_cols": ["MACDh_12_26_9"]},
     {"name": "RSI", "params": {"length": 14}, "output_cols": ["RSI_14"]},
-    # Adding the other 9 TIs from the full list for a comprehensive baseline
-    {"name": "STOCH", "params": {"k": 14, "d": 3, "smooth_k": 3}, "output_cols": ["STOCHk_14_3_3", "STOCHd_14_3_3"]},
-    {"name": "WILLR", "params": {"length": 14}, "output_cols": ["WILLR_14"]},
-    {"name": "SMA_price", "params": {"length": 50}, "output_cols": ["SMA_50"]}, # Renamed to avoid conflict
-    {"name": "ADX", "params": {"length": 14}, "output_cols": ["ADX_14", "DMP_14", "DMN_14"]},
-    {"name": "ATR", "params": {"length": 14, "mamode":"ema"}, "output_cols": ["ATRr_14"]},
+    {"name": "STOCH", "params": {"k": 14, "d": 3, "smooth_k": 3}, "output_cols": ["STOCHd_14_3_3"]},
+    {"name": "ADX", "params": {"length": 14}, "output_cols": ["ADX_14"]},
     {"name": "NATR", "params": {"length": 14}, "output_cols": ["NATR_14"]},
-    {"name": "SMA_volume", "params": {"length": 20, "close_col_name": "Volume"}, "output_cols": ["VOL_SMA_20"]},
-    {"name": "OBV", "params": {}, "output_cols": ["OBV"]},
-    {"name": "MFI", "params": {"length": 14}, "output_cols": ["MFI_14"]}
+    {"name": "MFI", "params": {"length": 14}, "output_cols": ["MFI_14"]},
 ]
 
 CANDLESTICK_FEATURES_CONFIG = {
@@ -78,7 +70,8 @@ TEMPORAL_FORECAST_PARAMS = {
 
 DYNAMIC_COVARIANCE_PARAMS = {
     "covariance_window_length": 60, "feature_extraction_methods": ["eigenvalues"],
-    "num_eigenvalues": min(3, NUM_ASSETS)
+    # Keep only active covariance channels.
+    "num_eigenvalues": min(2, NUM_ASSETS)
 }
 
 ACTUARIAL_PARAMS = {
@@ -96,69 +89,10 @@ FUNDAMENTAL_FEATURES_CONFIG = {
     "staleness_days_normalizer": 90.0
 }
 
-# Phase-1/2 feature pruning policy:
-# - remove strongly redundant trend/oscillator channels
-# - remove binary beta flags (continuous beta/rank already available)
-# - reduce redundant policy-rate level channels (prefer diff/zscore dynamics)
-PHASE12_REDUNDANT_FEATURES_TO_DISABLE = [
-    "EMA_12",
-    "EMA_26",
-    "BBM_20_2.0",
-    "SMA_50",
-    "STOCHk_14_3_3",
-    "WILLR_14",
-    "HighBeta_Flag",
-    "LowBeta_Flag",
-    "EFFR_level",
-    "FEDFUNDS_level",
-    # Legacy macro outputs retained in some metadata snapshots; prune explicitly.
-    "ISM_MAN_PMI_level",
-    "ISM_MAN_PMI_diff",
-]
-
-# Feature-audit pruning (2026-02-22):
-# Target active feature space: 52 non-actuarial features (+4 actuarial = 56).
-# Notes:
-# - Keeps VIX_zscore (implied-vol context), while dropping VIX_level.
-# - Applies high-confidence redundancy/noise removals from audit.
-# - Uses drop-only policy to avoid introducing new engineered columns mid-run.
-PHASE12_AUDIT_FEATURES_TO_DISABLE = [
-    # Technical overlap / non-stationary channels
-    "BBL_20_2.0",
-    "BBU_20_2.0",
-    "MACD_12_26_9",
-    "MACDs_12_26_9",
-    "ATRr_14",
-    "VOL_SMA_20",
-    "OBV",
-    # Directional movement pair (collapsed out of baseline to reduce dimension)
-    "DMP_14",
-    "DMN_14",
-    # Covariance tail noise
-    "Covariance_Eigenvalue_2",
-    # Fundamental redundancies
-    "Fundamental_FCFE_Sign",
-    "Fundamental_Staleness_Quarters",
-    # Interest-rate redundancy cluster
-    "EFFR_diff",
-    "EFFR_zscore",
-    "SOFR_level",
-    "FEDFUNDS_diff",
-    "FEDFUNDS_zscore",
-    "DGS10_slope",
-    "DGS2_level",
-    "DGS2_diff",
-    # Inflation overlap
-    "BreakevenInf5Y_level",
-    "BreakevenInf5Y_diff",
-    # Credit redundancy
-    "IG_Credit_level",
-    "IG_Credit_diff",
-    "HY_Credit_level",
-]
-
-# Canonical Exp6 feature-audit active set (52 non-actuarial features).
+# Canonical Exp6 feature-audit active set.
 # This is enforced via allowlist to keep training/evaluation deterministic.
+# Non-actuarial count: 55 (includes 3 regime-buy features)
+# Total count: 59 (55 + 4 actuarial)
 PHASE12_AUDIT_ACTIVE_FEATURES_NON_ACTUARIAL = [
     # Returns + risk moments
     "LogReturn_1d",
@@ -218,6 +152,10 @@ PHASE12_AUDIT_ACTIVE_FEATURES_NON_ACTUARIAL = [
     "HY_Credit_diff",
     "HY_Credit_zscore",
     "VIX_zscore",
+    # Regime-conditioned buy signal block
+    "BuyProb_Regime",
+    "BuyEdge_Regime",
+    "BuyFlag_Regime",
 ]
 
 PHASE12_AUDIT_ACTIVE_FEATURES_ACTUARIAL = [
@@ -234,49 +172,10 @@ PHASE12_AUDIT_ACTIVE_FEATURES = list(
     )
 )
 
-def _ordered_unique(items):
-    """Preserve first occurrence order while removing duplicates."""
-    return list(dict.fromkeys(items))
-
-FEATURES_TO_DISABLE = [
-    "BAMLC0A0CMEY_level",
-    "BAMLC0A0CMEY_diff",
-    "BAMLC0A0CMEY_zscore",
-    "BAMLH0A0HYM2_level",
-    "BAMLH0A0HYM2_diff",
-    "BAMLH0A0HYM2_zscore",
-    "DAAA_level",
-    "DAAA_zscore",
-    "VIX_level",
-    "MOVE_level",
-    "MOVE_zscore",
-    "UNRATE_level",
-    "UNRATE_diff",
-    "UNRATE_zscore",
-    "PAYEMS_level",
-    "PAYEMS_diff",
-    "PAYEMS_yoy",
-    "ICSA_level",
-    "ICSA_diff",
-    "INDPRO_level",
-    "INDPRO_diff",
-    "INDPRO_yoy",
-    "CPI_level",
-    "CPI_mom",
-    "CPI_yoy",
-    "PPI_level",
-    "PPI_mom",
-    "PPI_yoy",
-    "FedBalanceSheet_level",
-    "FedBalanceSheet_diff",
-    "ON_RRP_level",
-    "ON_RRP_diff",
-] + PHASE12_REDUNDANT_FEATURES_TO_DISABLE + PHASE12_AUDIT_FEATURES_TO_DISABLE
-
-FEATURES_TO_DISABLE = _ordered_unique(FEATURES_TO_DISABLE)
+FEATURES_TO_DISABLE = []
 
 FEATURE_SELECTION_CONFIG = {
-    "disable_features": True,
+    "disable_features": False,
     "disabled_features": FEATURES_TO_DISABLE,
     # Enforce the audit plan globally (Phase 1 and eval paths).
     "enforce_allowlist": True,
@@ -298,7 +197,23 @@ ALPHA_FEATURES_CONFIG = {
     "obv_window": 21,
     "yield_curve": {
         "long_col": "DGS10_level",
-        "short_col": "DGS2_level",
+        "short_col": None,
+        # Prefer direct spread series when available.
+        "spread_source_col": "T10Y2Y_level",
+    },
+    # Leakage-safe regime-conditioned buy signal features (optional).
+    # Produces: BuyProb_Regime, BuyEdge_Regime, BuyFlag_Regime.
+    "regime_buy_signal": {
+        "enabled": True,
+        "lookback_window": 252,
+        "min_history": 40,
+        "prior_alpha": 5.0,
+        "prior_beta": 5.0,
+        "buy_threshold": 0.55,
+        "use_relative_to_market": True,
+        "market_vol_short_window": 21,
+        "market_vol_long_window": 126,
+        "high_vol_ratio_threshold": 1.05,
     },
     "retain_market_return": False,
     "epsilon": 1e-9,
@@ -306,7 +221,8 @@ ALPHA_FEATURES_CONFIG = {
 
 # Cross-Sectional Features Configuration (Asset Differentiation)
 CROSS_SECTIONAL_FEATURES_CONFIG = {
-    "enabled": True,
+    # Disabled by default to keep runtime features strictly on the audit set.
+    "enabled": False,
     "momentum_windows": [21, 63, 252],  # Short/medium/long-term momentum rankings
     "zscore_features": [  # Features to standardize cross-sectionally
         "LogReturn_1d",
@@ -321,25 +237,15 @@ CROSS_SECTIONAL_FEATURES_CONFIG = {
 
 FRED_API_KEY = "da9d24dd8de4f924dcbc8416e539b4ef" # User's actual FRED API Key
 FRED_SERIES_CONFIG = [
-    {"code": "EFFR", "name": "EFFR", "freq": "d", "calc": ["diff", "zscore"]},
-    {"code": "SOFR", "name": "SOFR", "freq": "d", "calc": ["level", "diff"]},
-    {"code": "FEDFUNDS", "name": "FEDFUNDS", "freq": "m", "calc": ["diff", "zscore"]},
-    {"code": "DGS10", "name": "DGS10", "freq": "d", "calc": ["level", "diff", "slope"]},
-    {"code": "DGS2", "name": "DGS2", "freq": "d", "calc": ["level", "diff"]},
+    # Keep only macro channels used by the active allowlist.
+    {"code": "SOFR", "name": "SOFR", "freq": "d", "calc": ["diff"]},
+    {"code": "DGS10", "name": "DGS10", "freq": "d", "calc": ["level", "diff"]},
     {"code": "T10Y2Y", "name": "T10Y2Y", "freq": "d", "calc": ["level"]},
     {"code": "DFII10", "name": "TIPS10Y", "freq": "d", "calc": ["level", "diff"]},
     {"code": "T10YIE", "name": "BreakevenInf10Y", "freq": "d", "calc": ["level", "diff"]},
-    {"code": "T5YIFR", "name": "BreakevenInf5Y", "freq": "d", "calc": ["level", "diff"]},
-    {"code": "WALCL", "name": "FedBalanceSheet", "freq": "w", "calc": ["level", "diff"]},
-    {"code": "RRPONTSYD", "name": "ON_RRP", "freq": "d", "calc": ["level", "diff"]},
-    {"code": "CPIAUCSL", "name": "CPI", "freq": "m", "calc": ["yoy", "mom"]},
-    {"code": "PPIACO", "name": "PPI", "freq": "m", "calc": ["yoy", "mom"]},
-    {"code": "UNRATE", "name": "UNRATE", "freq": "m", "calc": ["level", "diff", "zscore"]},
-    {"code": "PAYEMS", "name": "PAYEMS", "freq": "m", "calc": ["level", "diff", "yoy"]},
-    {"code": "INDPRO", "name": "INDPRO", "freq": "m", "calc": ["level", "diff", "yoy"]},
-    {"code": "BAMLC0A4CBBBEY", "name": "IG_Credit", "freq": "d", "calc": ["level", "diff", "zscore"]},
-    {"code": "BAMLH0A0HYM2", "name": "HY_Credit", "freq": "d", "calc": ["level", "diff", "zscore"]},
-    {"code": "VIXCLS", "name": "VIX", "freq": "d", "calc": ["level", "zscore"]},
+    {"code": "BAMLC0A4CBBBEY", "name": "IG_Credit", "freq": "d", "calc": ["zscore"]},
+    {"code": "BAMLH0A0HYM2", "name": "HY_Credit", "freq": "d", "calc": ["diff", "zscore"]},
+    {"code": "VIXCLS", "name": "VIX", "freq": "d", "calc": ["zscore"]},
 ]
 
 # Explicit global-context routing for structured observations in Phase 1/2.
@@ -352,13 +258,11 @@ PHASE12_GLOBAL_FEATURE_COLUMNS = [
 PHASE12_GLOBAL_FEATURE_PREFIXES = [
     "Covariance_Eigenvalue_",
     "YieldCurve_",
-    "EFFR_",
     "SOFR_",
-    "FEDFUNDS_",
-    "DGS",
-    "T10Y",
-    "TIPS",
-    "BreakevenInf",
+    "DGS10_",
+    "T10Y2Y_",
+    "TIPS10Y_",
+    "BreakevenInf10Y_",
     "IG_Credit_",
     "HY_Credit_",
     "VIX_",

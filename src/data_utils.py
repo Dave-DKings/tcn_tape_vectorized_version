@@ -208,6 +208,7 @@ class DataProcessor:
         self._macro_feature_names: List[str] = []
         self._regime_feature_names: List[str] = []
         self._quant_feature_names: List[str] = []
+        self._regime_buy_feature_names: List[str] = []
         self._actuarial_feature_names: List[str] = []
         self._candlestick_feature_names: List[str] = []
         
@@ -596,16 +597,20 @@ class DataProcessor:
                 # Assign results to output columns
                 if ta_result is not None:
                     if isinstance(ta_result, pd.DataFrame):
-                        # Multiple output columns (e.g., MACD, Bollinger Bands)
+                        # Multiple output columns (e.g., MACD, STOCH, ADX).
+                        # Prefer name-based mapping so configs can request a subset
+                        # without relying on source column order.
                         ta_aligned = ta_result.reindex(group_df.index)
+                        src_cols = list(ta_aligned.columns)
                         for i, output_col in enumerate(output_cols):
-                            if i < len(ta_aligned.columns):
-                                group_df[output_col] = pd.to_numeric(
-                                    ta_aligned.iloc[:, i],
-                                    errors='coerce'
-                                )
+                            if output_col in ta_aligned.columns:
+                                source_series = ta_aligned[output_col]
+                            elif i < len(src_cols):
+                                source_series = ta_aligned[src_cols[i]]
                             else:
                                 group_df[output_col] = np.nan
+                                continue
+                            group_df[output_col] = pd.to_numeric(source_series, errors='coerce')
                     elif isinstance(ta_result, pd.Series):
                         # Single output column (e.g., RSI, EMA)
                         if output_cols:
@@ -1038,8 +1043,8 @@ class DataProcessor:
             lambda s: s.rolling(trend_long, min_periods=max(10, trend_long // 2)).mean()
         )
         df_sorted["Regime_Price_vs_SMA_Short"] = (df_sorted[self.close_col] - sma_short) / sma_short.replace(0.0, np.nan)
-        df_sorted["Regime_SMA_Short_Slope"] = sma_short.diff(5)
-        df_sorted["Regime_SMA_Long_Slope"] = sma_long.diff(5)
+        df_sorted["Regime_SMA_Short_Slope"] = sma_short.diff(5) / sma_short.replace(0.0, np.nan)
+        df_sorted["Regime_SMA_Long_Slope"] = sma_long.diff(5) / sma_long.replace(0.0, np.nan)
 
         df_sorted["Regime_Momentum_Short"] = grouped[self.close_col].transform(
             lambda s: s.pct_change(mom_short)
@@ -1103,6 +1108,152 @@ class DataProcessor:
 
         logger.info(f"  ✅ Regime features added - columns: {len(new_cols)}")
         return df_sorted
+
+    def add_regime_buy_signal_features(
+        self,
+        df: pd.DataFrame,
+        *,
+        alpha_cfg: Optional[Dict[str, Any]] = None,
+    ) -> pd.DataFrame:
+        """
+        Build leakage-safe regime-conditioned buy features.
+
+        Generated columns:
+        - BuyProb_Regime: posterior probability in [0, 1]
+        - BuyEdge_Regime: centered edge (BuyProb_Regime - 0.5)
+        - BuyFlag_Regime: hard gate from BuyProb_Regime threshold + minimum history
+        """
+        if alpha_cfg is None:
+            alpha_cfg = self.config.get("feature_params", {}).get("alpha_features", {}) or {}
+        regime_buy_cfg = alpha_cfg.get("regime_buy_signal", {}) or {}
+        self._regime_buy_feature_names = []
+        if not bool(regime_buy_cfg.get("enabled", False)):
+            return df
+
+        required_cols = [self.date_col, self.ticker_col]
+        missing_required = [c for c in required_cols if c not in df.columns]
+        if missing_required:
+            logger.warning(
+                "Regime buy features requested but required columns are missing: %s",
+                missing_required,
+            )
+            return df
+
+        # Use precomputed daily log return when available; otherwise derive from close.
+        return_col = "LogReturn_1d" if "LogReturn_1d" in df.columns else None
+        derived_return_col = "_tmp_regime_buy_ret1d"
+        if return_col is None:
+            if self.close_col not in df.columns:
+                logger.warning(
+                    "Regime buy features requested but no return source is available "
+                    "(need LogReturn_1d or Close)."
+                )
+                return df
+            df = df.copy()
+            df[derived_return_col] = (
+                df.sort_values([self.ticker_col, self.date_col])
+                .groupby(self.ticker_col)[self.close_col]
+                .transform(lambda s: np.log(s.replace(0.0, np.nan)).diff())
+            )
+            return_col = derived_return_col
+
+        lookback_window = max(5, int(regime_buy_cfg.get("lookback_window", 252)))
+        min_history = max(1, int(regime_buy_cfg.get("min_history", 40)))
+        prior_alpha = float(max(regime_buy_cfg.get("prior_alpha", 5.0), 1e-6))
+        prior_beta = float(max(regime_buy_cfg.get("prior_beta", 5.0), 1e-6))
+        buy_threshold = float(np.clip(regime_buy_cfg.get("buy_threshold", 0.55), 0.0, 1.0))
+        use_relative_to_market = bool(regime_buy_cfg.get("use_relative_to_market", True))
+        market_vol_short_window = max(5, int(regime_buy_cfg.get("market_vol_short_window", 21)))
+        market_vol_long_window = max(
+            market_vol_short_window + 1,
+            int(regime_buy_cfg.get("market_vol_long_window", 126)),
+        )
+        high_vol_ratio_threshold = float(max(regime_buy_cfg.get("high_vol_ratio_threshold", 1.05), 1e-6))
+
+        out = df.sort_values([self.ticker_col, self.date_col]).copy()
+        out[self.date_col] = pd.to_datetime(out[self.date_col], errors="coerce")
+        out["_rb_ret"] = pd.to_numeric(out[return_col], errors="coerce")
+
+        # Daily market state from equal-weight market return + short/long vol ratio.
+        market_ret_by_date = out.groupby(self.date_col)["_rb_ret"].mean().sort_index()
+        market_vol_short = market_ret_by_date.rolling(
+            market_vol_short_window,
+            min_periods=max(5, market_vol_short_window // 2),
+        ).std()
+        market_vol_long = market_ret_by_date.rolling(
+            market_vol_long_window,
+            min_periods=max(10, market_vol_long_window // 2),
+        ).std()
+        market_vol_ratio = market_vol_short / market_vol_long.replace(0.0, np.nan)
+        market_up = market_ret_by_date > 0.0
+        market_high_vol = market_vol_ratio >= high_vol_ratio_threshold
+        market_state = (market_high_vol.astype(int) * 2 + market_up.astype(int)).astype(float)
+
+        out["_rb_market_ret"] = out[self.date_col].map(market_ret_by_date)
+        out["_rb_market_state"] = out[self.date_col].map(market_state).fillna(0.0).astype(int)
+
+        if use_relative_to_market:
+            out["_rb_signal_ret"] = out["_rb_ret"] - out["_rb_market_ret"]
+        else:
+            out["_rb_signal_ret"] = out["_rb_ret"]
+        out["_rb_success"] = (out["_rb_signal_ret"] > 0.0).astype(float)
+
+        # Leakage-safe history: always shift by 1 before rolling aggregation.
+        group_state = out.groupby([self.ticker_col, "_rb_market_state"], group_keys=False)
+        group_ticker = out.groupby(self.ticker_col, group_keys=False)
+
+        state_sum = group_state["_rb_success"].transform(
+            lambda s: s.shift(1).rolling(lookback_window, min_periods=1).sum()
+        ).fillna(0.0)
+        state_count = group_state["_rb_success"].transform(
+            lambda s: s.shift(1).rolling(lookback_window, min_periods=1).count()
+        ).fillna(0.0)
+
+        ticker_sum = group_ticker["_rb_success"].transform(
+            lambda s: s.shift(1).rolling(lookback_window, min_periods=1).sum()
+        ).fillna(0.0)
+        ticker_count = group_ticker["_rb_success"].transform(
+            lambda s: s.shift(1).rolling(lookback_window, min_periods=1).count()
+        ).fillna(0.0)
+
+        prob_state = (prior_alpha + state_sum) / (prior_alpha + prior_beta + state_count)
+        prob_ticker = (prior_alpha + ticker_sum) / (prior_alpha + prior_beta + ticker_count)
+
+        # Blend toward ticker-level prior when current regime has insufficient history.
+        blend_w = np.clip(state_count / max(float(min_history), 1.0), 0.0, 1.0)
+        prob = blend_w * prob_state + (1.0 - blend_w) * prob_ticker
+        prior_mean = prior_alpha / (prior_alpha + prior_beta)
+        prob = pd.to_numeric(prob, errors="coerce").fillna(prior_mean).clip(1e-4, 1.0 - 1e-4)
+
+        edge = prob - 0.5
+        flag = ((prob >= buy_threshold) & (state_count >= float(min_history))).astype(float)
+
+        out["BuyProb_Regime"] = prob.astype(np.float32)
+        out["BuyEdge_Regime"] = edge.astype(np.float32)
+        out["BuyFlag_Regime"] = flag.astype(np.float32)
+        self._regime_buy_feature_names = ["BuyProb_Regime", "BuyEdge_Regime", "BuyFlag_Regime"]
+
+        helper_cols = [
+            "_rb_ret",
+            "_rb_market_ret",
+            "_rb_market_state",
+            "_rb_signal_ret",
+            "_rb_success",
+        ]
+        if return_col == derived_return_col:
+            helper_cols.append(derived_return_col)
+        out = out.drop(columns=[c for c in helper_cols if c in out.columns], errors="ignore")
+        out = out.sort_index()
+
+        logger.info(
+            "✅ Regime buy features added: %s | lookback=%d min_history=%d threshold=%.2f rel_to_mkt=%s",
+            self._regime_buy_feature_names,
+            lookback_window,
+            min_history,
+            buy_threshold,
+            use_relative_to_market,
+        )
+        return out
 
     def add_candlestick_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -1183,6 +1334,7 @@ class DataProcessor:
         """
         alpha_cfg = self.config.get("feature_params", {}).get("alpha_features", {})
         self._quant_feature_names = []
+        self._regime_buy_feature_names = []
         if not alpha_cfg or not alpha_cfg.get("enabled", False):
             return df
 
@@ -1233,10 +1385,17 @@ class DataProcessor:
         yield_cfg = alpha_cfg.get("yield_curve", {})
         long_col = yield_cfg.get("long_col", "DGS10_level")
         short_col = yield_cfg.get("short_col", "DGS2_level")
+        spread_source_col = yield_cfg.get("spread_source_col", "T10Y2Y_level")
+        spread_series = None
         if long_col in df.columns and short_col in df.columns:
+            spread_series = df[long_col] - df[short_col]
+        elif spread_source_col in df.columns:
+            spread_series = df[spread_source_col]
+
+        if spread_series is not None:
             spread_name = "YieldCurve_Spread"
             flag_name = "YieldCurve_Inverted_Flag"
-            df[spread_name] = df[long_col] - df[short_col]
+            df[spread_name] = spread_series
             df[flag_name] = (df[spread_name] < 0).astype(float)
             new_cols.extend([spread_name, flag_name])
 
@@ -1301,6 +1460,11 @@ class DataProcessor:
             feature_name = f"OBV_Delta_Norm_{obv_window}"
             df[feature_name] = obv_delta / (obv_std + eps)
             new_cols.append(feature_name)
+
+        # Regime-conditioned buy features (probability/edge/flag)
+        df = self.add_regime_buy_signal_features(df, alpha_cfg=alpha_cfg)
+        if self._regime_buy_feature_names:
+            new_cols.extend(self._regime_buy_feature_names)
 
         for col in new_cols:
             if col in df.columns:
@@ -1573,40 +1737,30 @@ class DataProcessor:
     def _is_bounded_feature_name(column: str) -> bool:
         if not column:
             return False
+        if column in {"BuyProb_Regime", "BuyEdge_Regime", "BuyFlag_Regime"}:
+            return True
         if column.endswith("_Flag") or column == "YieldCurve_Inverted_Flag":
             return True
         if "Rank" in column:
             return True
-        if column.startswith("Candle_CloseLocation"):
+        if column.startswith(("Candle_CloseLocation", "Candle_BodyToRange")):
             return True
-        bounded_prefixes = ("RSI_", "STOCHk_", "STOCHd_", "WILLR_", "MFI_")
+        if column == "Regime_Breadth_Positive":
+            return True
+        if column in {"Actuarial_Prob_30d", "Actuarial_Prob_60d", "Actuarial_Reserve_Severity"}:
+            return True
+        if column.startswith("Volume_Percentile_"):
+            return True
+        bounded_prefixes = ("RSI_", "STOCHk_", "STOCHd_", "WILLR_", "MFI_", "ADX_")
         return column.startswith(bounded_prefixes)
 
     @staticmethod
     def _is_macro_level_feature_name(column: str) -> bool:
-        if not column or not column.endswith("_level"):
-            return False
-        macro_prefixes = (
-            "EFFR_",
-            "SOFR_",
-            "FEDFUNDS_",
-            "DGS",
-            "T10Y",
-            "TIPS",
-            "BreakevenInf",
-            "IG_Credit_",
-            "HY_Credit_",
-            "VIX_",
-            "MOVE_",
-            "UNRATE_",
-            "PAYEMS_",
-            "INDPRO_",
-            "CPI_",
-            "PPI_",
-            "FedBalanceSheet_",
-            "ON_RRP_",
-        )
-        return column.startswith(macro_prefixes)
+        # Disabled: macro levels now use standard z-score normalization to
+        # preserve level information (regime context) instead of destroying
+        # it via first-differencing.  The daily-change signal is already
+        # captured by the companion *_diff features in the active set.
+        return False
 
     @staticmethod
     def _is_heavy_tail_feature_name(column: str) -> bool:
@@ -1639,14 +1793,46 @@ class DataProcessor:
             return True
         return column in {"YieldCurve_Spread"}
 
+    @staticmethod
+    def _is_skip_normalization(column: str) -> bool:
+        """Features that are already properly scaled and should skip normalization."""
+        return column.startswith("CrossSectional_ZScore_")
+
+    @staticmethod
+    def _apply_pre_transform(values: np.ndarray, column: str) -> np.ndarray:
+        """Apply feature-specific pre-transforms before normalization.
+
+        - RealizedKurtosis: log1p compression to tame extreme fat-tail values
+        - Actuarial_Expected_Recovery: log1p to handle bimodal spike-at-zero
+        """
+        if column.startswith("RealizedKurtosis_"):
+            return np.sign(values) * np.log1p(np.abs(values))
+        if column == "Actuarial_Expected_Recovery":
+            return np.log1p(np.clip(values, 0.0, None))
+        return values
+
+    @staticmethod
+    def _winsorization_percentiles(column: str):
+        """Return (low, high) winsorization percentiles for a column.
+
+        Widens from [0.5, 99.5] to [0.1, 99.9] for features whose tails
+        carry critical information (kurtosis, vol-of-vol, beta).
+        """
+        wide_prefixes = ("RealizedKurtosis_", "VolOfVol_", "Beta_to_Market")
+        if column.startswith(wide_prefixes):
+            return (0.1, 99.9)
+        return (0.5, 99.5)
+
     def _normalization_strategy(self, column: str) -> str:
         """
         Route features to family-aware normalization strategies:
-        - bounded: bounded indicators/binary/ranks
-        - macro_diff_standard: macro levels transformed by date-difference then z-scored
+        - skip: pre-normalized features (e.g. cross-sectional z-scores)
+        - bounded: bounded indicators/binary/ranks/probabilities
         - robust_winsor: heavy-tail features use robust scaling + percentile winsorization
-        - standard: default fallback
+        - standard: default fallback (includes macro levels for regime context)
         """
+        if self._is_skip_normalization(column):
+            return "skip"
         if self._is_bounded_feature_name(column):
             return "bounded"
         if self._is_macro_level_feature_name(column):
@@ -1659,16 +1845,36 @@ class DataProcessor:
         arr = np.asarray(values, dtype=np.float64)
         transformed = arr.copy()
 
+        if column == "BuyProb_Regime":
+            transformed = np.clip(transformed, 0.0, 1.0)
+            return np.nan_to_num(transformed, nan=0.5, posinf=1.0, neginf=0.0)
+        if column == "BuyEdge_Regime":
+            transformed = np.clip(transformed * 2.0, -1.0, 1.0)
+            return np.nan_to_num(transformed, nan=0.0, posinf=1.0, neginf=-1.0)
+        if column == "BuyFlag_Regime":
+            transformed = np.clip(transformed, 0.0, 1.0)
+            return np.nan_to_num(transformed, nan=0.0, posinf=1.0, neginf=0.0)
         if column.endswith("_Flag") or column == "YieldCurve_Inverted_Flag":
             return np.nan_to_num(transformed, nan=0.0, posinf=1.0, neginf=0.0)
         if "Rank" in column:
             transformed = (transformed * 2.0) - 1.0
             return np.nan_to_num(transformed, nan=0.0, posinf=1.0, neginf=-1.0)
-        if column.startswith(("RSI_", "STOCHk_", "STOCHd_", "MFI_")):
+        if column.startswith(("RSI_", "STOCHk_", "STOCHd_", "MFI_", "ADX_")):
             transformed = (transformed - 50.0) / 50.0
             return np.nan_to_num(transformed, nan=0.0, posinf=1.0, neginf=-1.0)
         if column.startswith("WILLR_"):
             transformed = (transformed + 50.0) / 50.0
+            return np.nan_to_num(transformed, nan=0.0, posinf=1.0, neginf=-1.0)
+        # [0, 1] features → center to [-1, 1]
+        if column.startswith(("Candle_CloseLocation", "Volume_Percentile_")) or column in {
+            "Regime_Breadth_Positive", "Actuarial_Prob_30d",
+            "Actuarial_Prob_60d", "Actuarial_Reserve_Severity",
+        }:
+            transformed = np.clip(transformed, 0.0, 1.0) * 2.0 - 1.0
+            return np.nan_to_num(transformed, nan=0.0, posinf=1.0, neginf=-1.0)
+        # Candle_BodyToRange: naturally bounded [-1, 1], just clip and pass
+        if column.startswith("Candle_BodyToRange"):
+            transformed = np.clip(transformed, -1.0, 1.0)
             return np.nan_to_num(transformed, nan=0.0, posinf=1.0, neginf=-1.0)
 
         return np.nan_to_num(transformed, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1804,7 +2010,9 @@ class DataProcessor:
         # Normalize each feature column
         for col in feature_cols:
             try:
-                all_values = pd.to_numeric(df_copy[col], errors='coerce').to_numpy(dtype=np.float64, copy=False)
+                all_values = pd.to_numeric(df_copy[col], errors='coerce').to_numpy(dtype=np.float64, copy=True)
+                # Apply feature-specific pre-transforms (e.g. log1p for kurtosis)
+                all_values = self._apply_pre_transform(all_values, col)
                 finite_mask = np.isfinite(all_values)
 
                 if mode == 'train':
@@ -1822,7 +2030,12 @@ class DataProcessor:
                     strategy = self._normalization_strategy(col)
                     transformed = np.full(all_values.shape, np.nan, dtype=np.float64)
 
-                    if strategy == "bounded":
+                    if strategy == "skip":
+                        transformed = np.nan_to_num(all_values, nan=0.0, posinf=0.0, neginf=0.0)
+                        fitted_scalers[col] = {"method": "skip"}
+                        logger.info(f"✅ {col}: skipped normalization (pre-normalized)")
+
+                    elif strategy == "bounded":
                         transformed = self._transform_bounded_values(all_values, col)
                         fitted_scalers[col] = {"method": "bounded"}
                         logger.info(f"✅ {col}: applied bounded normalization")
@@ -1842,7 +2055,8 @@ class DataProcessor:
                             logger.info(f"✅ {col}: applied macro diff-then-zscore normalization")
 
                     if strategy == "robust_winsor":
-                        winsor_low, winsor_high = np.nanpercentile(train_values, [0.5, 99.5])
+                        p_low, p_high = self._winsorization_percentiles(col)
+                        winsor_low, winsor_high = np.nanpercentile(train_values, [p_low, p_high])
                         if not np.isfinite(winsor_low) or not np.isfinite(winsor_high) or winsor_low == winsor_high:
                             winsor_low = float(np.nanmin(train_values))
                             winsor_high = float(np.nanmax(train_values))
@@ -1905,6 +2119,8 @@ class DataProcessor:
                             transformed[macro_finite] = scaler.transform(
                                 macro_diff_all[macro_finite].reshape(-1, 1)
                             ).flatten()
+                        elif method == "skip":
+                            transformed = np.nan_to_num(all_values, nan=0.0, posinf=0.0, neginf=0.0)
                         elif method == "robust_winsor":
                             scaler = spec.get("scaler")
                             if scaler is None:
@@ -2601,7 +2817,7 @@ class DataProcessor:
 
         if self._quant_feature_names:
             feature_cols.extend(self._quant_feature_names)
-            
+
         if self._actuarial_feature_names:
             feature_cols.extend(self._actuarial_feature_names)
 
