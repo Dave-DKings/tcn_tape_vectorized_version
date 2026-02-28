@@ -942,6 +942,10 @@ STEP_DIAGNOSTIC_FIELDNAMES: List[str] = [
     "tx_cost_contrib_reward_pts",
     "action_realization_l1",
     "action_realization_penalty",
+    "cash_weight_raw",
+    "cash_weight_projected",
+    "cash_weight_final",
+    "cash_weight_forced_gap",
     "drawdown_penalty",
 ]
 
@@ -4452,6 +4456,10 @@ def run_experiment6_tape(
                             "tx_cost_contrib_reward_pts": float(tx_cost_contrib_reward_pts),
                             "action_realization_l1": float(info.get("action_realization_l1", 0.0) or 0.0),
                             "action_realization_penalty": float(info.get("action_realization_penalty", 0.0) or 0.0),
+                            "cash_weight_raw": float(info.get("cash_weight_raw", 0.0) or 0.0),
+                            "cash_weight_projected": float(info.get("cash_weight_projected", 0.0) or 0.0),
+                            "cash_weight_final": float(info.get("cash_weight_final", 0.0) or 0.0),
+                            "cash_weight_forced_gap": float(info.get("cash_weight_forced_gap", 0.0) or 0.0),
                             "drawdown_penalty": float(info.get("drawdown_penalty", 0.0) or 0.0),
                         }
                         step_diag_csv_logger.log(step_diag_row)
@@ -4630,6 +4638,10 @@ def run_experiment6_tape(
                     "tx_cost_contrib_reward_pts": float(tx_cost_contrib_reward_pts),
                     "action_realization_l1": float(info.get("action_realization_l1", 0.0) or 0.0),
                     "action_realization_penalty": float(info.get("action_realization_penalty", 0.0) or 0.0),
+                    "cash_weight_raw": float(info.get("cash_weight_raw", 0.0) or 0.0),
+                    "cash_weight_projected": float(info.get("cash_weight_projected", 0.0) or 0.0),
+                    "cash_weight_final": float(info.get("cash_weight_final", 0.0) or 0.0),
+                    "cash_weight_forced_gap": float(info.get("cash_weight_forced_gap", 0.0) or 0.0),
                     "drawdown_penalty": float(info.get("drawdown_penalty", 0.0) or 0.0),
                 }
                 step_diag_csv_logger.log(step_diag_row)

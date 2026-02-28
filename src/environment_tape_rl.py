@@ -1470,6 +1470,8 @@ class PortfolioEnvTAPE(gym.Env):
             weights = np.ones(self.num_assets + 1) / (self.num_assets + 1)  # Fallback to equal weights
             logger.error(f"   Falling back to equal weights: {weights}")
         
+        # Canonicalize to [num_assets risky + cash] before any diagnostics/projection.
+        weights = self._coerce_weights_with_cash(weights)
         proposed_weights = weights.copy()
         # ═══════════════════════════════════════════════════════════════
         # POSITION CONSTRAINTS (for realistic portfolio management)
@@ -1486,6 +1488,9 @@ class PortfolioEnvTAPE(gym.Env):
             max_single_position=max_single_position,
             min_cash_position=min_cash_position,
         )
+        cash_weight_raw = float(proposed_weights[-1]) if len(proposed_weights) else 0.0
+        cash_weight_projected = float(weights[-1]) if len(weights) else 0.0
+        cash_weight_forced_gap = cash_weight_projected - cash_weight_raw
 
         # Track concentration and action-realization mismatch diagnostics.
         risky_weights = weights[:-1] if len(weights) > 1 else weights
@@ -1514,6 +1519,7 @@ class PortfolioEnvTAPE(gym.Env):
             else:
                 weights = last_weights.copy()
         execution_smoothing_l1 = float(np.sum(np.abs(weights - target_weights)))
+        cash_weight_final = float(weights[-1]) if len(weights) else 0.0
         
         # ═══════════════════════════════════════════════════════════════
         # STEP 4: ADVANCE TO NEXT DAY
@@ -1734,6 +1740,10 @@ class PortfolioEnvTAPE(gym.Env):
             'action_realization_l1': action_realization_l1,
             'action_realization_penalty': action_realization_penalty,
             'action_realization_penalty_sum': self.action_realization_penalty_sum,
+            'cash_weight_raw': cash_weight_raw,
+            'cash_weight_projected': cash_weight_projected,
+            'cash_weight_final': cash_weight_final,
+            'cash_weight_forced_gap': cash_weight_forced_gap,
         }
         
         return observation, reward, terminated, False, info
@@ -1886,6 +1896,35 @@ class PortfolioEnvTAPE(gym.Env):
             final /= final_sum
 
         return final.astype(np.float32)
+
+    def _coerce_weights_with_cash(self, weights: np.ndarray) -> np.ndarray:
+        """
+        Coerce portfolio weights to shape (num_assets + 1,), where the last
+        element is cash. This makes env diagnostics robust when upstream policy
+        heads emit risky-only vectors of length num_assets.
+        """
+        arr = np.asarray(weights, dtype=np.float64).reshape(-1)
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        arr = np.maximum(arr, 0.0)
+
+        if arr.size == self.num_assets:
+            risky = arr.copy()
+            risky_sum = float(np.sum(risky))
+            if risky_sum > 1.0 and risky_sum > 1e-12:
+                risky /= risky_sum
+                risky_sum = 1.0
+            cash = max(0.0, 1.0 - risky_sum)
+            arr = np.concatenate([risky, np.array([cash], dtype=np.float64)], axis=0)
+        elif arr.size != self.num_assets + 1:
+            arr = np.ones(self.num_assets + 1, dtype=np.float64) / (self.num_assets + 1)
+
+        total = float(np.sum(arr))
+        if total <= 1e-12:
+            arr = np.ones(self.num_assets + 1, dtype=np.float64) / (self.num_assets + 1)
+        else:
+            arr /= total
+
+        return arr.astype(np.float32)
 
     def _softmax_normalization(self, actions: np.ndarray) -> np.ndarray:
         """
