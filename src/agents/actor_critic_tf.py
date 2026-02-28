@@ -36,6 +36,11 @@ _DEFAULT_FUSION_CROSS_ASSET_MIXER_ENABLED = bool(_DEFAULT_AGENT_PARAMS.get('fusi
 _DEFAULT_FUSION_CROSS_ASSET_MIXER_LAYERS = int(_DEFAULT_AGENT_PARAMS.get('fusion_cross_asset_mixer_layers', 1))
 _DEFAULT_FUSION_CROSS_ASSET_MIXER_EXPANSION = float(_DEFAULT_AGENT_PARAMS.get('fusion_cross_asset_mixer_expansion', 2.0))
 _DEFAULT_FUSION_CROSS_ASSET_MIXER_DROPOUT = _DEFAULT_AGENT_PARAMS.get('fusion_cross_asset_mixer_dropout', _DEFAULT_FUSION_DROPOUT)
+_DEFAULT_FUSION_ASSET_IDENTITY_ENABLED = bool(_DEFAULT_AGENT_PARAMS.get('fusion_asset_identity_enabled', False))
+_DEFAULT_FUSION_CONTEXT_CROSS_ATTN_ENABLED = bool(_DEFAULT_AGENT_PARAMS.get('fusion_context_cross_attention_enabled', False))
+_DEFAULT_FUSION_CONTEXT_CROSS_ATTN_HEADS = int(_DEFAULT_AGENT_PARAMS.get('fusion_context_cross_attention_heads', 4))
+_DEFAULT_FUSION_CONTEXT_CROSS_ATTN_DROPOUT = float(_DEFAULT_AGENT_PARAMS.get('fusion_context_cross_attention_dropout', 0.1))
+_DEFAULT_FUSION_PER_ASSET_ALPHA_HEAD = bool(_DEFAULT_AGENT_PARAMS.get('fusion_per_asset_alpha_head', False))
 _DEFAULT_RECURRENT_MEMORY_ENABLED = bool(_DEFAULT_AGENT_PARAMS.get('recurrent_memory_enabled', False))
 _DEFAULT_RECURRENT_MEMORY_UNITS = int(_DEFAULT_AGENT_PARAMS.get('recurrent_memory_units', 64))
 _DEFAULT_RECURRENT_MEMORY_DROPOUT = float(_DEFAULT_AGENT_PARAMS.get('recurrent_memory_dropout', _DEFAULT_TCN_DROPOUT))
@@ -194,6 +199,78 @@ class CrossAssetMixerBlock(layers.Layer):
         ffn_out = self.ffn_dropout1(ffn_out, training=training)
         ffn_out = self.ffn_dense2(ffn_out)
         ffn_out = self.ffn_dropout2(ffn_out, training=training)
+        return x + ffn_out
+
+
+class ContextCrossAttentionBlock(layers.Layer):
+    """
+    Cross-attention block: per-asset queries attend to global context.
+
+    Enables each asset embedding to selectively incorporate macro/market
+    information (interest rates, VIX, breadth, etc.), producing
+    context-aware per-asset representations.
+
+    Q = per-asset embeddings  (batch, num_assets, d_model)
+    K/V = global context      (batch, K, d_model)
+
+    Architecture follows the pre-norm transformer convention with
+    separate normalization on Q and K/V paths for stable cross-modal fusion.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        expansion: float = 2.0,
+        dropout: float = 0.1,
+        name: str = "ctx_cross_attn",
+    ):
+        super(ContextCrossAttentionBlock, self).__init__(name=name)
+        if d_model % num_heads != 0:
+            num_heads = 1
+
+        # Pre-norm for query and key/value paths
+        self.norm_q = layers.LayerNormalization(epsilon=1e-6, name=f"{name}_norm_q")
+        self.norm_kv = layers.LayerNormalization(epsilon=1e-6, name=f"{name}_norm_kv")
+
+        # Multi-head cross-attention
+        self.cross_attn = layers.MultiHeadAttention(
+            num_heads=int(num_heads),
+            key_dim=max(1, d_model // int(num_heads)),
+            dropout=dropout,
+            name=f"{name}_mha",
+        )
+        self.attn_dropout = layers.Dropout(dropout, name=f"{name}_attn_drop")
+
+        # Feed-forward network (expansion -> projection)
+        hidden_dim = max(d_model, int(round(d_model * float(expansion))))
+        self.norm_ffn = layers.LayerNormalization(epsilon=1e-6, name=f"{name}_norm_ffn")
+        self.ffn_dense1 = layers.Dense(hidden_dim, activation="gelu", name=f"{name}_ffn1")
+        self.ffn_drop1 = layers.Dropout(dropout, name=f"{name}_ffn_drop1")
+        self.ffn_dense2 = layers.Dense(d_model, activation=None, name=f"{name}_ffn2")
+        self.ffn_drop2 = layers.Dropout(dropout, name=f"{name}_ffn_drop2")
+
+    def call(self, query, context, training=None):
+        """
+        Args:
+            query:   (batch, num_assets, d_model) - per-asset embeddings
+            context: (batch, K, d_model) - global context token(s)
+        Returns:
+            (batch, num_assets, d_model) - context-enriched asset embeddings
+        """
+        # Cross-attention: each asset attends to global context
+        q = self.norm_q(query)
+        kv = self.norm_kv(context)
+        attn_out = self.cross_attn(q, kv, training=training)
+        attn_out = self.attn_dropout(attn_out, training=training)
+        x = query + attn_out  # residual
+
+        # Feed-forward with residual
+        ffn_in = self.norm_ffn(x)
+        ffn_out = self.ffn_dense1(ffn_in)
+        ffn_out = self.ffn_drop1(ffn_out, training=training)
+        ffn_out = self.ffn_dense2(ffn_out)
+        ffn_out = self.ffn_drop2(ffn_out, training=training)
         return x + ffn_out
 
 
@@ -957,6 +1034,11 @@ class TCNFusionActor(DirichletActor):
         fusion_cross_asset_mixer_dropout: Optional[float] = None,
         fusion_alpha_head_hidden_dims: Optional[List[int]] = None,
         fusion_alpha_head_dropout: Optional[float] = None,
+        fusion_asset_identity_enabled: Optional[bool] = None,
+        fusion_context_cross_attention_enabled: Optional[bool] = None,
+        fusion_context_cross_attention_heads: Optional[int] = None,
+        fusion_context_cross_attention_dropout: Optional[float] = None,
+        fusion_per_asset_alpha_head: Optional[bool] = None,
         recurrent_memory_enabled: Optional[bool] = None,
         recurrent_memory_units: Optional[int] = None,
         recurrent_memory_dropout: Optional[float] = None,
@@ -1003,6 +1085,16 @@ class TCNFusionActor(DirichletActor):
             fusion_alpha_head_hidden_dims = _DEFAULT_FUSION_ALPHA_HEAD_HIDDEN_DIMS
         if fusion_alpha_head_dropout is None:
             fusion_alpha_head_dropout = _DEFAULT_FUSION_ALPHA_HEAD_DROPOUT
+        if fusion_asset_identity_enabled is None:
+            fusion_asset_identity_enabled = _DEFAULT_FUSION_ASSET_IDENTITY_ENABLED
+        if fusion_context_cross_attention_enabled is None:
+            fusion_context_cross_attention_enabled = _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_ENABLED
+        if fusion_context_cross_attention_heads is None:
+            fusion_context_cross_attention_heads = _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_HEADS
+        if fusion_context_cross_attention_dropout is None:
+            fusion_context_cross_attention_dropout = _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_DROPOUT
+        if fusion_per_asset_alpha_head is None:
+            fusion_per_asset_alpha_head = _DEFAULT_FUSION_PER_ASSET_ALPHA_HEAD
         if recurrent_memory_enabled is None:
             recurrent_memory_enabled = _DEFAULT_RECURRENT_MEMORY_ENABLED
         if recurrent_memory_units is None:
@@ -1108,12 +1200,56 @@ class TCNFusionActor(DirichletActor):
                         name=f"{name}_asset_mixer_{i}",
                     )
                 )
-        self.asset_pool = layers.GlobalAveragePooling1D()
+
+        # --- Cross-Asset Attention v2 upgrades ---
+
+        # Change 1: Learnable asset identity embeddings
+        self.asset_identity_enabled = bool(fusion_asset_identity_enabled)
+        self.asset_identity_embed = None
+        if self.asset_identity_enabled:
+            self.asset_identity_embed = self.add_weight(
+                name=f"{name}_asset_identity",
+                shape=(self.num_assets, self.fusion_embed_dim),
+                initializer=tf.keras.initializers.TruncatedNormal(stddev=0.02),
+                trainable=True,
+            )
+
+        # Change 2: Context cross-attention (assets attend to global context)
+        self.context_cross_attn_enabled = bool(fusion_context_cross_attention_enabled)
+        self.context_cross_attn_block = None
+        self.context_projection = None
+        if self.context_cross_attn_enabled:
+            ctx_heads = int(fusion_context_cross_attention_heads)
+            ctx_dropout = float(fusion_context_cross_attention_dropout)
+            self.context_cross_attn_block = ContextCrossAttentionBlock(
+                d_model=self.fusion_embed_dim,
+                num_heads=ctx_heads,
+                expansion=2.0,
+                dropout=ctx_dropout,
+                name=f"{name}_ctx_cross_attn",
+            )
+            # Project global context to same embedding dim for cross-attention
+            self.context_projection = layers.Dense(
+                self.fusion_embed_dim, activation="relu",
+                name=f"{name}_ctx_projection",
+            )
+        # 3-layer stack mode:
+        # self-attn (mixer[0]) -> context cross-attn -> self-attn (mixer[1:]).
+        self.use_three_layer_context_stack = bool(
+            self.context_cross_attn_enabled
+            and self.cross_asset_mixer_enabled
+            and len(self.asset_mixer_blocks) >= 2
+        )
+
+        # Change 3: Per-asset alpha head (bypass AvgPool bottleneck)
+        self.per_asset_alpha_head_enabled = bool(fusion_per_asset_alpha_head)
+        self.asset_pool = layers.GlobalAveragePooling1D()  # kept as fallback
 
         self.global_time_pool = layers.GlobalAveragePooling1D()
         self.global_projection = layers.Dense(self.fusion_embed_dim, activation="relu", name=f"{name}_global_projection")
         self.global_dropout = layers.Dropout(fusion_dropout)
 
+        # Gate layer for legacy path (used when context cross-attn is disabled)
         self.gate_layer = layers.Dense(self.fusion_embed_dim, activation="sigmoid", name=f"{name}_gate")
         self.regime_encoder = None
         self.regime_fusion = None
@@ -1127,6 +1263,7 @@ class TCNFusionActor(DirichletActor):
                 ],
                 name=f"{name}_regime_encoder",
             )
+            # For per-asset path, regime is broadcast to each asset embedding
             self.regime_fusion = layers.Dense(
                 self.fusion_embed_dim,
                 activation="relu",
@@ -1146,13 +1283,35 @@ class TCNFusionActor(DirichletActor):
                         layers.Dropout(float(fusion_alpha_head_dropout), name=f"{name}_alpha_dropout_{i}"),
                     )
                 )
-        self.output_layer = layers.Dense(
-            self.num_actions,
-            activation=None,
-            kernel_initializer="orthogonal",
-            bias_initializer=tf.keras.initializers.Constant(0.5),
-            name=f"{name}_output",
-        )
+
+        if self.per_asset_alpha_head_enabled:
+            # Per-asset output: Dense(1) per asset embedding → squeeze
+            self.per_asset_pre_norm = layers.LayerNormalization(
+                epsilon=1e-6, name=f"{name}_per_asset_pre_norm"
+            )
+            self.per_asset_logit_head = layers.Dense(
+                1, activation=None,
+                kernel_initializer="orthogonal",
+                bias_initializer=tf.keras.initializers.Constant(0.5),
+                name=f"{name}_per_asset_logit",
+            )
+            # Legacy output layer still exists for backward compat loading
+            self.output_layer = layers.Dense(
+                self.num_actions, activation=None,
+                kernel_initializer="orthogonal",
+                bias_initializer=tf.keras.initializers.Constant(0.5),
+                name=f"{name}_output",
+            )
+        else:
+            self.per_asset_pre_norm = None
+            self.per_asset_logit_head = None
+            self.output_layer = layers.Dense(
+                self.num_actions,
+                activation=None,
+                kernel_initializer="orthogonal",
+                bias_initializer=tf.keras.initializers.Constant(0.5),
+                name=f"{name}_output",
+            )
 
     def _align_feature_dim(self, x: tf.Tensor) -> tf.Tensor:
         """Pad/slice dynamic feature width so local/context split stays valid."""
@@ -1253,6 +1412,7 @@ class TCNFusionActor(DirichletActor):
                 )
             regime_seq = x
 
+        # --- Per-asset TCN encoding (shared weights) ---
         for block in self.asset_tcn_blocks:
             x_assets = block(x_assets, training=training)
         if self.asset_memory_layer is not None:
@@ -1261,35 +1421,93 @@ class TCNFusionActor(DirichletActor):
         x_assets = self.asset_time_pool(x_assets)
         x_assets = self.asset_projection(x_assets)
         x_assets = tf.reshape(x_assets, (batch, self.num_assets, self.fusion_embed_dim))
-        x_assets = self.asset_attention(x_assets, training=training)
-        for mixer_block in self.asset_mixer_blocks:
-            x_assets = mixer_block(x_assets, training=training)
-        asset_context = self.asset_pool(x_assets)
 
+        # --- Change 1: Add asset identity embeddings ---
+        if self.asset_identity_embed is not None:
+            x_assets = x_assets + self.asset_identity_embed[tf.newaxis, :, :]
+
+        # --- Cross-asset attention stack ---
+        # Preferred v2 layout when enabled:
+        #   layer1 self-attn (mixer[0]) -> layer2 context cross-attn -> layer3 self-attn (mixer[1:])
+        if self.use_three_layer_context_stack:
+            x_assets = self.asset_mixer_blocks[0](x_assets, training=training)
+        else:
+            x_assets = self.asset_attention(x_assets, training=training)
+            for mixer_block in self.asset_mixer_blocks:
+                x_assets = mixer_block(x_assets, training=training)
+
+        # --- Global context branch ---
         if self.global_memory_layer is not None:
             context_seq = self.global_memory_layer(context_seq, training=training)
         global_context = self.global_time_pool(context_seq)
         global_context = self.global_projection(global_context)
         global_context = self.global_dropout(global_context, training=training)
 
-        gate = self.gate_layer(tf.concat([asset_context, global_context], axis=-1))
-        fused = gate * asset_context + (1.0 - gate) * global_context
+        # --- Change 2: Context cross-attention OR legacy gate fusion ---
+        if self.context_cross_attn_enabled and self.context_cross_attn_block is not None:
+            # Project global context and reshape to (batch, 1, embed_dim) token
+            ctx_token = self.context_projection(global_context)  # (batch, embed_dim)
+            ctx_token = tf.expand_dims(ctx_token, axis=1)  # (batch, 1, embed_dim)
+            # Assets attend to context: each asset queries the global context
+            x_assets = self.context_cross_attn_block(
+                query=x_assets,   # (batch, num_assets, embed_dim)
+                context=ctx_token, # (batch, 1, embed_dim)
+                training=training,
+            )  # (batch, num_assets, embed_dim) — context-enriched
+            if self.use_three_layer_context_stack:
+                for mixer_block in self.asset_mixer_blocks[1:]:
+                    x_assets = mixer_block(x_assets, training=training)
+            # Keep a pooled fallback path valid when per-asset head is disabled.
+            fused = self.asset_pool(x_assets)
+        else:
+            # Legacy: pool assets → gate with global → single fused vector
+            asset_context = self.asset_pool(x_assets)
+            gate = self.gate_layer(tf.concat([asset_context, global_context], axis=-1))
+            fused = gate * asset_context + (1.0 - gate) * global_context
+
+        # --- Regime conditioning ---
         if self.regime_encoder is not None and self.regime_fusion is not None:
             regime_summary = _compute_regime_summary_features(regime_seq)
             regime_embed = self.regime_encoder(regime_summary, training=training)
-            fused = self.regime_fusion(tf.concat([fused, regime_embed], axis=-1), training=training)
-            if self.regime_dropout is not None:
-                fused = self.regime_dropout(fused, training=training)
+            if self.per_asset_alpha_head_enabled:
+                # Broadcast regime to each asset embedding
+                regime_per_asset = tf.expand_dims(regime_embed, axis=1)  # (batch, 1, regime_dim)
+                regime_per_asset = tf.tile(regime_per_asset, [1, self.num_assets, 1])
+                x_assets = self.regime_fusion(
+                    tf.concat([x_assets, regime_per_asset], axis=-1), training=training
+                )
+                if self.regime_dropout is not None:
+                    x_assets = self.regime_dropout(x_assets, training=training)
+            else:
+                fused = self.regime_fusion(tf.concat([fused, regime_embed], axis=-1), training=training)
+                if self.regime_dropout is not None:
+                    fused = self.regime_dropout(fused, training=training)
 
-        if self.use_richer_alpha_head and self.alpha_pre_norm is not None:
-            alpha_features = self.alpha_pre_norm(fused)
-            for dense_layer, dropout_layer in self.alpha_head_blocks:
-                alpha_features = dense_layer(alpha_features)
-                alpha_features = dropout_layer(alpha_features, training=training)
+        # --- Change 3: Per-asset alpha head OR legacy pooled head ---
+        if self.per_asset_alpha_head_enabled and self.per_asset_logit_head is not None:
+            # x_assets is (batch, num_assets, embed_dim)
+            # Apply optional richer alpha MLP per-asset
+            if self.use_richer_alpha_head and self.alpha_pre_norm is not None:
+                x_assets = self.alpha_pre_norm(x_assets)
+                for dense_layer, dropout_layer in self.alpha_head_blocks:
+                    x_assets = dense_layer(x_assets)
+                    x_assets = dropout_layer(x_assets, training=training)
+            else:
+                x_assets = self.per_asset_pre_norm(x_assets)
+            # Per-asset logit: (batch, num_assets, embed_dim) → (batch, num_assets, 1) → (batch, num_assets)
+            logits = self.per_asset_logit_head(x_assets, training=training)
+            logits = tf.squeeze(logits, axis=-1)  # (batch, num_assets)
         else:
-            alpha_features = fused
+            # Legacy path: single fused vector → Dense(num_actions)
+            if self.use_richer_alpha_head and self.alpha_pre_norm is not None:
+                alpha_features = self.alpha_pre_norm(fused)
+                for dense_layer, dropout_layer in self.alpha_head_blocks:
+                    alpha_features = dense_layer(alpha_features)
+                    alpha_features = dropout_layer(alpha_features, training=training)
+            else:
+                alpha_features = fused
+            logits = self.output_layer(alpha_features, training=training)
 
-        logits = self.output_layer(alpha_features, training=training)
         return self._format_actor_output(logits_for_alpha=logits)
 
 
@@ -1617,6 +1835,10 @@ class TCNFusionCritic(Model):
         fusion_cross_asset_mixer_layers: Optional[int] = None,
         fusion_cross_asset_mixer_expansion: Optional[float] = None,
         fusion_cross_asset_mixer_dropout: Optional[float] = None,
+        fusion_asset_identity_enabled: Optional[bool] = None,
+        fusion_context_cross_attention_enabled: Optional[bool] = None,
+        fusion_context_cross_attention_heads: Optional[int] = None,
+        fusion_context_cross_attention_dropout: Optional[float] = None,
         recurrent_memory_enabled: Optional[bool] = None,
         recurrent_memory_units: Optional[int] = None,
         recurrent_memory_dropout: Optional[float] = None,
@@ -1651,6 +1873,14 @@ class TCNFusionCritic(Model):
             fusion_cross_asset_mixer_expansion = _DEFAULT_FUSION_CROSS_ASSET_MIXER_EXPANSION
         if fusion_cross_asset_mixer_dropout is None:
             fusion_cross_asset_mixer_dropout = _DEFAULT_FUSION_CROSS_ASSET_MIXER_DROPOUT
+        if fusion_asset_identity_enabled is None:
+            fusion_asset_identity_enabled = _DEFAULT_FUSION_ASSET_IDENTITY_ENABLED
+        if fusion_context_cross_attention_enabled is None:
+            fusion_context_cross_attention_enabled = _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_ENABLED
+        if fusion_context_cross_attention_heads is None:
+            fusion_context_cross_attention_heads = _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_HEADS
+        if fusion_context_cross_attention_dropout is None:
+            fusion_context_cross_attention_dropout = _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_DROPOUT
         if recurrent_memory_enabled is None:
             recurrent_memory_enabled = _DEFAULT_RECURRENT_MEMORY_ENABLED
         if recurrent_memory_units is None:
@@ -1743,6 +1973,46 @@ class TCNFusionCritic(Model):
                         name=f"{name}_asset_mixer_{i}",
                     )
                 )
+        # --- Cross-Asset Attention v2 upgrades (critic) ---
+
+        # Change 1: Learnable asset identity embeddings
+        self.asset_identity_enabled = bool(fusion_asset_identity_enabled)
+        self.asset_identity_embed = None
+        if self.asset_identity_enabled:
+            self.asset_identity_embed = self.add_weight(
+                name=f"{name}_asset_identity",
+                shape=(self.num_assets, self.fusion_embed_dim),
+                initializer=tf.keras.initializers.TruncatedNormal(stddev=0.02),
+                trainable=True,
+            )
+
+        # Change 2: Context cross-attention
+        self.context_cross_attn_enabled = bool(fusion_context_cross_attention_enabled)
+        self.context_cross_attn_block = None
+        self.context_projection_critic = None
+        if self.context_cross_attn_enabled:
+            ctx_heads = int(fusion_context_cross_attention_heads)
+            ctx_dropout = float(fusion_context_cross_attention_dropout)
+            self.context_cross_attn_block = ContextCrossAttentionBlock(
+                d_model=self.fusion_embed_dim,
+                num_heads=ctx_heads,
+                expansion=2.0,
+                dropout=ctx_dropout,
+                name=f"{name}_ctx_cross_attn",
+            )
+            self.context_projection_critic = layers.Dense(
+                self.fusion_embed_dim, activation="relu",
+                name=f"{name}_ctx_projection",
+            )
+        # 3-layer stack mode:
+        # self-attn (mixer[0]) -> context cross-attn -> self-attn (mixer[1:]).
+        self.use_three_layer_context_stack = bool(
+            self.context_cross_attn_enabled
+            and self.cross_asset_mixer_enabled
+            and len(self.asset_mixer_blocks) >= 2
+        )
+
+        # Critic always pools to scalar — but enriched per-asset representations help
         self.asset_pool = layers.GlobalAveragePooling1D()
 
         self.global_time_pool = layers.GlobalAveragePooling1D()
@@ -1865,6 +2135,7 @@ class TCNFusionCritic(Model):
                 )
             regime_seq = x
 
+        # --- Per-asset TCN encoding (shared weights) ---
         for block in self.asset_tcn_blocks:
             x_assets = block(x_assets, training=training)
         if self.asset_memory_layer is not None:
@@ -1873,25 +2144,51 @@ class TCNFusionCritic(Model):
         x_assets = self.asset_time_pool(x_assets)
         x_assets = self.asset_projection(x_assets)
         x_assets = tf.reshape(x_assets, (batch, self.num_assets, self.fusion_embed_dim))
-        x_assets = self.asset_attention(x_assets, training=training)
-        for mixer_block in self.asset_mixer_blocks:
-            x_assets = mixer_block(x_assets, training=training)
-        asset_context = self.asset_pool(x_assets)
 
+        # --- Change 1: Asset identity embeddings ---
+        if self.asset_identity_embed is not None:
+            x_assets = x_assets + self.asset_identity_embed[tf.newaxis, :, :]
+
+        # --- Cross-asset attention stack ---
+        if self.use_three_layer_context_stack:
+            x_assets = self.asset_mixer_blocks[0](x_assets, training=training)
+        else:
+            x_assets = self.asset_attention(x_assets, training=training)
+            for mixer_block in self.asset_mixer_blocks:
+                x_assets = mixer_block(x_assets, training=training)
+
+        # --- Global context branch ---
         if self.global_memory_layer is not None:
             context_seq = self.global_memory_layer(context_seq, training=training)
         global_context = self.global_time_pool(context_seq)
         global_context = self.global_projection(global_context)
         global_context = self.global_dropout(global_context, training=training)
 
-        gate = self.gate_layer(tf.concat([asset_context, global_context], axis=-1))
-        fused = gate * asset_context + (1.0 - gate) * global_context
+        # --- Change 2: Context cross-attention OR legacy gate ---
+        if self.context_cross_attn_enabled and self.context_cross_attn_block is not None:
+            ctx_token = self.context_projection_critic(global_context)  # (batch, embed_dim)
+            ctx_token = tf.expand_dims(ctx_token, axis=1)  # (batch, 1, embed_dim)
+            x_assets = self.context_cross_attn_block(
+                query=x_assets, context=ctx_token, training=training,
+            )
+            if self.use_three_layer_context_stack:
+                for mixer_block in self.asset_mixer_blocks[1:]:
+                    x_assets = mixer_block(x_assets, training=training)
+            # Pool enriched asset representations for critic value
+            fused = self.asset_pool(x_assets)
+        else:
+            asset_context = self.asset_pool(x_assets)
+            gate = self.gate_layer(tf.concat([asset_context, global_context], axis=-1))
+            fused = gate * asset_context + (1.0 - gate) * global_context
+
+        # --- Regime conditioning ---
         if self.regime_encoder is not None and self.regime_fusion is not None:
             regime_summary = _compute_regime_summary_features(regime_seq)
             regime_embed = self.regime_encoder(regime_summary, training=training)
             fused = self.regime_fusion(tf.concat([fused, regime_embed], axis=-1), training=training)
             if self.regime_dropout is not None:
                 fused = self.regime_dropout(fused, training=training)
+
         return self.output_layer(fused, training=training)
 
 
@@ -2001,6 +2298,11 @@ def create_actor_critic(architecture: str,
                 fusion_cross_asset_mixer_dropout=config.get('fusion_cross_asset_mixer_dropout', _DEFAULT_FUSION_CROSS_ASSET_MIXER_DROPOUT),
                 fusion_alpha_head_hidden_dims=config.get('fusion_alpha_head_hidden_dims', _DEFAULT_FUSION_ALPHA_HEAD_HIDDEN_DIMS),
                 fusion_alpha_head_dropout=config.get('fusion_alpha_head_dropout', _DEFAULT_FUSION_ALPHA_HEAD_DROPOUT),
+                fusion_asset_identity_enabled=config.get('fusion_asset_identity_enabled', _DEFAULT_FUSION_ASSET_IDENTITY_ENABLED),
+                fusion_context_cross_attention_enabled=config.get('fusion_context_cross_attention_enabled', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_ENABLED),
+                fusion_context_cross_attention_heads=config.get('fusion_context_cross_attention_heads', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_HEADS),
+                fusion_context_cross_attention_dropout=config.get('fusion_context_cross_attention_dropout', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_DROPOUT),
+                fusion_per_asset_alpha_head=config.get('fusion_per_asset_alpha_head', _DEFAULT_FUSION_PER_ASSET_ALPHA_HEAD),
                 dual_head_enabled=dual_head_enabled_cfg,
                 **recurrent_kwargs,
                 **regime_kwargs,
@@ -2022,6 +2324,10 @@ def create_actor_critic(architecture: str,
                 fusion_cross_asset_mixer_layers=config.get('fusion_cross_asset_mixer_layers', _DEFAULT_FUSION_CROSS_ASSET_MIXER_LAYERS),
                 fusion_cross_asset_mixer_expansion=config.get('fusion_cross_asset_mixer_expansion', _DEFAULT_FUSION_CROSS_ASSET_MIXER_EXPANSION),
                 fusion_cross_asset_mixer_dropout=config.get('fusion_cross_asset_mixer_dropout', _DEFAULT_FUSION_CROSS_ASSET_MIXER_DROPOUT),
+                fusion_asset_identity_enabled=config.get('fusion_asset_identity_enabled', _DEFAULT_FUSION_ASSET_IDENTITY_ENABLED),
+                fusion_context_cross_attention_enabled=config.get('fusion_context_cross_attention_enabled', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_ENABLED),
+                fusion_context_cross_attention_heads=config.get('fusion_context_cross_attention_heads', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_HEADS),
+                fusion_context_cross_attention_dropout=config.get('fusion_context_cross_attention_dropout', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_DROPOUT),
                 **recurrent_kwargs,
                 **regime_kwargs,
                 **critic_distributional_kwargs,
@@ -2098,6 +2404,11 @@ def create_actor_critic(architecture: str,
             fusion_cross_asset_mixer_dropout=config.get('fusion_cross_asset_mixer_dropout', _DEFAULT_FUSION_CROSS_ASSET_MIXER_DROPOUT),
             fusion_alpha_head_hidden_dims=config.get('fusion_alpha_head_hidden_dims', _DEFAULT_FUSION_ALPHA_HEAD_HIDDEN_DIMS),
             fusion_alpha_head_dropout=config.get('fusion_alpha_head_dropout', _DEFAULT_FUSION_ALPHA_HEAD_DROPOUT),
+            fusion_asset_identity_enabled=config.get('fusion_asset_identity_enabled', _DEFAULT_FUSION_ASSET_IDENTITY_ENABLED),
+            fusion_context_cross_attention_enabled=config.get('fusion_context_cross_attention_enabled', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_ENABLED),
+            fusion_context_cross_attention_heads=config.get('fusion_context_cross_attention_heads', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_HEADS),
+            fusion_context_cross_attention_dropout=config.get('fusion_context_cross_attention_dropout', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_DROPOUT),
+            fusion_per_asset_alpha_head=config.get('fusion_per_asset_alpha_head', _DEFAULT_FUSION_PER_ASSET_ALPHA_HEAD),
             dual_head_enabled=dual_head_enabled_cfg,
             **recurrent_kwargs,
             **regime_kwargs,
@@ -2119,6 +2430,10 @@ def create_actor_critic(architecture: str,
             fusion_cross_asset_mixer_layers=config.get('fusion_cross_asset_mixer_layers', _DEFAULT_FUSION_CROSS_ASSET_MIXER_LAYERS),
             fusion_cross_asset_mixer_expansion=config.get('fusion_cross_asset_mixer_expansion', _DEFAULT_FUSION_CROSS_ASSET_MIXER_EXPANSION),
             fusion_cross_asset_mixer_dropout=config.get('fusion_cross_asset_mixer_dropout', _DEFAULT_FUSION_CROSS_ASSET_MIXER_DROPOUT),
+            fusion_asset_identity_enabled=config.get('fusion_asset_identity_enabled', _DEFAULT_FUSION_ASSET_IDENTITY_ENABLED),
+            fusion_context_cross_attention_enabled=config.get('fusion_context_cross_attention_enabled', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_ENABLED),
+            fusion_context_cross_attention_heads=config.get('fusion_context_cross_attention_heads', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_HEADS),
+            fusion_context_cross_attention_dropout=config.get('fusion_context_cross_attention_dropout', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_DROPOUT),
             **recurrent_kwargs,
             **regime_kwargs,
             **critic_distributional_kwargs,
