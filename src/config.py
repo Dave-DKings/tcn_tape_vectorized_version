@@ -484,12 +484,18 @@ PHASE1_CONFIG = {
         "fusion_embed_dim": 128,
         "fusion_attention_heads": 4,
         "fusion_dropout": 0.1,
-        "fusion_cross_asset_mixer_enabled": False,   # A4 toggle (kept off by default for checkpoint compatibility)
-        "fusion_cross_asset_mixer_layers": 1,
+        "fusion_cross_asset_mixer_enabled": True,    # v2: enable multi-layer cross-asset self-attention
+        "fusion_cross_asset_mixer_layers": 2,        # v2: 2-layer transformer for richer inter-asset modeling
         "fusion_cross_asset_mixer_expansion": 2.0,
         "fusion_cross_asset_mixer_dropout": 0.1,
         "fusion_alpha_head_hidden_dims": [],         # A3 toggle (empty = legacy direct logits head)
         "fusion_alpha_head_dropout": 0.1,
+        # Cross-asset attention v2 upgrades
+        "fusion_asset_identity_enabled": True,               # Learnable per-asset embeddings
+        "fusion_context_cross_attention_enabled": True,      # Assets attend to global context
+        "fusion_context_cross_attention_heads": 4,
+        "fusion_context_cross_attention_dropout": 0.1,
+        "fusion_per_asset_alpha_head": True,                 # Per-asset alpha output (no AvgPool bottleneck)
         # Optional recurrent memory.
         "recurrent_memory_enabled": True,
         "recurrent_memory_units": 64,
