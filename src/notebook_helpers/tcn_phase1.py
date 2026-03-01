@@ -5703,6 +5703,10 @@ def evaluate_experiment6_checkpoint(
     state_dim = env_test_deterministic.observation_space.shape[0]
     stock_dim = env_test_deterministic.num_assets
     agent_config_eval = copy.deepcopy(experiment6.agent_config)
+    # Always align eval agent action topology to the live eval environment.
+    # This prevents stale notebook/metadata num_assets values from forcing
+    # incompatible reshapes (e.g., 10-asset layout applied to 7-asset eval data).
+    agent_config_eval["num_assets"] = int(stock_dim)
     arch_hints = _infer_checkpoint_architecture_hints(
         actor_weights_path,
         fallback_architecture=str(agent_config_eval.get("actor_critic_type", experiment6.architecture or "TCN")),
@@ -5741,6 +5745,14 @@ def evaluate_experiment6_checkpoint(
                 ):
                     # Keep training-time layout unless we explicitly infer better from checkpoint.
                     apply_env_layout = False
+                if isinstance(existing_layout, dict) and bool(existing_layout):
+                    existing_num_assets = int(existing_layout.get("num_assets", stock_dim) or stock_dim)
+                    if existing_num_assets != int(stock_dim):
+                        apply_env_layout = True
+                        print(
+                            "   ⚠️ Existing eval state_layout num_assets mismatch "
+                            f"({existing_num_assets} != env {int(stock_dim)}); using env layout."
+                        )
                 if (
                     fusion_signature
                     and str(agent_config_eval.get("actor_critic_type", "")).upper().startswith("TCN_FUSION")
