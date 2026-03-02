@@ -174,7 +174,107 @@ class TrainingSession:
                 logger.info(f"   {threshold:,}-{next_threshold:,} steps: {metric_name.lower()}={value:.2f}")
             else:
                 logger.info(f"   {threshold:,}+ steps: {metric_name.lower()}={value:.2f} (final)")
-    
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # PERF-FIX #2: Smooth schedule interpolation utilities
+    # ═════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _interpolate_schedule(schedule: list, current_step: int, value_key: str):
+        """
+        Linear interpolation between schedule waypoints.
+
+        Args:
+            schedule: List of dicts with 'threshold' and a value key.
+            current_step: Current training timestep.
+            value_key: Key name for the value to interpolate (e.g. 'gamma', 'lr').
+
+        Returns:
+            Interpolated value, or None if schedule is empty / value key missing.
+        """
+        if not schedule:
+            return None
+        # Handle dict-based schedules (threshold: value) as well
+        if isinstance(schedule, dict):
+            sorted_thresholds = sorted(schedule.keys())
+            schedule = [{"threshold": int(t), value_key: schedule[t]} for t in sorted_thresholds]
+
+        # Ensure sorted by threshold
+        schedule = sorted(schedule, key=lambda s: s.get("threshold", 0))
+
+        # Past the last waypoint → return last value
+        if current_step >= schedule[-1]["threshold"]:
+            val = schedule[-1].get(value_key)
+            return val
+
+        # Find the enclosing interval
+        for i in range(len(schedule) - 1):
+            t0 = schedule[i]["threshold"]
+            t1 = schedule[i + 1]["threshold"]
+            if current_step < t1:
+                v0 = schedule[i].get(value_key)
+                v1 = schedule[i + 1].get(value_key)
+                if v0 is None or v1 is None:
+                    return v0  # Can't interpolate None (e.g. episode_limit=None)
+                alpha = (current_step - t0) / max(t1 - t0, 1)
+                return v0 + alpha * (v1 - v0)
+
+        return schedule[-1].get(value_key)
+
+    def _apply_dynamic_schedules(self, agent: 'PPOAgentTF',
+                                  envs=None) -> None:
+        """
+        PERF-FIX #2: Apply all curriculum schedules at the current timestep.
+
+        Smoothly interpolates gamma, GAE-lambda, actor LR, execution beta,
+        and turnover penalty based on config schedules and current timestep.
+        """
+        step = self.total_timesteps
+        training_params = self.config.get('training_params', {})
+
+        # --- Gamma schedule ---
+        gamma_schedule = training_params.get('ppo_gamma_schedule')
+        if gamma_schedule:
+            new_gamma = self._interpolate_schedule(gamma_schedule, step, 'gamma')
+            if new_gamma is not None:
+                agent.gamma = float(new_gamma)
+
+        # --- GAE-lambda schedule ---
+        gae_schedule = training_params.get('ppo_gae_lambda_schedule')
+        if gae_schedule:
+            new_gae = self._interpolate_schedule(gae_schedule, step, 'gae_lambda')
+            if new_gae is not None:
+                agent.gae_lambda = float(new_gae)
+
+        # --- Actor LR schedule ---
+        lr_schedule = training_params.get('actor_lr_schedule')
+        if lr_schedule:
+            new_lr = self._interpolate_schedule(lr_schedule, step, 'lr')
+            if new_lr is not None and hasattr(agent, 'set_actor_lr'):
+                agent.set_actor_lr(float(new_lr))
+
+        # --- Execution beta schedule ---
+        beta_schedule = training_params.get('action_execution_beta_schedule')
+        if beta_schedule:
+            new_beta = self._interpolate_schedule(beta_schedule, step, 'beta')
+            if new_beta is not None:
+                target_envs = envs if envs else ([self.training_env] if self.training_env else [])
+                for env in target_envs:
+                    if hasattr(env, 'set_action_execution_beta'):
+                        env.set_action_execution_beta(float(new_beta))
+
+        # --- Turnover penalty curriculum ---
+        turnover_curriculum = training_params.get('turnover_penalty_curriculum')
+        if turnover_curriculum:
+            new_penalty = self._interpolate_schedule(
+                turnover_curriculum, step, 'value'
+            )
+            if new_penalty is not None:
+                target_envs = envs if envs else ([self.training_env] if self.training_env else [])
+                for env in target_envs:
+                    if hasattr(env, 'turnover_penalty_scalar'):
+                        env.turnover_penalty_scalar = float(new_penalty)
+
     def _deep_update(self, base_dict: Dict, update_dict: Dict) -> None:
         """Deep update nested dictionary."""
         for key, value in update_dict.items():
@@ -350,7 +450,7 @@ class TrainingSession:
 
     def _determine_episode_limit(self, env: PortfolioEnvTF) -> Optional[int]:
         """
-        Curriculum for episode length: 1 year → 2 years → full history.
+        PERF-FIX #2: Curriculum for episode length using config schedule with interpolation.
         """
         if not self.use_episode_length_curriculum:
             return getattr(env, 'total_days', None)
@@ -359,10 +459,21 @@ class TrainingSession:
         if not total_days:
             return None
 
-        if self.total_timesteps < 20_000:
-            return min(252, total_days)
-        if self.total_timesteps < 60_000:
-            return min(504, total_days)
+        # Use config-driven schedule
+        training_params = self.config.get('training_params', {})
+        schedule = training_params.get('episode_length_curriculum_schedule')
+
+        if schedule:
+            raw_limit = self._interpolate_schedule(schedule, self.total_timesteps, 'limit')
+            if raw_limit is None:
+                return total_days  # None means full dataset
+            return min(int(round(raw_limit)), total_days)
+
+        # Legacy fallback (if no schedule in config)
+        if self.total_timesteps < 100_000:
+            return min(756, total_days)
+        if self.total_timesteps < 250_000:
+            return min(1008, total_days)
         return total_days
 
     def _apply_turnover_curriculum(self, env: PortfolioEnvTF) -> None:
@@ -1370,6 +1481,8 @@ class TrainingSession:
                             self._last_regime = current_regime
 
                     steps_target = min(timesteps_per_update, max_timesteps - self.total_timesteps)
+                    # PERF-FIX #2: Apply smooth schedule transitions before each rollout
+                    self._apply_dynamic_schedules(agent, envs=parallel_envs)
                     completed_eps, precomputed_gae = self._collect_parallel_rollout(
                         parallel_envs,
                         agent,
@@ -1431,6 +1544,8 @@ class TrainingSession:
                             logger.info("=" * 80)
                             self._last_regime = current_regime
 
+                    # PERF-FIX #2: Apply smooth schedule transitions before each episode
+                    self._apply_dynamic_schedules(agent, envs=[env])
                     episode_stats = self.run_episode(env, agent, volatility_regime=current_regime)
 
                     update_stats = None

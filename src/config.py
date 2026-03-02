@@ -485,29 +485,29 @@ PHASE1_CONFIG = {
         "fusion_attention_heads": 4,
         "fusion_dropout": 0.1,
         "fusion_cross_asset_mixer_enabled": True,    # v2: enable multi-layer cross-asset self-attention
-        "fusion_cross_asset_mixer_layers": 2,        # v2: 2-layer transformer for richer inter-asset modeling
+        "fusion_cross_asset_mixer_layers": 1,        # PERF-FIX #8: reduced from 2 to 1 — simpler until base is stable
         "fusion_cross_asset_mixer_expansion": 2.0,
         "fusion_cross_asset_mixer_dropout": 0.1,
         "fusion_alpha_head_hidden_dims": [],         # A3 toggle (empty = legacy direct logits head)
         "fusion_alpha_head_dropout": 0.1,
         # Cross-asset attention v2 upgrades
         "fusion_asset_identity_enabled": True,               # Learnable per-asset embeddings
-        "fusion_context_cross_attention_enabled": True,      # Assets attend to global context
+        "fusion_context_cross_attention_enabled": False,     # PERF-FIX #8: disabled — undertrained with 150K steps
         "fusion_context_cross_attention_heads": 4,
         "fusion_context_cross_attention_dropout": 0.1,
         "fusion_per_asset_alpha_head": True,                 # Per-asset alpha output (no AvgPool bottleneck)
         # Optional recurrent memory.
-        "recurrent_memory_enabled": True,
+        "recurrent_memory_enabled": False,          # PERF-FIX #8: disabled — TCN already captures temporal
         "recurrent_memory_units": 64,
         "recurrent_memory_dropout": 0.1,
         # Optional regime-aware conditioning.
-        "regime_conditioning_enabled": True,
+        "regime_conditioning_enabled": False,        # PERF-FIX #8: disabled — regime info already in features
         "regime_conditioning_hidden_dim": 32,
         "regime_conditioning_dropout": 0.0,
         # Optional state augmentation for regime summary features.
         "state_augmentation_enabled": True,
         # Optional distributional critic head.
-        "distributional_critic_enabled": True,
+        "distributional_critic_enabled": False,      # PERF-FIX #8: disabled — simpler critic learns faster
         "distributional_num_quantiles": 17,
         # Dual-head policy (Dirichlet + softmax/projection).
         "dual_head_enabled": False,
@@ -523,9 +523,9 @@ PHASE1_CONFIG = {
         "dual_head_projection_min_cash_position": 0.05,
 
         # Dirichlet alpha activation (controls action concentration)
-        "dirichlet_alpha_activation": "softplus",  # Stable strictly-positive alpha map
+        "dirichlet_alpha_activation": "exp_tanh",   # PERF-FIX #4c: exp(tanh(x)*scale) — better diversity than softplus
         "dirichlet_exp_clip": (-5.0, 3.0),
-        "dirichlet_logit_temperature": 1.0,
+        "dirichlet_logit_temperature": 0.5,           # PERF-FIX #4a: sharper allocation (was 1.0)
         # Optional adaptive temperature controller:
         # temperature = clip(base + slope * |logit|, t_min, t_max)
         # Larger |logit| -> larger temperature -> flatter alpha map.
@@ -534,7 +534,7 @@ PHASE1_CONFIG = {
         "dirichlet_adaptive_temperature_slope": 0.0,
         "dirichlet_adaptive_temperature_min": 0.8,
         "dirichlet_adaptive_temperature_max": 2.5,
-        "dirichlet_alpha_cap": 100.0,
+        "dirichlet_alpha_cap": 50.0,                 # PERF-FIX #4a: tighter cap (was 100.0)
 
         # Dirichlet exploration (epsilon annealing)
         "dirichlet_epsilon": {
@@ -549,11 +549,14 @@ PHASE1_CONFIG = {
         # PPO Algorithm parameters
         # Stabilized PPO regime for better out-of-sample Sharpe retention.
         "ppo_params": {
-            "gamma": 0.99, "gae_lambda": 0.9, "policy_clip": 0.10,
-            "entropy_coef": 0.01, "vf_coef": 0.5, "num_ppo_epochs": 4,
-            "batch_size_ppo": 252, "actor_lr": 0.00002, "critic_lr": 0.0003,
-            "max_grad_norm": 0.5, "value_clip": 0.2, "target_kl": 0.015,
-            "kl_stop_multiplier": 1.2, "minibatches_before_kl_stop": 1,
+            # PERF-FIX #1: PPO stability overhaul
+            "gamma": 0.99, "gae_lambda": 0.92, "policy_clip": 0.15,
+            "entropy_coef": 0.005, "vf_coef": 0.5, "num_ppo_epochs": 3,
+            "batch_size_ppo": 252, "actor_lr": 0.00003, "critic_lr": 0.00015,
+            "max_grad_norm": 0.5, "value_clip": 0.3, "target_kl": 0.02,
+            "kl_stop_multiplier": 2.0, "minibatches_before_kl_stop": 2,
+            # PERF-FIX #4b: Alpha diversity HHI auxiliary loss coefficient
+            "alpha_diversity_coef": 0.01,
             # Optional risk-aware actor auxiliaries.
             "use_risk_aux_loss": True,
             # Per-asset feature index used as one-step return proxy in structured state tensor.
@@ -584,7 +587,7 @@ PHASE1_CONFIG = {
     },
     #================================================
     "training_params": {
-        "max_total_timesteps": 150000,  # Requested architecture update
+        "max_total_timesteps": 500_000,  # PERF-FIX #5: extended from 150K for complex architecture
         "num_parallel_envs": 1,  # >1 enables vectorized rollout collection
         "timesteps_per_ppo_update": 504,  # Frequent updates (matched to episode length) — archive used ~252
         "log_interval_episodes": 10,
@@ -619,26 +622,47 @@ PHASE1_CONFIG = {
             {"name": "all", "timesteps_fraction": 0.30}          # Final 30% on all data
         ],
 
-        # Enable episode-length curriculum with smooth overlap ramps.
+        # PERF-FIX #2 + #5: Smooth schedule transitions with wider spacing for 500K budget.
         "use_episode_length_curriculum": True,
         "episode_length_curriculum_schedule": [
-            {"threshold": 0, "limit": 1500},
-            {"threshold": 30_000, "limit": 2000},
-            {"threshold": 60_000, "limit": 2500},
-            {"threshold": 90_000, "limit": None},
+            {"threshold": 0,        "limit": 756},
+            {"threshold": 100_000,  "limit": 1008},
+            {"threshold": 250_000,  "limit": 1500},
+            {"threshold": 400_000,  "limit": None},
         ],
         "episode_length_curriculum_smooth_enabled": True,
-        "episode_length_curriculum_overlap_steps": 10_000,
+        "episode_length_curriculum_overlap_steps": 20_000,
         "ppo_gamma_schedule": [
-            {"threshold": 0, "gamma": 0.985},
-            {"threshold": 50_000, "gamma": 0.992},
-            {"threshold": 100_000, "gamma": 0.997},
+            {"threshold": 0,        "gamma": 0.990},
+            {"threshold": 150_000,  "gamma": 0.995},
+            {"threshold": 350_000,  "gamma": 0.998},
         ],
         "ppo_gae_lambda_schedule": [
-            {"threshold": 0, "gae_lambda": 0.90},
-            {"threshold": 50_000, "gae_lambda": 0.94},
-            {"threshold": 100_000, "gae_lambda": 0.97},
+            {"threshold": 0,        "gae_lambda": 0.92},
+            {"threshold": 150_000,  "gae_lambda": 0.95},
+            {"threshold": 350_000,  "gae_lambda": 0.97},
         ],
+        # PERF-FIX #2: Actor LR schedule (gentle decay)
+        "actor_lr_schedule": [
+            {"threshold": 0,        "lr": 0.00003},
+            {"threshold": 150_000,  "lr": 0.00002},
+            {"threshold": 300_000,  "lr": 0.00001},
+        ],
+        # PERF-FIX #6: Execution inertia — start high beta, reduce slowly
+        "action_execution_beta_schedule": [
+            {"threshold": 0,        "beta": 0.50},
+            {"threshold": 100_000,  "beta": 0.40},
+            {"threshold": 200_000,  "beta": 0.30},
+            {"threshold": 350_000,  "beta": 0.25},
+        ],
+        # PERF-FIX #2: Turnover penalty curriculum (scaled for 500K)
+        "turnover_penalty_curriculum": {
+            0:        0.75,
+            100_000:  1.25,
+            200_000:  1.50,
+            300_000:  1.75,
+            400_000:  2.00,
+        },
         
         # PHASE 1: Progressive Threshold Curriculum
         "use_progressive_threshold": True,

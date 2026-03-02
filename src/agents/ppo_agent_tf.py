@@ -44,15 +44,22 @@ def _to_tensor_with_cast(value, dtype=None):
 
 
 class RunningMeanStd:
-    """Track running mean and variance for streaming normalization."""
+    """
+    Track running mean and variance for streaming normalization.
 
-    def __init__(self, epsilon: float = 1e-4):
+    PERF-FIX #3: Uses exponential moving average (EMA) instead of Welford
+    accumulator for faster adaptation to distribution shifts (e.g. when
+    episode length or reward scale changes during curriculum learning).
+    """
+
+    def __init__(self, epsilon: float = 1e-4, ema_decay: float = 0.999):
         self.mean = 0.0
         self.var = 1.0
         self.count = epsilon
+        self.ema_decay = ema_decay
 
     def update(self, x):
-        """Update running statistics with a new batch."""
+        """Update running statistics with a new batch using EMA."""
         x = np.asarray(x, dtype=np.float64)
         if x.size == 0:
             return
@@ -61,18 +68,23 @@ class RunningMeanStd:
         batch_var = np.var(x)
         batch_count = x.shape[0]
 
-        delta = batch_mean - self.mean
-        total_count = self.count + batch_count
+        # EMA adaptation: alpha controls how fast we forget old stats
+        # For a batch of size n, effective alpha = 1 - decay^n
+        alpha = 1.0 - self.ema_decay ** batch_count
 
-        new_mean = self.mean + delta * batch_count / total_count
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
-        m2 = m_a + m_b + delta ** 2 * self.count * batch_count / total_count
-        new_var = m2 / total_count
+        if self.count < 1.0:
+            # First update: initialize directly from batch
+            self.mean = float(batch_mean)
+            self.var = float(max(batch_var, 1e-8))
+        else:
+            # EMA update
+            self.mean = float((1 - alpha) * self.mean + alpha * batch_mean)
+            self.var = float(max(
+                (1 - alpha) * self.var + alpha * batch_var,
+                1e-8
+            ))
 
-        self.mean = float(new_mean)
-        self.var = float(max(new_var, 1e-8))
-        self.count = float(total_count)
+        self.count = float(self.count + batch_count)
 
     @property
     def std(self):
@@ -171,6 +183,8 @@ class PPOAgentTF:
         self.target_kl = float(ppo_params.get('target_kl', 0.03))
         self.kl_stop_multiplier = float(ppo_params.get('kl_stop_multiplier', 1.5))
         self.minibatches_before_kl_stop = int(ppo_params.get('minibatches_before_kl_stop', 2))
+        # PERF-FIX #4b: Alpha diversity HHI auxiliary loss coefficient
+        self.alpha_diversity_coef = float(ppo_params.get('alpha_diversity_coef', 0.0))
 
         # Optional risk-aware actor auxiliary losses (disabled by default).
         # These are additive regularizers intended to improve risk-adjusted robustness.
@@ -391,6 +405,11 @@ class PPOAgentTF:
         # Debug/diagnostic verbosity toggle
         self.debug_prints = bool(config.get('debug_prints', False))
 
+        # PERF-FIX #7: EMA (Polyak-averaged) actor weights for stable evaluation
+        self.ema_decay = float(ppo_params.get('ema_actor_decay', 0.995))
+        self.actor_ema_weights = None
+        self._init_ema_actor()
+
     def get_actor_lr(self) -> float:
         """Return the actor optimizer learning rate as a python float."""
         try:
@@ -406,6 +425,55 @@ class PPOAgentTF:
         else:
             self.actor_optimizer.learning_rate = new_lr
         self._current_actor_lr = new_lr
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # PERF-FIX #7: EMA (Polyak-averaged) actor weight tracking
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _init_ema_actor(self):
+        """Initialize EMA actor weights as a copy of current actor weights."""
+        try:
+            self.actor_ema_weights = [w.numpy().copy() for w in self.actor.trainable_weights]
+            logger.info("  EMA actor initialized (decay=%.4f, %d weight tensors)",
+                       self.ema_decay, len(self.actor_ema_weights))
+        except Exception as e:
+            logger.warning("  EMA actor init failed: %s", e)
+            self.actor_ema_weights = None
+
+    def _update_ema_actor(self):
+        """Polyak update: ema_w = decay * ema_w + (1 - decay) * actor_w."""
+        if self.actor_ema_weights is None:
+            return
+        try:
+            current_weights = self.actor.trainable_weights
+            for i, w in enumerate(current_weights):
+                self.actor_ema_weights[i] = (
+                    self.ema_decay * self.actor_ema_weights[i]
+                    + (1.0 - self.ema_decay) * w.numpy()
+                )
+        except Exception:
+            pass  # Silently skip if weight shape mismatch etc.
+
+    def get_ema_actor_weights(self):
+        """Return the EMA-averaged actor weights (for evaluation/checkpointing)."""
+        return self.actor_ema_weights
+
+    def apply_ema_actor_weights(self):
+        """Temporarily apply EMA weights to actor for evaluation."""
+        if self.actor_ema_weights is None:
+            return None
+        # Save current weights to restore later
+        backup = [w.numpy().copy() for w in self.actor.trainable_weights]
+        for w, ema_w in zip(self.actor.trainable_weights, self.actor_ema_weights):
+            w.assign(ema_w)
+        return backup
+
+    def restore_actor_weights(self, backup):
+        """Restore actor weights from backup (after EMA evaluation)."""
+        if backup is None:
+            return
+        for w, bw in zip(self.actor.trainable_weights, backup):
+            w.assign(bw)
 
     def get_critic_lr(self) -> float:
         """Return the critic optimizer learning rate as a python float."""
@@ -1568,7 +1636,17 @@ class PPOAgentTF:
                 tf.constant(self.dual_head_consistency_coef, dtype=tf.float32)
                 * tf.reduce_mean(tf.square(dirichlet_mean - projection_weights))
             )
-        total_loss = policy_loss + entropy_loss + risk_aux_total + consistency_loss
+        # PERF-FIX #4b: Alpha diversity HHI auxiliary loss
+        # Encourages the Dirichlet to produce concentrated (non-uniform) allocations
+        # by maximizing the Herfindahl-Hirschman Index (HHI) of alpha-implied weights.
+        diversity_loss = tf.constant(0.0, dtype=tf.float32)
+        if self.alpha_diversity_coef > 0.0:
+            alpha_weights = alpha / tf.reduce_sum(alpha, axis=-1, keepdims=True)
+            hhi = tf.reduce_sum(tf.square(alpha_weights), axis=-1)  # (batch,)
+            # Negative sign: we WANT high HHI (concentrated), so loss = -coef * mean(HHI)
+            diversity_loss = tf.constant(-self.alpha_diversity_coef, dtype=tf.float32) * tf.reduce_mean(hhi)
+
+        total_loss = policy_loss + entropy_loss + risk_aux_total + consistency_loss + diversity_loss
         
         approx_kl = tf.reduce_mean(log_probs_old - log_probs_new)
         clip_mask = tf.cast(tf.abs(ratio_unclipped - 1.0) > self.policy_clip, tf.float32)
@@ -2005,7 +2083,10 @@ class PPOAgentTF:
             stats['explained_variance'] = 0.0
 
         logger.debug(f"PPO Update completed: {num_updates} mini-batch updates over {num_epochs} epochs")
-        
+
+        # PERF-FIX #7: Update EMA actor weights after each PPO update
+        self._update_ema_actor()
+
         return stats
     
     def save_models(self, filepath_prefix):

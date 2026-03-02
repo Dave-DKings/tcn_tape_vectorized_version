@@ -606,6 +606,12 @@ class DirichletActor(Model):
         elif activation == "exp_clip":
             low, high = self._exp_clip
             alpha = tf.exp(tf.clip_by_value(scaled_logits, low, high)) + eps
+        elif activation == "exp_tanh":
+            # PERF-FIX #4c: exp(tanh(x) * scale) + eps
+            # Bounded output prevents alpha explosion and naturally encourages
+            # diversity. Range: [exp(-scale), exp(scale)] ~ [0.08, 12.2] for scale=2.5
+            exp_tanh_scale = 2.5
+            alpha = tf.exp(tf.nn.tanh(scaled_logits) * exp_tanh_scale) + eps
         else:
             # Default / legacy: softplus + adaptive epsilon
             alpha = tf.nn.softplus(scaled_logits) + eps

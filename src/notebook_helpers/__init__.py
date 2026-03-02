@@ -29,6 +29,10 @@ from .feature_signal import (
     save_feature_signal_report,
     describe_top_features,
 )
+from .artifact_sync import (
+    DEFAULT_ARTIFACT_REL_PATHS,
+    save_artifacts_to_drive,
+)
 
 __all__ = [
     "configure_episode_length_curriculum",
@@ -54,4 +58,6 @@ __all__ = [
     "compute_feature_signal_report",
     "save_feature_signal_report",
     "describe_top_features",
+    "DEFAULT_ARTIFACT_REL_PATHS",
+    "save_artifacts_to_drive",
 ]
