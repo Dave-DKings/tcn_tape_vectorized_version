@@ -553,7 +553,7 @@ PHASE1_CONFIG = {
             "gamma": 0.99, "gae_lambda": 0.92, "policy_clip": 0.15,
             "entropy_coef": 0.005, "vf_coef": 0.5, "num_ppo_epochs": 3,
             "batch_size_ppo": 252, "actor_lr": 0.00003, "critic_lr": 0.00015,
-            "max_grad_norm": 0.5, "value_clip": 0.3, "target_kl": 0.02,
+            "max_grad_norm": 0.5, "value_clip": 0.3, "target_kl": 0.0,  # disabled: exp_tanh has naturally larger KL
             "kl_stop_multiplier": 2.0, "minibatches_before_kl_stop": 2,
             # PERF-FIX #4b: Alpha diversity HHI auxiliary loss coefficient
             "alpha_diversity_coef": 0.01,

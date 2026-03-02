@@ -255,6 +255,14 @@ class TrainingSession:
 
         # --- Execution beta schedule ---
         beta_schedule = training_params.get('action_execution_beta_schedule')
+        # Fallback: convert old dict-format curriculum to list-format schedule
+        if not beta_schedule:
+            beta_curriculum = training_params.get('action_execution_beta_curriculum')
+            if isinstance(beta_curriculum, dict) and beta_curriculum:
+                beta_schedule = [
+                    {'threshold': int(t), 'beta': float(v)}
+                    for t, v in sorted(beta_curriculum.items(), key=lambda x: int(x[0]))
+                ]
         if beta_schedule:
             new_beta = self._interpolate_schedule(beta_schedule, step, 'beta')
             if new_beta is not None:
