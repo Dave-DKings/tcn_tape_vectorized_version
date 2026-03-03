@@ -1181,6 +1181,8 @@ def apply_run5_overrides(config: dict, overrides: dict = None) -> dict:
     split_date = overrides.get("train_test_split")
     if split_date:
         TRAIN_TEST_SPLIT_DATE = split_date
+        # Also set in the config dict so prepare_phase1_dataset picks it up
+        config["TRAIN_TEST_SPLIT_DATE"] = split_date
         print(f"[Run5] Train/test split => {split_date}")
 
     # --- FIX 2: Regime conditioning ---
