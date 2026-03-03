@@ -1140,7 +1140,7 @@ RUN5_OVERRIDES = {
     },
 
     # FIX 5: Lower drawdown trigger
-    "drawdown_constraint_target": 0.12,
+    "drawdown_constraint_target": 0.20,
     "drawdown_constraint_tolerance": -0.01,
 }
 
