@@ -64,20 +64,20 @@ def diagnose_alpha_distribution(agent, state, verbose=True):
         
         # Interpret
         if stats['alpha_std'] < 0.3:
-            print(f"\n   ⚠️ WARNING: Alphas too uniform! TCN not learning.")
-            print(f"   → Check if gradients are flowing back to actor")
-            print(f"   → Consider deeper TCN or lower entropy coefficient")
+            print(f"\n   [WARN] WARNING: Alphas too uniform! TCN not learning.")
+            print(f"   => Check if gradients are flowing back to actor")
+            print(f"   => Consider deeper TCN or lower entropy coefficient")
         elif stats['alpha_std'] < 1.0:
             print(f"\n   ⚡ Moderate differentiation. May need more training.")
         else:
-            print(f"\n   ✅ Good differentiation! TCN learning asset preferences.")
+            print(f"\n   [OK] Good differentiation! TCN learning asset preferences.")
         
         # Display implied weights
         print(f"\n   Implied mean weights: {stats['implied_weights']}")
         print(f"   Weight std: {stats['implied_weights'].std():.3f}")
         
         if stats['implied_weights'].std() < 0.05:
-            print(f"   ⚠️ Near-uniform weights despite varied alphas!")
+            print(f"   [WARN] Near-uniform weights despite varied alphas!")
         
         print(f"{'='*80}\n")
     
@@ -113,7 +113,7 @@ def log_alpha_stats(stats, update_num, logger=None):
     # Warning if alpha stuck
     if update_num > 500 and alpha_std < 0.3:
         warning = (
-            "⚠️ Alpha std still < 0.3 after 500 updates. "
+            "[WARN] Alpha std still < 0.3 after 500 updates. "
             "TCN may not be learning. Consider:"
             "\n  1. Checking PPO ratio (should be 0.95-1.05)"
             "\n  2. Lowering entropy further (0.005)"
@@ -225,14 +225,14 @@ def evaluate_with_diagnostics(env, agent, num_episodes=1, evaluation_mode='mode'
     print(f"Weight Std (episode avg): {avg_weight_std:.3f}")
     
     if avg_alpha_std < 0.3:
-        print(f"\n⚠️ WARNING: Low alpha std indicates TCN not learning")
+        print(f"\n[WARN] WARNING: Low alpha std indicates TCN not learning")
     elif avg_alpha_std > 0.5:
-        print(f"\n✅ Good alpha diversity - TCN is learning!")
+        print(f"\n[OK] Good alpha diversity - TCN is learning!")
     
     if avg_weight_std < 0.05:
-        print(f"⚠️ WARNING: Near-uniform weights despite alphas")
+        print(f"[WARN] WARNING: Near-uniform weights despite alphas")
     elif avg_weight_std > 0.08:
-        print(f"✅ Good weight diversity - avoiding uniform allocation!")
+        print(f"[OK] Good weight diversity - avoiding uniform allocation!")
     
     print(f"{'='*80}\n")
     
@@ -265,9 +265,9 @@ def quick_alpha_check(agent, env, num_samples=5):
     print(f"\nMean alpha_std: {mean_alpha_std:.3f}")
     
     if mean_alpha_std < 0.3:
-        print("⚠️ Alphas too uniform - TCN may not be learning")
+        print("[WARN] Alphas too uniform - TCN may not be learning")
     elif mean_alpha_std > 0.5:
-        print("✅ Good alpha diversity!")
+        print("[OK] Good alpha diversity!")
     else:
         print("⚡ Moderate diversity - more training may help")
     

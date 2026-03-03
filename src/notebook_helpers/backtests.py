@@ -246,13 +246,13 @@ def run_backtest_walk_forward(
 
 def describe_backtest_helpers() -> None:
     """Print a concise overview mirroring the notebook cell footer."""
-    print("✅ State-of-the-art evaluation framework loaded!")
+    print("[OK] State-of-the-art evaluation framework loaded!")
     print("   Available functions:")
     print("   - calculate_metrics_from_trajectory(): Compute metrics from portfolio trajectory")
     print("   - run_backtest_deterministic(): Single deterministic backtest (standard)")
     print("   - run_backtest_stochastic(): Monte Carlo evaluation with stochastic policy")
     print("   - run_backtest_walk_forward(): Walk-forward analysis across time windows")
-    print("   🎲 Pass `random_seed` for custom env reproducibility")
+    print("   [RAND] Pass `random_seed` for custom env reproducibility")
     print("   📌 FinRL envs remain deterministic by design")
 
 

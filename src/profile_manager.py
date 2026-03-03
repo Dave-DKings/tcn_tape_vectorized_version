@@ -12,7 +12,7 @@ decision hierarchy:
 
 2. Curriculum Learning (Medium Priority)
    - Structured learning phases for agent development
-   - Foundation → Exploration → Specialization → Mastery
+   - Foundation => Exploration => Specialization => Mastery
    - Ensures robust learning progression
 
 3. Market Heuristic Rules (Lowest Priority, Default)
@@ -20,7 +20,7 @@ decision hierarchy:
    - Uses VIX, yield curve, volatility, trend indicators
    - Fallback strategy when no overrides/curriculum active
 
-The system processes in order: Performance → Curriculum → Market → Default
+The system processes in order: Performance => Curriculum => Market => Default
 
 Author: AI Assistant
 Date: October 2, 2025

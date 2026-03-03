@@ -612,7 +612,7 @@ class PPOAgentTF:
         if self.is_sequential:
             # Sequential models expect: (batch, timesteps, features)
             if current_ndim == 2:
-                # (timesteps, features) → (1, timesteps, features)
+                # (timesteps, features) => (1, timesteps, features)
                 return tf.expand_dims(state, axis=0), True  # needs_squeeze
             elif current_ndim == 3:
                 # Already batched: (batch, timesteps, features)
@@ -624,7 +624,7 @@ class PPOAgentTF:
         else:
             # Non-sequential expects: (batch, features)
             if current_ndim == 1:
-                # (features,) → (1, features)
+                # (features,) => (1, features)
                 return tf.expand_dims(state, axis=0), True  # needs_squeeze
             elif current_ndim == 2:
                 # Already batched: (batch, features)
@@ -1053,7 +1053,7 @@ class PPOAgentTF:
         # Create Dirichlet distribution
         dirichlet = tfd.Dirichlet(alpha)
         
-        # ✅ FIX: stochastic parameter forces sampling even when not training
+        # [OK] FIX: stochastic parameter forces sampling even when not training
         if stochastic:
             # Force stochastic sampling for Monte Carlo evaluation
             action = dirichlet.sample()
@@ -1304,7 +1304,7 @@ class PPOAgentTF:
         if self.is_sequential:
             # Sequential: should be (timesteps, features)
             if state.ndim == 3 and state.shape[0] == 1:
-                # Remove batch dimension: (1, timesteps, features) → (timesteps, features)
+                # Remove batch dimension: (1, timesteps, features) => (timesteps, features)
                 state = state.squeeze(0)
             elif state.ndim != 2:
                 raise ValueError(
@@ -1314,7 +1314,7 @@ class PPOAgentTF:
         else:
             # Non-sequential: should be (features,)
             if state.ndim == 2 and state.shape[0] == 1:
-                # Remove batch dimension: (1, features) → (features,)
+                # Remove batch dimension: (1, features) => (features,)
                 state = state.squeeze(0)
             elif state.ndim != 1:
                 raise ValueError(
@@ -1339,7 +1339,7 @@ class PPOAgentTF:
         
         # Actions should always be (num_actions,)
         if action.ndim == 2 and action.shape[0] == 1:
-            # Remove batch dimension: (1, num_actions) → (num_actions,)
+            # Remove batch dimension: (1, num_actions) => (num_actions,)
             action = action.squeeze(0)
         elif action.ndim != 1:
             raise ValueError(f"Invalid action shape: {action.shape}. Expected (num_actions,) or (1, num_actions)")
@@ -1423,7 +1423,7 @@ class PPOAgentTF:
             print(f"   TD error mean: {np.mean(td_errors):.6f}, std: {np.std(td_errors):.6f}")
             print(f"   Abs TD error mean: {np.mean(np.abs(td_errors)):.6f}")
             if np.std(td_errors) < 0.01:
-                print(f"   ⚠️  WARNING: TD errors have very low variance! Critic may be overfitting.")
+                print(f"   [WARN]  WARNING: TD errors have very low variance! Critic may be overfitting.")
         
         return advantages, returns
     
@@ -1826,11 +1826,11 @@ class PPOAgentTF:
         raw_adv_mean = np.mean(raw_advantages)
         raw_adv_std = np.std(raw_advantages)
         if self.debug_prints:
-            print(f"\n🔍 ADVANTAGE DIAGNOSTICS:")
+            print(f"\n[SEARCH] ADVANTAGE DIAGNOSTICS:")
             print(f"   Raw advantages: min={raw_advantages.min():.6f}, max={raw_advantages.max():.6f}")
             print(f"   Raw adv mean: {raw_adv_mean:.6f}, std: {raw_adv_std:.6f}")
             if raw_adv_std < 0.01:
-                print(f"   ⚠️  WARNING: Very low std! Normalized advantages will be near zero!")
+                print(f"   [WARN]  WARNING: Very low std! Normalized advantages will be near zero!")
         
         # Normalize advantages
         advantages = (advantages - np.mean(advantages)) / (np.std(advantages) + 1e-8)
@@ -2024,13 +2024,13 @@ class PPOAgentTF:
                 stats['num_grad_updates'] += 1                
                 # CRITICAL: Detect NaN/Inf early to prevent cascade failures
                 if tf.math.is_nan(actor_loss) or tf.math.is_inf(actor_loss):
-                    logger.error(f"❌ CRITICAL: NaN/Inf detected in actor_loss! Training unstable.")
+                    logger.error(f"[ERROR] CRITICAL: NaN/Inf detected in actor_loss! Training unstable.")
                     logger.error(f"   Policy loss: {policy_loss:.6f}, Entropy loss: {entropy_loss:.6f}")
                     # Return current stats to allow graceful handling
                     break
                 
                 if tf.math.is_nan(critic_loss_raw) or tf.math.is_inf(critic_loss_raw):
-                    logger.error(f"❌ CRITICAL: NaN/Inf detected in critic_loss! Training unstable.")
+                    logger.error(f"[ERROR] CRITICAL: NaN/Inf detected in critic_loss! Training unstable.")
                     break
 
                 # Early-stop PPO update when KL drift is too high (stability guard).
@@ -2044,7 +2044,7 @@ class PPOAgentTF:
                     stats['early_stop_kl'] = approx_kl_value
                     stats['early_stop_epoch'] = float(epoch)
                     logger.warning(
-                        "⚠️ PPO early-stop: approx_kl %.6f exceeded threshold %.6f (target_kl %.6f × %.2f)",
+                        "[WARN] PPO early-stop: approx_kl %.6f exceeded threshold %.6f (target_kl %.6f × %.2f)",
                         approx_kl_value,
                         self.target_kl * self.kl_stop_multiplier,
                         self.target_kl,

@@ -79,7 +79,7 @@ def print_header():
     print("=" * 80)
     print(f"Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
-    print("✅ Using validated FinRL-refactored environment:")
+    print("[OK] Using validated FinRL-refactored environment:")
     print("   - Reward: Portfolio return * 100")
     print("   - Returns: Calculated from Close prices")
     print("   - Termination: Data exhausted only")
@@ -109,12 +109,12 @@ def train_agent(config: Dict, args) -> Dict:
     processor = DataProcessor(config)
     processed_df, scalers = processor.prepare_features_phase1()
     
-    print(f"✅ Data loaded: {len(processed_df):,} rows")
+    print(f"[OK] Data loaded: {len(processed_df):,} rows")
     print(f"   Date range: {processed_df['Date'].min()} to {processed_df['Date'].max()}")
     print()
     
     # Split data (80/20 for train/validation)
-    print("✂️  Splitting data...")
+    print("[SPLIT]  Splitting data...")
     unique_dates = sorted(processed_df['Date'].unique())
     train_date_count = int(len(unique_dates) * 0.8)
     
@@ -124,8 +124,8 @@ def train_agent(config: Dict, args) -> Dict:
     train_df = processed_df[processed_df['Date'].isin(train_dates)].copy()
     val_df = processed_df[processed_df['Date'].isin(val_dates)].copy()
     
-    print(f"✅ Training: {len(train_dates):,} dates ({len(train_df):,} rows)")
-    print(f"✅ Validation: {len(val_dates):,} dates ({len(val_df):,} rows)")
+    print(f"[OK] Training: {len(train_dates):,} dates ({len(train_df):,} rows)")
+    print(f"[OK] Validation: {len(val_dates):,} dates ({len(val_df):,} rows)")
     print()
     
     # Create environment
@@ -142,7 +142,7 @@ def train_agent(config: Dict, args) -> Dict:
     
     # Wrap for Stable-Baselines3
     env_train = DummyVecEnv([lambda: env_train])
-    print("✅ Environment created")
+    print("[OK] Environment created")
     print()
     
     # Create PPO agent
@@ -191,7 +191,7 @@ def train_agent(config: Dict, args) -> Dict:
     training_duration = (training_end - training_start).total_seconds()
     
     print()
-    print(f"✅ Training complete!")
+    print(f"[OK] Training complete!")
     print(f"   Duration: {training_duration / 60:.1f} minutes")
     print()
     
@@ -233,7 +233,7 @@ def train_agent(config: Dict, args) -> Dict:
         if done or truncated:
             break
     
-    print(f"✅ Validation complete ({step_count} steps)")
+    print(f"[OK] Validation complete ({step_count} steps)")
     print()
     
     # Calculate metrics
@@ -362,7 +362,7 @@ def main():
     print()
     print(f"End Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
-    print("✅ Summary:")
+    print("[OK] Summary:")
     val_perf = results['validation_performance']
     print(f"   Total Return:     {val_perf['total_return'] * 100:.2f}%")
     print(f"   Sharpe Ratio:     {val_perf['sharpe_ratio']:.3f}")
@@ -378,11 +378,11 @@ def main():
     print()
     
     if pct_of_benchmark >= 80:
-        print("🎉 EXCELLENT: Achieves ≥80% of benchmark!")
+        print("🎉 EXCELLENT: Achieves >=80% of benchmark!")
     elif pct_of_benchmark >= 65:
-        print("✅ SUCCESS: Achieves ≥65% of benchmark!")
+        print("[OK] SUCCESS: Achieves >=65% of benchmark!")
     else:
-        print("⚠️  Below target. Consider more training or hyperparameter tuning.")
+        print("[WARN]  Below target. Consider more training or hyperparameter tuning.")
     print()
     print("=" * 80)
 

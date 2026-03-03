@@ -278,20 +278,20 @@ class DataProcessor:
                     missing_cached_tickers = [t for t in self.asset_tickers if t not in cached_tickers]
                     if missing_cached_tickers:
                         cache_valid = False
-                        logger.warning("⚠️ Cache ticker coverage failed:")
+                        logger.warning("[WARN] Cache ticker coverage failed:")
                         logger.warning(f"   Missing configured assets in cache: {missing_cached_tickers}")
                         logger.warning(f"   Cached tickers: {cached_tickers}")
-                        logger.info("🔄 Downloading fresh data to update cache...")
+                        logger.info("[CYCLE] Downloading fresh data to update cache...")
 
                 if not cache_valid:
-                    logger.warning("⚠️ Cache validation failed:")
+                    logger.warning("[WARN] Cache validation failed:")
                     logger.warning(f"   Cached range: {cached_min_date} to {cached_max_date}")
                     logger.warning(f"   Requested:    {requested_start} to {requested_end}")
                     logger.warning(f"   Missing {(requested_end - cached_max_date).days} days at end")
-                    logger.info("🔄 Downloading fresh data to update cache...")
+                    logger.info("[CYCLE] Downloading fresh data to update cache...")
                     # Fall through to download logic below
                 else:
-                    logger.info("✅ Cache valid - covers requested range and assets")
+                    logger.info("[OK] Cache valid - covers requested range and assets")
                     logger.info(f"   Cached: {cached_min_date} to {cached_max_date}")
                     logger.info(f"   Rows: {len(df_cached)}")
                     if self.asset_tickers:
@@ -372,7 +372,7 @@ class DataProcessor:
                 except Exception as e:
                     logger.warning(f"Failed to cache data: {e}")
             
-            logger.info(f"✅ Successfully processed market data. Shape: {final_df.shape}")
+            logger.info(f"[OK] Successfully processed market data. Shape: {final_df.shape}")
             logger.info(f"📅 Date range: {final_df[self.date_col].min()} to {final_df[self.date_col].max()}")
             logger.info(f"📊 Tickers: {final_df[self.ticker_col].unique().tolist()}")
             
@@ -979,7 +979,7 @@ class DataProcessor:
 
         self._fundamental_features_active = True
         self._fundamental_feature_names = fundamental_feature_names
-        logger.info(f"✅ Added fundamental features: {fundamental_feature_names}")
+        logger.info(f"[OK] Added fundamental features: {fundamental_feature_names}")
         return df
 
     def add_regime_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1106,7 +1106,7 @@ class DataProcessor:
         if filled_count > 0:
             logger.info(f"  ℹ️  Filled {filled_count} regime warm-up NaNs via forward-fill only")
 
-        logger.info(f"  ✅ Regime features added - columns: {len(new_cols)}")
+        logger.info(f"  [OK] Regime features added - columns: {len(new_cols)}")
         return df_sorted
 
     def add_regime_buy_signal_features(
@@ -1246,7 +1246,7 @@ class DataProcessor:
         out = out.sort_index()
 
         logger.info(
-            "✅ Regime buy features added: %s | lookback=%d min_history=%d threshold=%.2f rel_to_mkt=%s",
+            "[OK] Regime buy features added: %s | lookback=%d min_history=%d threshold=%.2f rel_to_mkt=%s",
             self._regime_buy_feature_names,
             lookback_window,
             min_history,
@@ -1325,7 +1325,7 @@ class DataProcessor:
         self._candlestick_feature_names = new_cols.copy()
         if filled_count > 0:
             logger.info("  ℹ️  Filled %d candlestick NaNs via per-ticker forward-fill", filled_count)
-        logger.info("  ✅ Candlestick features added - columns: %d", len(new_cols))
+        logger.info("  [OK] Candlestick features added - columns: %d", len(new_cols))
         return out.sort_index()
 
     def add_quant_alpha_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1477,9 +1477,9 @@ class DataProcessor:
 
         self._quant_feature_names = new_cols
         if new_cols:
-            logger.info(f"✅ Added {len(new_cols)} quant features: {new_cols}")
+            logger.info(f"[OK] Added {len(new_cols)} quant features: {new_cols}")
         else:
-            logger.info("⚠️ Quant feature configuration enabled but no columns were generated.")
+            logger.info("[WARN] Quant feature configuration enabled but no columns were generated.")
 
         return df
 
@@ -1495,7 +1495,7 @@ class DataProcessor:
         Why this matters:
         - Temporal features alone can't differentiate assets if they all move similarly
         - Cross-sectional features tell TCN "which asset is relatively better TODAY"
-        - Expected outcome: More differentiated alpha values → peaked portfolio weights
+        - Expected outcome: More differentiated alpha values => peaked portfolio weights
         """
         cross_cfg = self.config.get("feature_params", {}).get("cross_sectional_features", {})
         self._cross_sectional_feature_names = []
@@ -1514,7 +1514,7 @@ class DataProcessor:
         # ------------------------------------------------------------------
         momentum_windows = cross_cfg.get("momentum_windows", [21, 63, 252])
         if self.close_col in df.columns and momentum_windows:
-            logger.info(f"  → Computing momentum ranks for windows: {momentum_windows}")
+            logger.info(f"  => Computing momentum ranks for windows: {momentum_windows}")
             for window in momentum_windows:
                 # Calculate returns for this window
                 ret_col = f"_tmp_ret_{window}d"
@@ -1541,7 +1541,7 @@ class DataProcessor:
             "RSI"
         ])
         if zscore_features:
-            logger.info(f"  → Computing z-scores for: {zscore_features}")
+            logger.info(f"  => Computing z-scores for: {zscore_features}")
             for col in zscore_features:
                 if col in df.columns:
                     grouped = df.groupby(self.date_col)[col]
@@ -1559,7 +1559,7 @@ class DataProcessor:
         # Enhance existing Beta_to_Market with cross-sectional ranking
         # ------------------------------------------------------------------
         if "Beta_to_Market" in df.columns:
-            logger.info("  → Computing beta rankings")
+            logger.info("  => Computing beta rankings")
             # Percentile rank (low beta = defensive, high beta = aggressive)
             df["BetaRank"] = (
                 df.groupby(self.date_col)["Beta_to_Market"]
@@ -1579,7 +1579,7 @@ class DataProcessor:
         # 4. VOLATILITY RANKINGS (BONUS: complementary to momentum)
         # ------------------------------------------------------------------
         if "RollingVolatility_21d" in df.columns:
-            logger.info("  → Computing volatility rankings")
+            logger.info("  => Computing volatility rankings")
             # Volatility rank (higher = riskier)
             df["VolatilityRank"] = (
                 df.groupby(self.date_col)["RollingVolatility_21d"]
@@ -1604,9 +1604,9 @@ class DataProcessor:
         
         self._cross_sectional_feature_names = new_cols
         if new_cols:
-            logger.info(f"✅ Added {len(new_cols)} cross-sectional features: {new_cols}")
+            logger.info(f"[OK] Added {len(new_cols)} cross-sectional features: {new_cols}")
         else:
-            logger.info("⚠️ Cross-sectional features enabled but no columns were generated")
+            logger.info("[WARN] Cross-sectional features enabled but no columns were generated")
         
         return df
 
@@ -1870,7 +1870,7 @@ class DataProcessor:
         if column.startswith("WILLR_"):
             transformed = (transformed + 50.0) / 50.0
             return np.nan_to_num(transformed, nan=0.0, posinf=1.0, neginf=-1.0)
-        # [0, 1] features → center to [-1, 1]
+        # [0, 1] features => center to [-1, 1]
         if column.startswith(("Candle_CloseLocation", "Volume_Percentile_")) or column in {
             "Regime_Breadth_Positive", "Actuarial_Prob_30d",
             "Actuarial_Prob_60d", "Actuarial_Reserve_Severity",
@@ -2038,12 +2038,12 @@ class DataProcessor:
                     if strategy == "skip":
                         transformed = np.nan_to_num(all_values, nan=0.0, posinf=0.0, neginf=0.0)
                         fitted_scalers[col] = {"method": "skip"}
-                        logger.info(f"✅ {col}: skipped normalization (pre-normalized)")
+                        logger.info(f"[OK] {col}: skipped normalization (pre-normalized)")
 
                     elif strategy == "bounded":
                         transformed = self._transform_bounded_values(all_values, col)
                         fitted_scalers[col] = {"method": "bounded"}
-                        logger.info(f"✅ {col}: applied bounded normalization")
+                        logger.info(f"[OK] {col}: applied bounded normalization")
 
                     elif strategy == "macro_diff_standard":
                         macro_diff_all = self._macro_level_diff_by_date(df_copy, col)
@@ -2057,7 +2057,7 @@ class DataProcessor:
                             scaler.fit(train_macro.reshape(-1, 1))
                             transformed[macro_finite] = scaler.transform(macro_diff_all[macro_finite].reshape(-1, 1)).flatten()
                             fitted_scalers[col] = {"method": "macro_diff_standard", "scaler": scaler}
-                            logger.info(f"✅ {col}: applied macro diff-then-zscore normalization")
+                            logger.info(f"[OK] {col}: applied macro diff-then-zscore normalization")
 
                     if strategy == "robust_winsor":
                         p_low, p_high = self._winsorization_percentiles(col)
@@ -2077,7 +2077,7 @@ class DataProcessor:
                             "winsor_high": float(winsor_high),
                         }
                         logger.info(
-                            f"✅ {col}: applied robust+winsor normalization "
+                            f"[OK] {col}: applied robust+winsor normalization "
                             f"(p0.5={winsor_low:.6f}, p99.5={winsor_high:.6f})"
                         )
 
@@ -2097,9 +2097,9 @@ class DataProcessor:
                         if transformed_train.size > 0:
                             train_mean = float(np.mean(transformed_train))
                             train_std = float(np.std(transformed_train))
-                            logger.info(f"✅ {col}: train_mean={train_mean:.4f}, train_std={train_std:.4f}")
+                            logger.info(f"[OK] {col}: train_mean={train_mean:.4f}, train_std={train_std:.4f}")
                             if abs(train_mean) > 0.01 or abs(train_std - 1.0) > 0.05:
-                                logger.warning(f"⚠️  {col}: Normalization quality check failed!")
+                                logger.warning(f"[WARN]  {col}: Normalization quality check failed!")
 
                     df_copy[col] = transformed
                     
@@ -2227,7 +2227,7 @@ class DataProcessor:
             return fitted_scalers
         
         logger.warning(
-            "⚠️ Detected %d feature columns with abnormal scaling; re-standardizing: %s",
+            "[WARN] Detected %d feature columns with abnormal scaling; re-standardizing: %s",
             len(flagged),
             flagged
         )
@@ -2237,12 +2237,12 @@ class DataProcessor:
             train_values = column_data[train_mask]
             finite_mask = np.isfinite(train_values)
             if not np.any(finite_mask):
-                logger.warning("   ⚠️ Skipping re-standardization for %s (no finite training data).", column)
+                logger.warning("   [WARN] Skipping re-standardization for %s (no finite training data).", column)
                 continue
             mean_val = float(np.mean(train_values[finite_mask]))
             std_val = float(np.std(train_values[finite_mask]))
             if std_val < 1e-8:
-                logger.warning("   ⚠️ Column %s has near-zero variance; skipping.", column)
+                logger.warning("   [WARN] Column %s has near-zero variance; skipping.", column)
                 continue
             df[column] = (column_data - mean_val) / std_val
             
@@ -2252,7 +2252,7 @@ class DataProcessor:
             scaler.scale_ = np.array([std_val], dtype=np.float32)
             scaler.n_features_in_ = 1
             fitted_scalers[column] = {"method": "standard", "scaler": scaler}
-            logger.info("   ✅ Re-standardized %s (mean=%.4f, std=%.4f).", column, mean_val, std_val)
+            logger.info("   [OK] Re-standardized %s (mean=%.4f, std=%.4f).", column, mean_val, std_val)
         
         return fitted_scalers
     
@@ -2310,7 +2310,7 @@ class DataProcessor:
             bad_dates = int(dates.isna().sum())
             if bad_dates > 0:
                 logger.warning(
-                    "  ⚠️ %s has %d invalid dates while computing actuarial features; dropping those rows for this ticker.",
+                    "  [WARN] %s has %d invalid dates while computing actuarial features; dropping those rows for this ticker.",
                     ticker,
                     bad_dates,
                 )
@@ -2352,7 +2352,7 @@ class DataProcessor:
                 except Exception as exc:
                     total_fit_failures += 1
                     logger.warning(
-                        "  ⚠️ Initial actuarial fit failed for %s: %s: %s",
+                        "  [WARN] Initial actuarial fit failed for %s: %s: %s",
                         ticker,
                         type(exc).__name__,
                         exc,
@@ -2371,7 +2371,7 @@ class DataProcessor:
                          except Exception as exc:
                              total_fit_failures += 1
                              logger.warning(
-                                 "  ⚠️ Rolling actuarial fit failed for %s at idx=%d: %s: %s",
+                                 "  [WARN] Rolling actuarial fit failed for %s at idx=%d: %s: %s",
                                  ticker,
                                  i,
                                  type(exc).__name__,
@@ -2390,7 +2390,7 @@ class DataProcessor:
                     except Exception as exc:
                         total_prediction_failures += 1
                         logger.warning(
-                            "  ⚠️ Actuarial predict failed for %s at idx=%d (dd=%.4f, elapsed=%d): %s: %s",
+                            "  [WARN] Actuarial predict failed for %s at idx=%d (dd=%.4f, elapsed=%d): %s: %s",
                             ticker,
                             i,
                             float(current_dd),
@@ -2436,16 +2436,16 @@ class DataProcessor:
         }
         total_non_null = int(sum(non_null_counts.values()))
         if missing_cols:
-            logger.warning("  ⚠️ Missing actuarial feature columns after computation: %s", missing_cols)
+            logger.warning("  [WARN] Missing actuarial feature columns after computation: %s", missing_cols)
         logger.info(
-            "  ✅ Actuarial features: computed %d columns with %d non-null values | per-column=%s",
+            "  [OK] Actuarial features: computed %d columns with %d non-null values | per-column=%s",
             len(self._actuarial_feature_names),
             total_non_null,
             non_null_counts,
         )
         if total_fit_failures > 0 or total_prediction_failures > 0:
             logger.warning(
-                "  ⚠️ Actuarial pipeline fallback usage: fit_failures=%d, predict_failures=%d",
+                "  [WARN] Actuarial pipeline fallback usage: fit_failures=%d, predict_failures=%d",
                 total_fit_failures,
                 total_prediction_failures,
             )
@@ -2513,11 +2513,11 @@ class DataProcessor:
             )
             if macro_df is not None and macro_cols:
                 df = df.merge(macro_df, on=self.date_col, how='left')
-                logger.info(f"  ✅ Macro features added - columns: {len(macro_cols)}")
+                logger.info(f"  [OK] Macro features added - columns: {len(macro_cols)}")
             else:
-                logger.warning("  ⚠️ Macro configuration provided but no features were generated.")
+                logger.warning("  [WARN] Macro configuration provided but no features were generated.")
         else:
-            logger.info("  ⚠️ Macro features disabled (config is None).")
+            logger.info("  [WARN] Macro features disabled (config is None).")
 
         logger.info("Step 3.8: Adding regime features (if enabled)...")
         df = self.add_regime_features(df)
@@ -2545,7 +2545,7 @@ class DataProcessor:
                 mask &= pd.to_datetime(df[self.date_col]) <= pd.to_datetime(analysis_end)
             before_rows = len(df)
             df = df.loc[mask].copy()
-            logger.info(f"Applied analysis window filter: rows {before_rows} → {len(df)}")
+            logger.info(f"Applied analysis window filter: rows {before_rows} => {len(df)}")
         logger.info(f"Data period after filtering: {df[self.date_col].min()} to {df[self.date_col].max()}")
 
         # Step 4.5: Global NaN cleanup (safety net)
@@ -2562,7 +2562,7 @@ class DataProcessor:
                 nan_report[col] = n
         if nan_report:
             logger.warning(
-                "⚠️  Step 4.5: %d columns still contain NaNs after feature engineering: %s",
+                "[WARN]  Step 4.5: %d columns still contain NaNs after feature engineering: %s",
                 len(nan_report), nan_report
             )
             for col in nan_report:
@@ -2572,9 +2572,9 @@ class DataProcessor:
                 )
                 df[col] = df[col].fillna(0.0)
             remaining = df[all_feature_cols].isna().sum().sum()
-            logger.info(f"  ✅ Global NaN cleanup complete. Remaining NaNs: {remaining}")
+            logger.info(f"  [OK] Global NaN cleanup complete. Remaining NaNs: {remaining}")
         else:
-            logger.info("Step 4.5: ✅ No NaNs detected — data is clean.")
+            logger.info("Step 4.5: [OK] No NaNs detected — data is clean.")
         
         # Step 5: Normalize features
         logger.info("Step 5: Normalizing features...")
@@ -2640,7 +2640,7 @@ class DataProcessor:
         # Step 2: Calculate multi-period log returns
         logger.info("Step 2: Calculating multi-period log returns...")
         df = self.calculate_log_returns(df, periods=[1, 5, 10, 21])
-        logger.info(f"  ✅ Multi-period returns added - shape: {df.shape}")
+        logger.info(f"  [OK] Multi-period returns added - shape: {df.shape}")
         
         # Rolling stats after daily returns
         logger.info("Step 2.5: Calculating 21-day rolling return statistics...")
@@ -2649,24 +2649,24 @@ class DataProcessor:
         # Step 3: Calculate technical indicators
         logger.info("Step 3: Calculating technical indicators...")
         df = self.calculate_technical_indicators(df)
-        logger.info(f"  ✅ Technical indicators added - shape: {df.shape}")
+        logger.info(f"  [OK] Technical indicators added - shape: {df.shape}")
 
         logger.info("Step 3.2: Adding candlestick geometry features (if enabled)...")
         df = self.add_candlestick_features(df)
-        logger.info(f"  ✅ Candlestick features processed - shape: {df.shape}")
+        logger.info(f"  [OK] Candlestick features processed - shape: {df.shape}")
         
         # Step 3.5: Calculate dynamic covariance features
         logger.info("Step 3.5: Calculating dynamic covariance features...")
         df = self.calculate_dynamic_covariance_features(df)
-        logger.info(f"  ✅ Dynamic covariance added - shape: {df.shape}")
+        logger.info(f"  [OK] Dynamic covariance added - shape: {df.shape}")
 
         # Optional: merge quarterly fundamentals
         logger.info("Step 3.6: Integrating fundamental features (if enabled)...")
         df = self.add_fundamental_features(df)
         if self._fundamental_features_active:
-            logger.info(f"  ✅ Fundamental features added - shape: {df.shape}")
+            logger.info(f"  [OK] Fundamental features added - shape: {df.shape}")
         else:
-            logger.info("  ⚠️ Fundamental features skipped (not enabled or data unavailable).")
+            logger.info("  [WARN] Fundamental features skipped (not enabled or data unavailable).")
         # Step 4: Temporal forecasts disabled in the TCN-only pipeline.
         
         # Step 5: Trading Signals
@@ -2680,7 +2680,7 @@ class DataProcessor:
             df=df,
             ticker_col=self.ticker_col
         )
-        logger.info(f"  ✅ Trading signals added - shape: {df.shape}")
+        logger.info(f"  [OK] Trading signals added - shape: {df.shape}")
         
         # Step 6: Macro Economic Data (OPTIONAL)
         macro_config = self.config.get('feature_params', {}).get('macro_data')
@@ -2693,9 +2693,9 @@ class DataProcessor:
             )
             if macro_df is not None and macro_cols:
                 df = df.merge(macro_df, on=self.date_col, how='left')
-                logger.info(f"  ✅ Macro features added - columns: {len(macro_cols)}")
+                logger.info(f"  [OK] Macro features added - columns: {len(macro_cols)}")
             else:
-                logger.warning("  ⚠️ Macro configuration provided but macro download failed.")
+                logger.warning("  [WARN] Macro configuration provided but macro download failed.")
         else:
             logger.info("Step 6: Macro data disabled (config is None)")
 
@@ -2889,7 +2889,7 @@ class DataProcessor:
                 )
                 if missing_from_runtime:
                     logger.warning(
-                        "⚠️ Allowlist columns missing from runtime feature pool (%d): %s",
+                        "[WARN] Allowlist columns missing from runtime feature pool (%d): %s",
                         len(missing_from_runtime),
                         missing_from_runtime[:20],
                     )
@@ -2899,7 +2899,7 @@ class DataProcessor:
                         expected_total_int = int(expected_total)
                         if len(feature_cols) != expected_total_int:
                             logger.warning(
-                                "⚠️ Feature-audit expected count mismatch: expected=%d got=%d",
+                                "[WARN] Feature-audit expected count mismatch: expected=%d got=%d",
                                 expected_total_int,
                                 len(feature_cols),
                             )
@@ -3093,7 +3093,7 @@ def create_sequential_dataset(df: pd.DataFrame,
         sequences = as_strided(ticker_data, shape=shape, strides=strides)
         sequences_list.append(sequences.copy())  # Copy to ensure data ownership
         
-        logger.info(f"✅ Ticker {ticker}: Generated {num_sequences} sequences")
+        logger.info(f"[OK] Ticker {ticker}: Generated {num_sequences} sequences")
     
     # Stack all ticker sequences
     all_sequences = np.vstack(sequences_list)

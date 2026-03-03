@@ -63,7 +63,7 @@ def calculate_sharpe_ratio_dsr(returns: np.ndarray, trading_days_per_year: int =
     
     # CRITICAL: Handle zero or near-zero standard deviation
     if std_dev is None or std_dev < 1e-8:
-        # Flat returns → no risk → Sharpe is technically undefined
+        # Flat returns => no risk => Sharpe is technically undefined
         # Return 0.0 to avoid numerical instability in DSR
         return 0.0
     
@@ -92,8 +92,8 @@ def calculate_portfolio_entropy(weights: np.ndarray, epsilon: float = 1e-8) -> f
         Entropy value (0 to log(N) where N is number of assets)
         
     Example:
-        Equal weights [0.2, 0.2, 0.2, 0.2, 0.2] → High entropy (~1.61)
-        Concentrated [0.96, 0.01, 0.01, 0.01, 0.01] → Low entropy (~0.24)
+        Equal weights [0.2, 0.2, 0.2, 0.2, 0.2] => High entropy (~1.61)
+        Concentrated [0.96, 0.01, 0.01, 0.01, 0.01] => Low entropy (~0.24)
     """
     # Clip weights to avoid log(0)
     weights_clipped = np.clip(weights, epsilon, 1.0)
@@ -421,11 +421,11 @@ def asymmetric_sigmoid_utility(x: float,
     
     For 'increasing' metrics (Sharpe, Sortino, Skew):
         U(x) = 1 / (1 + exp(-k * (x - mu)))
-        Higher x → higher utility
+        Higher x => higher utility
         
     For 'decreasing' metrics (MDD, Turnover):
         U(x) = 1 / (1 + exp(+k * (x - mu)))
-        Lower x → higher utility
+        Lower x => higher utility
     
     Key advantages over Gaussian:
     - Monotonic: never penalizes overperformance
@@ -452,22 +452,22 @@ def asymmetric_sigmoid_utility(x: float,
         # For decreasing metrics (e.g. MDD, Turnover):
         # Higher values = worse (e.g. turnover 0.80 is worse than 0.60)
         # Lower values = better (e.g. MDD -0.05 is better than -0.25)
-        # ABOVE mu: bad territory → steep penalty (k_plus)
-        # BELOW mu: good territory → gentle reward (k_minus)
+        # ABOVE mu: bad territory => steep penalty (k_plus)
+        # BELOW mu: good territory => gentle reward (k_minus)
         if x_trunc > mu:
-            k = k_plus   # Above target → steep penalty
+            k = k_plus   # Above target => steep penalty
         else:
-            k = k_minus  # Below target → gentle reward
+            k = k_minus  # Below target => gentle reward
         z = -k * (x_trunc - mu)  # Flip sigmoid direction
     else:
         # For increasing metrics (Sharpe, Sortino, Skew):
         # Higher values = better
-        # BELOW mu: bad territory → steep penalty (k_minus)
-        # ABOVE mu: good territory → gentle reward (k_plus)
+        # BELOW mu: bad territory => steep penalty (k_minus)
+        # ABOVE mu: good territory => gentle reward (k_plus)
         if x_trunc < mu:
-            k = k_minus  # Below target → steep penalty
+            k = k_minus  # Below target => steep penalty
         else:
-            k = k_plus   # Above target → gentle reward
+            k = k_plus   # Above target => gentle reward
         z = k * (x_trunc - mu)
     
     # Clip exponent for numerical stability

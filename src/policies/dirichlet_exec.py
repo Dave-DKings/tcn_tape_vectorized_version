@@ -37,7 +37,7 @@ def dirichlet_mode_boundary_aware(alpha: np.ndarray, eps: float = 1e-12) -> np.n
     Compute Dirichlet mode (MAP estimate) with boundary handling.
     
     The mode exists in the interior only when all α > 1.
-    When some α ≤ 1, the mode sits on the boundary (some weights → 0).
+    When some α <= 1, the mode sits on the boundary (some weights => 0).
     
     Args:
         alpha: Concentration parameters, shape (n_assets,)
@@ -53,7 +53,7 @@ def dirichlet_mode_boundary_aware(alpha: np.ndarray, eps: float = 1e-12) -> np.n
     active = alpha > 1.0
     
     if not np.any(active):
-        # All α ≤ 1: No unique interior mode
+        # All α <= 1: No unique interior mode
         # Tie-break: one-hot on argmax
         weights = np.zeros_like(alpha)
         weights[np.argmax(alpha)] = 1.0
@@ -95,7 +95,7 @@ def controlled_stochastic_sample(
     
     Args:
         alpha: Concentration parameters, shape (n_assets,)
-        s: Scaling factor (s ≥ 1)
+        s: Scaling factor (s >= 1)
         rng: Random number generator (creates new if None)
         eps: Minimum alpha value for numerical stability
         
@@ -161,7 +161,7 @@ def smooth_weights(
     
     Formula: w_t = (1-η)·w_{t-1} + η·w̃_t
     
-    Lower η → slower rebalancing → lower turnover
+    Lower η => slower rebalancing => lower turnover
     
     Recommended values:
     - η = 0.05: Very slow (risk-off)

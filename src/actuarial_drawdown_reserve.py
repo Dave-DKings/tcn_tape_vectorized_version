@@ -97,7 +97,7 @@ class DrawdownDevelopmentTriangle:
     ├──────────────┼────────┼────────┼─────────┼──────────┤
     │ 2020-03-15   │ -18%   │ -12%   │ -5%     │ Day 25   │
     │ 2021-06-10   │ -11%   │ -9%    │ -4%     │ Day 18   │
-    │ 2024-08-05   │ -15%   │ ???    │ ???     │ ???      │ ← Predict
+    │ 2024-08-05   │ -15%   │ ???    │ ???     │ ???      │ <= Predict
     └──────────────┴────────┴────────┴─────────┴──────────┘
     """
     
@@ -272,7 +272,7 @@ class DrawdownDevelopmentTriangle:
         # Fit recovery time distributions
         self._fit_recovery_distributions()
         
-        logger.info("✅ Drawdown development triangle fitted successfully")
+        logger.info("[OK] Drawdown development triangle fitted successfully")
     
     def _build_triangle_for_bucket(self, bucket_name: str):
         """
@@ -325,7 +325,7 @@ class DrawdownDevelopmentTriangle:
         Development Factor = Average(Value at t+Δt / Value at t)
         
         Example:
-            Day 5 → Day 10 factor = -0.12 / -0.18 = 0.67 (drawdown improving by 33%)
+            Day 5 => Day 10 factor = -0.12 / -0.18 = 0.67 (drawdown improving by 33%)
         """
         for bucket_name, triangle in self.triangles.items():
             if triangle.empty:

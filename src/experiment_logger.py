@@ -152,7 +152,7 @@ class ExperimentLogger:
                     df_custom = pd.DataFrame([self.summary_data])
                     df_custom.to_excel(writer, sheet_name='Custom_Summary', index=False)
             
-            print(f"✅ Experiment logs saved: {filepath}")
+            print(f"[OK] Experiment logs saved: {filepath}")
             return filepath
 
         # CSV fallback/output
@@ -183,7 +183,7 @@ class ExperimentLogger:
             pd.DataFrame().to_csv(placeholder_path, index=False)
             filepaths.append(placeholder_path)
         
-        print(f"✅ Experiment logs saved (CSV): {', '.join(filepaths)}")
+        print(f"[OK] Experiment logs saved (CSV): {', '.join(filepaths)}")
         return filepaths if len(filepaths) > 1 else filepaths[0]
     
     def _calculate_summary(self) -> pd.DataFrame:

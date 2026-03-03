@@ -22,7 +22,7 @@ def set_all_seeds(seed: int = 42, deterministic: bool = True):
         from reproducibility_helper import set_all_seeds
         set_all_seeds(42)
     """
-    print(f"🎲 Setting all random seeds to: {seed}")
+    print(f"[RAND] Setting all random seeds to: {seed}")
     
     # Python random
     random.seed(seed)
@@ -45,21 +45,21 @@ def set_all_seeds(seed: int = 42, deterministic: bool = True):
             except AttributeError:
                 pass  # Older TF versions don't have this
     except ImportError:
-        print("   ⚠️  TensorFlow not available")
+        print("   [WARN]  TensorFlow not available")
     
     # Set PYTHONHASHSEED for hash reproducibility
     os.environ['PYTHONHASHSEED'] = str(seed)
     
     # Set deterministic behavior
     if deterministic:
-        print("   ✅ Deterministic mode enabled (slower but reproducible)")
+        print("   [OK] Deterministic mode enabled (slower but reproducible)")
     else:
-        print("   ⚠️  Non-deterministic mode (faster but may vary slightly)")
+        print("   [WARN]  Non-deterministic mode (faster but may vary slightly)")
     
-    print("   ✅ Python random seed set")
-    print("   ✅ NumPy random seed set")
-    print("   ✅ TensorFlow seed set")
-    print("   ✅ Custom PPO agents seeded")
+    print("   [OK] Python random seed set")
+    print("   [OK] NumPy random seed set")
+    print("   [OK] TensorFlow seed set")
+    print("   [OK] Custom PPO agents seeded")
 
 
 def test_reproducibility():
@@ -90,7 +90,7 @@ def test_reproducibility():
     except ImportError:
         print(f"TensorFlow random: [not available]")
     
-    print("\n✅ If you run this again with seed=42, you should see IDENTICAL numbers!")
+    print("\n[OK] If you run this again with seed=42, you should see IDENTICAL numbers!")
     print("=" * 60)
 
 

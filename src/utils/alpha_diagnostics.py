@@ -44,13 +44,13 @@ def diagnose_alpha_distribution(agent, state, num_samples=1):
     
     # Interpret
     if alpha.std() < 0.3:
-        print(f"\n   ⚠️ WARNING: Alphas too uniform! TCN not learning.")
-        print(f"   → Check if gradients are flowing back to actor")
-        print(f"   → Consider deeper TCN or lower entropy coefficient")
+        print(f"\n   [WARN] WARNING: Alphas too uniform! TCN not learning.")
+        print(f"   => Check if gradients are flowing back to actor")
+        print(f"   => Consider deeper TCN or lower entropy coefficient")
     elif alpha.std() < 1.0:
         print(f"\n   ⚡ Moderate differentiation. May need more training.")
     else:
-        print(f"\n   ✅ Good differentiation! TCN learning asset preferences.")
+        print(f"\n   [OK] Good differentiation! TCN learning asset preferences.")
     
     # Calculate implied mean weights (Dirichlet mean)
     mean_weights = alpha / alpha.sum()
@@ -58,7 +58,7 @@ def diagnose_alpha_distribution(agent, state, num_samples=1):
     print(f"   Weight std: {mean_weights.std():.3f}")
     
     if mean_weights.std() < 0.05:
-        print(f"   ⚠️ Near-uniform weights despite varied alphas!")
+        print(f"   [WARN] Near-uniform weights despite varied alphas!")
     
     print(f"{'='*80}\n")
     

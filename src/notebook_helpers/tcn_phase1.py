@@ -150,7 +150,7 @@ def summarize_active_feature_manifest(
     }
 
     if print_output:
-        print(f"🧾 Active Feature Manifest Summary: {path}")
+        print(f"[RCPT] Active Feature Manifest Summary: {path}")
         print(f"   Type: {manifest_type} | Environments: {len(env_blocks)}")
         for env_name, env_summary in summary["environments"].items():
             print(
@@ -599,6 +599,7 @@ def _extract_effective_agent_params(
         "regime_conditioning_enabled",
         "regime_conditioning_hidden_dim",
         "regime_conditioning_dropout",
+        "regime_conditioning_mode",
         "state_augmentation_enabled",
         "distributional_critic_enabled",
         "distributional_num_quantiles",
@@ -1137,6 +1138,7 @@ def create_experiment6_result_stub(
         "regime_conditioning_enabled": True,
         "regime_conditioning_hidden_dim": 32,
         "regime_conditioning_dropout": 0.0,
+        "regime_conditioning_mode": "concat",
         "state_augmentation_enabled": True,
         "distributional_critic_enabled": True,
         "distributional_num_quantiles": 17,
@@ -1451,7 +1453,7 @@ def load_training_metadata_into_config(
         feature_meta = metadata.get("Feature_Groups", {}) or {}
         actuarial_cols_meta = feature_meta.get("actuarial_columns_detected", []) or []
         actuarial_missing_meta = feature_meta.get("actuarial_columns_missing_from_feature_list", []) or []
-        print("✅ Applied training metadata to config")
+        print("[OK] Applied training metadata to config")
         print(f"   Metadata: {meta_path}")
         if run_ctx.get("timestamp"):
             print(f"   Run timestamp: {run_ctx.get('timestamp')}")
@@ -1500,6 +1502,7 @@ def load_training_metadata_into_config(
         print(
             "   Regime conditioning: "
             f"enabled={bool(agent_params.get('regime_conditioning_enabled', False))} | "
+            f"mode={agent_params.get('regime_conditioning_mode', 'concat')} | "
             f"hidden_dim={agent_params.get('regime_conditioning_hidden_dim', 32)} | "
             f"dropout={agent_params.get('regime_conditioning_dropout', 0.0)} | "
             f"state_aug={bool(agent_params.get('state_augmentation_enabled', False))}"
@@ -1557,7 +1560,7 @@ def load_training_metadata_into_config(
         )
         print(f"   Actuarial columns detected: {len(actuarial_cols_meta)}")
         if actuarial_missing_meta:
-            print(f"   ⚠️ Actuarial columns missing from feature list: {actuarial_missing_meta}")
+            print(f"   [WARN] Actuarial columns missing from feature list: {actuarial_missing_meta}")
 
     return config
 
@@ -1708,12 +1711,12 @@ def prepare_phase1_dataset(
         end_date=config.get("DATA_FETCH_END_DATE"),
         force_download=force_download,
     )
-    print(f"   ✅ Raw data shape: {raw_df.shape}")
-    print(f"   ✅ Date range: {raw_df['Date'].min()} → {raw_df['Date'].max()}")
+    print(f"   [OK] Raw data shape: {raw_df.shape}")
+    print(f"   [OK] Date range: {raw_df['Date'].min()} => {raw_df['Date'].max()}")
 
-    print(f"\n🔧 Computing multi-horizon log returns: {list(periods)}")
+    print(f"\n[TOOL] Computing multi-horizon log returns: {list(periods)}")
     df_with_returns = processor.calculate_log_returns(raw_df, periods=list(periods))
-    print(f"   ✅ Shape after returns: {df_with_returns.shape}")
+    print(f"   [OK] Shape after returns: {df_with_returns.shape}")
 
     print("\n📈 Calculating 21-day rolling statistics")
     df_with_stats = processor.calculate_return_statistics(df_with_returns, window=21)
@@ -1734,21 +1737,21 @@ def prepare_phase1_dataset(
     print("\n🎯 Adding regime awareness features")
     master_df = processor.add_regime_features(master_df)
     
-    print(f"   ✅ Master DF shape: {master_df.shape}")
-    print(f"   ✅ Total features: {len(master_df.columns)}")
+    print(f"   [OK] Master DF shape: {master_df.shape}")
+    print(f"   [OK] Total features: {len(master_df.columns)}")
 
     # Add fundamental features (if enabled)
     print("\n📊 Integrating fundamental features (if enabled)...")
     master_df = processor.add_fundamental_features(master_df)
     fundamental_cols = [col for col in master_df.columns if col.startswith("Fundamental_")]
     print(
-        f"   ✅ Fundamental columns in dataset: {len(fundamental_cols)} "
+        f"   [OK] Fundamental columns in dataset: {len(fundamental_cols)} "
         f"(enabled={config.get('feature_params', {}).get('fundamental_features', {}).get('enabled', False)})"
     )
     if fundamental_cols:
         preview = fundamental_cols[:8]
         suffix = " ..." if len(fundamental_cols) > 8 else ""
-        print(f"   🧾 Sample fundamental cols: {preview}{suffix}")
+        print(f"   [RCPT] Sample fundamental cols: {preview}{suffix}")
     
     # Add macroeconomic features (if enabled)
     print("\n📊 Integrating macroeconomic features (if enabled)...")
@@ -1761,11 +1764,11 @@ def prepare_phase1_dataset(
         )
         if macro_df is not None and macro_cols:
             master_df = master_df.merge(macro_df, on=processor.date_col, how='left')
-            print(f"   ✅ Macro features added - {len(macro_cols)} columns: {macro_cols}")
+            print(f"   [OK] Macro features added - {len(macro_cols)} columns: {macro_cols}")
         else:
-            print("   ⚠️ Macro configuration provided but no features were generated.")
+            print("   [WARN] Macro configuration provided but no features were generated.")
     else:
-        print("   ⚠️ Macro features disabled (config is None).")
+        print("   [WARN] Macro features disabled (config is None).")
 
     # Add Alpha features (if enabled)
     print("\n📊 Integrating Alpha features (if enabled)...")
@@ -1784,17 +1787,17 @@ def prepare_phase1_dataset(
             for col in sorted(actuarial_cols)
         }
         print(
-            f"   ✅ Actuarial columns in dataset: {len(actuarial_cols)} "
+            f"   [OK] Actuarial columns in dataset: {len(actuarial_cols)} "
             f"(enabled={actuarial_enabled})"
         )
         print(f"   📋 Non-null counts: {non_null_counts}")
     elif actuarial_enabled:
-        print("   ⚠️ Actuarial is enabled but no Actuarial_ columns were produced.")
+        print("   [WARN] Actuarial is enabled but no Actuarial_ columns were produced.")
     else:
         print("   ℹ️ Actuarial features disabled by config.")
     
-    print(f"\n✅ Final master DF shape: {master_df.shape}")
-    print(f"   ✅ Total features: {len(master_df.columns)}")
+    print(f"\n[OK] Final master DF shape: {master_df.shape}")
+    print(f"   [OK] Total features: {len(master_df.columns)}")
     engineered_full_df = master_df.copy()
 
     # Ensure Date column is timezone-naive for downstream processing
@@ -1818,21 +1821,21 @@ def prepare_phase1_dataset(
         if expected_total is not None:
             try:
                 exp = int(expected_total)
-                status = "✅" if len(feature_cols) == exp else "⚠️"
+                status = "[OK]" if len(feature_cols) == exp else "[WARN]"
                 print(f"   {status} expected active features: {exp}")
             except Exception:
                 pass
     if missing_cols:
-        print(f"⚠️ Missing features before normalisation: {missing_cols}")
+        print(f"[WARN] Missing features before normalisation: {missing_cols}")
 
     # Filter to analysis date range BEFORE splitting
     analysis_start = config.get('ANALYSIS_START_DATE', '2003-09-02')
     analysis_end = config.get('ANALYSIS_END_DATE', '2024-09-01')
     
     print("\n" + "="*80)
-    print("✂️ FILTERING TO ANALYSIS PERIOD")
+    print("[SPLIT] FILTERING TO ANALYSIS PERIOD")
     print("="*80)
-    print(f"   Filtering data to: {analysis_start} → {analysis_end}")
+    print(f"   Filtering data to: {analysis_start} => {analysis_end}")
     
     master_df = master_df[
         (master_df[date_col] >= pd.to_datetime(analysis_start)) &
@@ -1841,8 +1844,8 @@ def prepare_phase1_dataset(
     engineered_analysis_df = master_df.copy()
     
     unique_dates_filtered = sorted(master_df[date_col].unique())
-    print(f"   ✅ Dates after filter: {len(unique_dates_filtered)} trading days")
-    print(f"   ✅ Date range: {unique_dates_filtered[0]} to {unique_dates_filtered[-1]}")
+    print(f"   [OK] Dates after filter: {len(unique_dates_filtered)} trading days")
+    print(f"   [OK] Date range: {unique_dates_filtered[0]} to {unique_dates_filtered[-1]}")
     print("="*80)
 
     # Check if fixed split date is specified, otherwise use percentage
@@ -1863,7 +1866,7 @@ def prepare_phase1_dataset(
             train_fraction=train_fraction,
         )
 
-    print(f"\n🔧 NORMALISING FEATURES ({scaler_type} scaler)")
+    print(f"\n[TOOL] NORMALISING FEATURES ({scaler_type} scaler)")
     master_df_norm, scalers = processor.normalize_features(
         master_df,
         feature_cols=feature_cols,
@@ -1963,19 +1966,19 @@ def split_dataset_by_date(
     test_start_date = pd.to_datetime(test_dates[0]) if test_dates else train_end_date
 
     print("=" * 80)
-    print(f"✂️  TIME-BASED TRAIN/TEST SPLIT ({split_method})")
+    print(f"[SPLIT]  TIME-BASED TRAIN/TEST SPLIT ({split_method})")
     if train_dates:
         train_years = len(train_dates) / 252
-        print(f"   Train: {train_dates[0].date()} → {train_dates[-1].date()} "
+        print(f"   Train: {train_dates[0].date()} => {train_dates[-1].date()} "
               f"({len(train_dates)} days, {train_years:.1f} years, {len(train_df)} rows)")
     else:
-        print("   ⚠️  No training dates available (empty dataset).")
+        print("   [WARN]  No training dates available (empty dataset).")
     if test_dates:
         test_years = len(test_dates) / 252
-        print(f"   Test:  {test_dates[0].date()} → {test_dates[-1].date()} "
+        print(f"   Test:  {test_dates[0].date()} => {test_dates[-1].date()} "
               f"({len(test_dates)} days, {test_years:.1f} years, {len(test_df)} rows)")
     else:
-        print("   ⚠️  No test dates found; entire dataset used for training.")
+        print("   [WARN]  No test dates found; entire dataset used for training.")
     print("=" * 80)
 
     return train_df, test_df, train_end_date, test_start_date
@@ -2272,8 +2275,8 @@ def run_experiment6_tape(
     print(
         "   Gate A: "
         f"{'enabled' if gate_enabled else 'disabled'} "
-        f"(Sharpe ≤ {gate_sharpe:.2f} "
-        f"or MDD ≥ {gate_mdd*100:.1f}% -> force non-positive terminal bonus)"
+        f"(Sharpe <= {gate_sharpe:.2f} "
+        f"or MDD >= {gate_mdd*100:.1f}% -> force non-positive terminal bonus)"
     )
     gate_neutral_enabled = bool(gate_cfg.get("tape_terminal_neutral_band_enabled", True))
     gate_neutral_halfwidth = float(gate_cfg.get("tape_terminal_neutral_band_halfwidth", 0.02))
@@ -2282,15 +2285,15 @@ def run_experiment6_tape(
         f"{'enabled' if gate_neutral_enabled else 'disabled'} "
         f"(±{gate_neutral_halfwidth:.3f} around baseline)"
     )
-    print("   🔄 Profile Manager: disabled (static profile only)")
-    print(f"🎲 Experiment Seed: {experiment_seed} (Base: {random_seed}, Offset: {exp_idx * 1000})")
+    print("   [CYCLE] Profile Manager: disabled (static profile only)")
+    print(f"[RAND] Experiment Seed: {experiment_seed} (Base: {random_seed}, Offset: {exp_idx * 1000})")
 
     experiment_train_df = phase1_data.train_df.copy()
     experiment_test_df = phase1_data.test_df.copy()
     covariance_columns = phase1_data.covariance_columns
     data_processor = phase1_data.data_processor
 
-    print(f"✅ Features: Enhanced (includes {len(covariance_columns)} covariance eigenvalues)")
+    print(f"[OK] Features: Enhanced (includes {len(covariance_columns)} covariance eigenvalues)")
     print(f"   Eigenvalues: {covariance_columns}")
     print(f"   Train shape: {experiment_train_df.shape}")
     print(f"   Test shape: {experiment_test_df.shape}")
@@ -2311,7 +2314,7 @@ def run_experiment6_tape(
         )
         print(f"      {actuarial_non_null_master_runtime}")
     elif actuarial_enabled_cfg:
-        print("   ⚠️ Actuarial is enabled but no Actuarial_ columns were detected in master_df.")
+        print("   [WARN] Actuarial is enabled but no Actuarial_ columns were detected in master_df.")
     else:
         print("   ℹ️ Actuarial features disabled by config.")
 
@@ -2331,7 +2334,7 @@ def run_experiment6_tape(
     if sorted_turnover_values:
         if len(sorted_turnover_values) > 1:
             turnover_scalar_display = (
-                f"{sorted_turnover_values[0]:.2f} -> " + " → ".join(f"{v:.2f}" for v in sorted_turnover_values[1:])
+                f"{sorted_turnover_values[0]:.2f} -> " + " => ".join(f"{v:.2f}" for v in sorted_turnover_values[1:])
             )
         else:
             turnover_scalar_display = f"{sorted_turnover_values[0]:.2f}"
@@ -2383,7 +2386,7 @@ def run_experiment6_tape(
     if len(sorted_action_execution_betas) > 1:
         action_execution_beta_display = (
             f"{sorted_action_execution_betas[0]:.2f} -> "
-            + " → ".join(f"{v:.2f}" for v in sorted_action_execution_betas[1:])
+            + " => ".join(f"{v:.2f}" for v in sorted_action_execution_betas[1:])
         )
     else:
         action_execution_beta_display = f"{sorted_action_execution_betas[0]:.2f}"
@@ -2425,7 +2428,7 @@ def run_experiment6_tape(
     print(f"   📊 Profile: {profile.get('name', 'BALANCED_GROWTH') if isinstance(profile, dict) else 'BALANCED_GROWTH'}")
     print(f"   ⚙️  Component 1: Base Reward (Net Return)")
     print(f"   ⚙️  Component 2: DSR/PBRS (window=60, scalar={dsr_scalar_cfg:.2f}, gamma={gamma_cfg:.2f})")
-    turnover_schedule_pretty = " → ".join(
+    turnover_schedule_pretty = " => ".join(
         f"{scalar:.2f}@{threshold:,}"
         for threshold, scalar in sorted(turnover_curriculum.items(), key=lambda item: item[0])
     )
@@ -2434,7 +2437,7 @@ def run_experiment6_tape(
         f"(target={target_turnover_cfg:.2f}, band=±{turnover_band_cfg:.2f}, scalar={turnover_scalar_display})"
     )
     print(f"      ↳ Schedule: {turnover_schedule_pretty}")
-    action_execution_schedule_pretty = " → ".join(
+    action_execution_schedule_pretty = " => ".join(
         f"{beta:.2f}@{threshold:,}"
         for threshold, beta in sorted(action_execution_beta_curriculum.items(), key=lambda item: item[0])
     )
@@ -2457,12 +2460,12 @@ def run_experiment6_tape(
     )
     print(
         f"   🚦 Gate A: {'enabled' if tape_terminal_gate_a_enabled else 'disabled'} "
-        f"(Sharpe ≤ {tape_terminal_gate_a_sharpe_threshold:.2f}, "
-        f"MDD ≥ {tape_terminal_gate_a_max_drawdown*100:.1f}%)"
+        f"(Sharpe <= {tape_terminal_gate_a_sharpe_threshold:.2f}, "
+        f"MDD >= {tape_terminal_gate_a_max_drawdown*100:.1f}%)"
     )
-    print("   🧠 Credit Assignment: step reward is computed at each environment step")
-    print("   🧾 Episode-End Handling: terminal TAPE bonus is added at episode completion only")
-    print("   ✅ Retroactive episode-wide reward rescaling: disabled in notebook helper path")
+    print("   [BRAIN] Credit Assignment: step reward is computed at each environment step")
+    print("   [RCPT] Episode-End Handling: terminal TAPE bonus is added at episode completion only")
+    print("   [OK] Retroactive episode-wide reward rescaling: disabled in notebook helper path")
 
     use_episode_length_curriculum = bool(training_params.get("use_episode_length_curriculum", False))
     episode_length_curriculum_smooth_enabled = bool(
@@ -2599,7 +2602,7 @@ def run_experiment6_tape(
 
     if getattr(env_train, "drawdown_constraint_enabled", False):
         print(
-            "   ✅ Drawdown controller armed in env: "
+            "   [OK] Drawdown controller armed in env: "
             f"target={env_train.drawdown_target:.2%}, "
             f"trigger={env_train.drawdown_trigger_boundary:.2%}, "
             f"λ_init={env_train.drawdown_lambda_init:.3f}, "
@@ -2608,7 +2611,7 @@ def run_experiment6_tape(
             f"penalty_coef={env_train.drawdown_penalty_coef:.2f}"
         )
     else:
-        print("   ✅ Drawdown controller disabled in env (as configured)")
+        print("   [OK] Drawdown controller disabled in env (as configured)")
 
     env_test_deterministic = PortfolioEnvTAPE(
         config=config,
@@ -2674,7 +2677,7 @@ def run_experiment6_tape(
 
     env_test_alias = env_test_deterministic
 
-    print(f"✅ THREE-COMPONENT TAPE v3 Environments created:")
+    print(f"[OK] THREE-COMPONENT TAPE v3 Environments created:")
     print(f"   Training: {env_train.total_days} days")
     print(f"   Parallel train env instances: {len(train_envs)}")
     print(f"   Testing: {env_test_alias.total_days} days")
@@ -2705,8 +2708,8 @@ def run_experiment6_tape(
         num_assets=stock_dim,
         config=agent_config,
     )
-    print(f"✅ Agent created: {agent.__class__.__name__}")
-    print(f"   🎲 Dirichlet Distribution: ENABLED")
+    print(f"[OK] Agent created: {agent.__class__.__name__}")
+    print(f"   [RAND] Dirichlet Distribution: ENABLED")
 
     actor_lr_schedule_cfg = training_params.get(
         "actor_lr_schedule",
@@ -2794,10 +2797,10 @@ def run_experiment6_tape(
 
     current_actor_lr = determine_actor_lr(0)
     agent.set_actor_lr(current_actor_lr)
-    actor_schedule_pretty = " → ".join(
+    actor_schedule_pretty = " => ".join(
         f"{entry['lr']:.6f}@{entry['threshold']:,}" for entry in actor_lr_schedule
     )
-    print(f"   🔧 Actor LR schedule: {actor_schedule_pretty}")
+    print(f"   [TOOL] Actor LR schedule: {actor_schedule_pretty}")
     print(f"   State dim: {n_features}")
     print(f"   Action dim: {stock_dim}")
     print(f"   Actor LR (configured): {agent_config['ppo_params']['actor_lr']}")
@@ -2838,23 +2841,24 @@ def run_experiment6_tape(
             f"per_asset_alpha_head={bool(agent_config.get('fusion_per_asset_alpha_head', False))}"
         )
     print(
-        "   🧠 Recurrent memory: "
+        "   [BRAIN] Recurrent memory: "
         f"enabled={bool(agent_config.get('recurrent_memory_enabled', False))} | "
         f"units={agent_config.get('recurrent_memory_units', 64)} | "
         f"dropout={agent_config.get('recurrent_memory_dropout', 0.1)}"
     )
     print(
-        "   🌐 Regime conditioning: "
+        "   [GLOBE] Regime conditioning: "
         f"enabled={bool(agent_config.get('regime_conditioning_enabled', False))} | "
+        f"mode={agent_config.get('regime_conditioning_mode', 'concat')} | "
         f"hidden_dim={agent_config.get('regime_conditioning_hidden_dim', 32)} | "
         f"dropout={agent_config.get('regime_conditioning_dropout', 0.0)}"
     )
     print(
-        "   🧬 State augmentation: "
+        "   [DNA] State augmentation: "
         f"enabled={bool(agent_config.get('state_augmentation_enabled', False))}"
     )
     print(
-        "   📉 Distributional critic: "
+        "   [DOWN] Distributional critic: "
         f"enabled={bool(agent_config.get('distributional_critic_enabled', False))} | "
         f"num_quantiles={agent_config.get('distributional_num_quantiles', 17)}"
     )
@@ -2886,22 +2890,22 @@ def run_experiment6_tape(
         f"epochs={num_ppo_epochs}, batch_size={initial_batch_size}, "
         f"target_kl={agent.target_kl:.4f}, entropy_coef={agent.entropy_coef:.4f}"
     )
-    gamma_schedule_pretty = " → ".join(
+    gamma_schedule_pretty = " => ".join(
         f"{entry['gamma']:.4f}@{entry['threshold']:,}" for entry in gamma_schedule
     )
-    gae_schedule_pretty = " → ".join(
+    gae_schedule_pretty = " => ".join(
         f"{entry['gae_lambda']:.4f}@{entry['threshold']:,}" for entry in gae_lambda_schedule
     )
-    print(f"   📉 PPO gamma schedule: {gamma_schedule_pretty}")
-    print(f"   📉 PPO GAE-λ schedule: {gae_schedule_pretty}")
+    print(f"   [DOWN] PPO gamma schedule: {gamma_schedule_pretty}")
+    print(f"   [DOWN] PPO GAE-λ schedule: {gae_schedule_pretty}")
     if len(timestep_update_schedule) > 1:
-        rollout_schedule_pretty = " → ".join(
+        rollout_schedule_pretty = " => ".join(
             f"{entry['timesteps_per_update']}@{entry['threshold']:,}"
             for entry in timestep_update_schedule
         )
         print(f"   📐 PPO rollout schedule: {rollout_schedule_pretty}")
     if len(batch_size_schedule) > 1 or batch_size_auto_from_rollout:
-        batch_schedule_pretty = " → ".join(
+        batch_schedule_pretty = " => ".join(
             f"{entry['batch_size']}@{entry['threshold']:,}" for entry in batch_size_schedule
         )
         source_note = " (auto from rollout/4)" if batch_size_auto_from_rollout else ""
@@ -2911,7 +2915,7 @@ def run_experiment6_tape(
     ra_kl_enabled = bool(training_params.get("ra_kl_enabled", False))
     ra_kl_base_target = float(max(agent.target_kl, 0.0))
     if ra_kl_enabled and ra_kl_base_target <= 0.0:
-        print("   ⚠️ RA-KL disabled because initial target_kl <= 0.")
+        print("   [WARN] RA-KL disabled because initial target_kl <= 0.")
         ra_kl_enabled = False
     ra_kl_target_ratio = float(training_params.get("ra_kl_target_ratio", 1.0))
     ra_kl_ema_alpha = float(np.clip(training_params.get("ra_kl_ema_alpha", 0.25), 0.01, 1.0))
@@ -3698,7 +3702,7 @@ def run_experiment6_tape(
         if deterministic_validation_mode_cfg == "mode" and np.isfinite(val_mode_vertex_fraction):
             if val_mode_vertex_fraction > 0.0:
                 print(
-                    "         ⚠️ Mode fallback detected: "
+                    "         [WARN] Mode fallback detected: "
                     f"alpha<=1 on {val_mode_vertex_fraction*100.0:.1f}% of validation steps."
                 )
         if not np.isfinite(val_sharpe) or not np.isfinite(val_selection_score):
@@ -3717,7 +3721,7 @@ def run_experiment6_tape(
                 f"mean_sharpe={sanity_mean:.3f} | std={sanity_std:.3f} | runs={int(sanity_result.get('runs', 0))}"
             )
             if not bool(sanity_result.get("passed", False)):
-                print("         ⚠️ Sanity gate rejected checkpoint (stochastic robustness failed).")
+                print("         [WARN] Sanity gate rejected checkpoint (stochastic robustness failed).")
                 return
         elif deterministic_validation_stochastic_sanity_enabled_cfg:
             # Enabled but no valid sanity metric available.
@@ -3811,7 +3815,7 @@ def run_experiment6_tape(
         print(f"      {threshold:,}+ steps: beta={beta_value:.2f}")
     if deterministic_validation_checkpointing_enabled_cfg:
         if deterministic_validation_episode_length_limit_schedule:
-            schedule_label = " → ".join(
+            schedule_label = " => ".join(
                 f"{entry['threshold']:,}@{'full' if entry['limit'] is None else entry['limit']}"
                 for entry in deterministic_validation_episode_length_limit_schedule
             )
@@ -3861,16 +3865,16 @@ def run_experiment6_tape(
         print("   🧷 Legacy checkpoint routes: configurable")
     if deterministic_validation_checkpointing_enabled_cfg:
         if deterministic_validation_multi_horizon_enabled_cfg:
-            print("   ✅ Checkpoint selector default: deterministic validation multi-horizon composite score")
+            print("   [OK] Checkpoint selector default: deterministic validation multi-horizon composite score")
         else:
-            print("   ✅ Checkpoint selector default: deterministic validation Sharpe improvement")
+            print("   [OK] Checkpoint selector default: deterministic validation Sharpe improvement")
     else:
-        print("   ⚠️ Checkpoint selector default: legacy high-watermark path")
+        print("   [WARN] Checkpoint selector default: legacy high-watermark path")
     if high_watermark_checkpoint_enabled_cfg:
         print(
             "   💾 High-watermark checkpoints: "
-            f"enabled (Sharpe ≥ {high_watermark_sharpe_threshold_cfg:.2f}, "
-            f"MDD ≤ {high_watermark_max_drawdown_abs_threshold_cfg*100:.1f}%, "
+            f"enabled (Sharpe >= {high_watermark_sharpe_threshold_cfg:.2f}, "
+            f"MDD <= {high_watermark_max_drawdown_abs_threshold_cfg*100:.1f}%, "
             f"skip_on_det_validation={bool(high_watermark_skip_on_det_validation_trigger_cfg)})"
         )
     else:
@@ -3885,7 +3889,7 @@ def run_experiment6_tape(
     }
     with open(feature_manifest_path, "w", encoding="utf-8") as f:
         json.dump(active_feature_manifest, f, indent=2, default=str)
-    print(f"🧾 Active feature manifest saved: {feature_manifest_path.resolve()}")
+    print(f"[RCPT] Active feature manifest saved: {feature_manifest_path.resolve()}")
 
     feature_params = config.get("feature_params", {})
     fundamental_cfg = feature_params.get("fundamental_features", {}) if isinstance(feature_params, dict) else {}
@@ -3908,7 +3912,7 @@ def run_experiment6_tape(
         try:
             phase1_feature_cols_for_audit = list(data_processor.get_feature_columns("phase1"))
         except Exception as exc:
-            print(f"⚠️ Could not collect phase1 feature list for actuarial audit: {type(exc).__name__}: {exc}")
+            print(f"[WARN] Could not collect phase1 feature list for actuarial audit: {type(exc).__name__}: {exc}")
     actuarial_columns_missing_from_feature_list = (
         sorted([col for col in actuarial_columns if col not in set(phase1_feature_cols_for_audit)])
         if phase1_feature_cols_for_audit
@@ -4112,6 +4116,7 @@ def run_experiment6_tape(
             "regime_conditioning_enabled": bool(agent_config.get("regime_conditioning_enabled", False)),
             "regime_conditioning_hidden_dim": copy.deepcopy(agent_config.get("regime_conditioning_hidden_dim", 32)),
             "regime_conditioning_dropout": copy.deepcopy(agent_config.get("regime_conditioning_dropout", 0.0)),
+            "regime_conditioning_mode": str(agent_config.get("regime_conditioning_mode", "concat")),
             "state_augmentation_enabled": bool(agent_config.get("state_augmentation_enabled", False)),
             "distributional_critic_enabled": bool(agent_config.get("distributional_critic_enabled", False)),
             "distributional_num_quantiles": copy.deepcopy(agent_config.get("distributional_num_quantiles", 17)),
@@ -4223,7 +4228,7 @@ def run_experiment6_tape(
     }
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, default=str)
-    print(f"🧾 Training metadata saved: {metadata_path.resolve()}")
+    print(f"[RCPT] Training metadata saved: {metadata_path.resolve()}")
 
 
     train_start = time.time()
@@ -4346,12 +4351,12 @@ def run_experiment6_tape(
         if not np.isclose(active_ppo_gamma, current_ppo_gamma):
             current_ppo_gamma = active_ppo_gamma
             agent.gamma = current_ppo_gamma
-            print(f"\n📉 PPO GAMMA UPDATE at {step:,} steps:")
+            print(f"\n[DOWN] PPO GAMMA UPDATE at {step:,} steps:")
             print(f"   gamma: {current_ppo_gamma:.4f}")
         if not np.isclose(active_ppo_gae_lambda, current_ppo_gae_lambda):
             current_ppo_gae_lambda = active_ppo_gae_lambda
             agent.gae_lambda = current_ppo_gae_lambda
-            print(f"\n📉 PPO GAE-λ UPDATE at {step:,} steps:")
+            print(f"\n[DOWN] PPO GAE-λ UPDATE at {step:,} steps:")
             print(f"   gae_lambda: {current_ppo_gae_lambda:.4f}")
 
         steps_this_update = min(active_timestep_rollout, max_total_timesteps - step)
@@ -4414,7 +4419,7 @@ def run_experiment6_tape(
                     if not np.isclose(new_actor_lr, current_actor_lr):
                         current_actor_lr = new_actor_lr
                         agent.set_actor_lr(current_actor_lr)
-                        print(f"   🔧 Actor learning rate adjusted to {current_actor_lr:.6f} at step {step:,}")
+                        print(f"   [TOOL] Actor learning rate adjusted to {current_actor_lr:.6f} at step {step:,}")
 
                     if step_diag_csv_logger is not None:
                         turnover_val = float(info.get("turnover", 0.0) or 0.0)
@@ -4596,7 +4601,7 @@ def run_experiment6_tape(
             if not np.isclose(new_actor_lr, current_actor_lr):
                 current_actor_lr = new_actor_lr
                 agent.set_actor_lr(current_actor_lr)
-                print(f"   🔧 Actor learning rate adjusted to {current_actor_lr:.6f} at step {step:,}")
+                print(f"   [TOOL] Actor learning rate adjusted to {current_actor_lr:.6f} at step {step:,}")
 
             if step_diag_csv_logger is not None:
                 turnover_val = float(info.get("turnover", 0.0) or 0.0)
@@ -4705,7 +4710,7 @@ def run_experiment6_tape(
                 tape_score = info.get("tape_score")
                 if tape_score is None:
                     print(
-                        f"   ⚠️ Episode {training_episode_count}: tape_score is None; "
+                        f"   [WARN] Episode {training_episode_count}: tape_score is None; "
                         "terminal TAPE bonus metadata missing."
                     )
                 if tape_score is not None:
@@ -4739,7 +4744,7 @@ def run_experiment6_tape(
                     gate_triggered = bool(info.get("tape_gate_a_triggered", False))
                     print(
                         f"   🎯 Episode {training_episode_count}: TAPE Score = {tape_score:.4f} "
-                        f"(bonus: {tape_bonus_raw:+.2f} → {tape_bonus_clipped:+.2f})"
+                        f"(bonus: {tape_bonus_raw:+.2f} => {tape_bonus_clipped:+.2f})"
                     )
                     if neutral_band_applied:
                         print(
@@ -4910,7 +4915,7 @@ def run_experiment6_tape(
                     agent.target_kl = new_target_kl
 
         if np.isnan(actor_loss_value) or np.isinf(actor_loss_value):
-            print(f"\n❌ CRITICAL ERROR: NaN/Inf detected in actor_loss at update {update_count}!")
+            print(f"\n[ERROR] CRITICAL ERROR: NaN/Inf detected in actor_loss at update {update_count}!")
             print(f"   Actor Loss: {actor_loss_value}")
             print(f"   Critic Loss: {critic_loss_value}")
             print(f"   🛑 Stopping training early to prevent cascade failure.")
@@ -5015,7 +5020,7 @@ def run_experiment6_tape(
             terminal_intra_step_tape_delta_reward = last_terminal_intra_step_tape_delta_reward
 
             print(
-                f"🔄 Update {update_count}/{num_updates} | Step {step:,}/{max_total_timesteps:,} | "
+                f"[CYCLE] Update {update_count}/{num_updates} | Step {step:,}/{max_total_timesteps:,} | "
                 f"Episode {training_episode_count} | Time: {elapsed:.1f}s"
             )
             print(
@@ -5031,7 +5036,7 @@ def run_experiment6_tape(
                 )
             print(f"   🎯 Profile: {last_profile_name}")
             print(
-                f"   🧠 Training: actor_loss={actor_loss_val:.4f} | "
+                f"   [BRAIN] Training: actor_loss={actor_loss_val:.4f} | "
                 f"critic_loss={critic_loss_val:.4f} | mean_adv={mean_advantage_val:.4f}"
             )
             print(
@@ -5074,7 +5079,7 @@ def run_experiment6_tape(
                     and alpha_std_val < alpha_diversity_warning_std_threshold
                 ):
                     print(
-                        "   ⚠️  WARNING: "
+                        "   [WARN]  WARNING: "
                         f"Alpha std < {alpha_diversity_warning_std_threshold:.2f} "
                         f"after {update_count} updates. "
                         f"TCN may not be learning asset discrimination."
@@ -5231,7 +5236,7 @@ def run_experiment6_tape(
 
     train_end = time.time()
     train_duration = train_end - train_start
-    print(f"\n✅ THREE-COMPONENT TAPE v3 training completed!")
+    print(f"\n[OK] THREE-COMPONENT TAPE v3 training completed!")
     print(f"   Total episodes: {training_episode_count}")
     print(f"   Total timesteps: {step:,}")
     print(f"   Training time: {train_duration:.2f}s ({train_duration/60:.2f}min)")
@@ -5357,7 +5362,7 @@ def run_experiment6_tape(
         with open(metadata_path, "w", encoding="utf-8") as f:
             json.dump(metadata_latest, f, indent=2, default=str)
     except Exception as exc:
-        print(f"⚠️ Could not append checkpoint details to metadata JSON: {exc}")
+        print(f"[WARN] Could not append checkpoint details to metadata JSON: {exc}")
 
     return Experiment6Result(
         exp_idx=exp_idx,
@@ -5594,7 +5599,7 @@ def evaluate_experiment6_checkpoint(
             if ep == int(checkpoint_episode):
                 matching_files.append(str(actor_path))
         if not matching_files:
-            print(f"❌ No rare model found for episode {checkpoint_episode}")
+            print(f"[ERROR] No rare model found for episode {checkpoint_episode}")
             print(f"   Searched all actor checkpoints in: {rare_dir}")
             print("\n📁 Available rare models:")
             for p in sorted(rare_dir.glob("*_actor.weights.h5")):
@@ -5604,7 +5609,7 @@ def evaluate_experiment6_checkpoint(
         actor_weights_path = matching_files[0]
         critic_weights_path = actor_weights_path.replace("_actor.weights.h5", "_critic.weights.h5")
         checkpoint_description = f"Rare checkpoint (episode {checkpoint_episode})"
-        print(f"✅ Found rare model: {actor_weights_path}")
+        print(f"[OK] Found rare model: {actor_weights_path}")
     else:
         actor_weights_path, critic_weights_path, checkpoint_description = _resolve_normal_model("latest")
         print("\n" + "=" * 80)
@@ -5614,14 +5619,14 @@ def evaluate_experiment6_checkpoint(
 
     path_obj = Path(actor_weights_path)
     if not path_obj.exists():
-        print(f"❌ Actor weights not found: {actor_weights_path}")
+        print(f"[ERROR] Actor weights not found: {actor_weights_path}")
         print("\n📁 Available checkpoints:")
         search_path = rare_dir if use_rare_model else results_root
         for p in sorted(search_path.glob("exp6_*.weights.h5")):
             print(f"   {p}")
     else:
-        print(f"✅ Found actor weights: {actor_weights_path}")
-        print(f"✅ Found critic weights: {critic_weights_path}")
+        print(f"[OK] Found actor weights: {actor_weights_path}")
+        print(f"[OK] Found critic weights: {critic_weights_path}")
         if checkpoint_path_override:
             results_root = _infer_results_root_from_actor_weights(path_obj)
 
@@ -5719,7 +5724,7 @@ def evaluate_experiment6_checkpoint(
         or bool(agent_config_eval.get("use_fusion", False)) != bool(arch_hints.get("use_fusion", False))
     ):
         print(
-            "   ⚠️ Adjusting agent architecture from checkpoint hints: "
+            "   [WARN] Adjusting agent architecture from checkpoint hints: "
             f"{agent_config_eval.get('actor_critic_type')} -> {arch_hints['actor_critic_type']} "
             f"(attention={arch_hints['use_attention']}, fusion={arch_hints['use_fusion']}, source={arch_hints['source']})"
         )
@@ -5750,7 +5755,7 @@ def evaluate_experiment6_checkpoint(
                     if existing_num_assets != int(stock_dim):
                         apply_env_layout = True
                         print(
-                            "   ⚠️ Existing eval state_layout num_assets mismatch "
+                            "   [WARN] Existing eval state_layout num_assets mismatch "
                             f"({existing_num_assets} != env {int(stock_dim)}); using env layout."
                         )
                 if (
@@ -5796,7 +5801,7 @@ def evaluate_experiment6_checkpoint(
                         agent_config_eval["asset_feature_dim"] = int(ckpt_asset_dim)
                         agent_config_eval["global_feature_dim"] = int(inferred_global_dim)
                         print(
-                            "   ⚠️ Checkpoint/env layout mismatch detected. "
+                            "   [WARN] Checkpoint/env layout mismatch detected. "
                             f"checkpoint(conv1_in={ckpt_asset_dim}, global_proj_in={ckpt_global_proj_in}) "
                             f"vs env(asset={env_asset_dim}, global={env_global_dim}). "
                             f"Using {'structured' if inferred_structured else 'flat'} checkpoint-aligned inputs."
@@ -5853,19 +5858,20 @@ def evaluate_experiment6_checkpoint(
             f"per_asset_alpha_head={bool(agent_config_eval.get('fusion_per_asset_alpha_head', False))}"
         )
     print(
-        "   🧠 Eval recurrent memory: "
+        "   [BRAIN] Eval recurrent memory: "
         f"enabled={bool(agent_config_eval.get('recurrent_memory_enabled', False))} | "
         f"units={agent_config_eval.get('recurrent_memory_units', 64)} | "
         f"dropout={agent_config_eval.get('recurrent_memory_dropout', 0.1)}"
     )
     print(
-        "   🌐 Eval regime conditioning: "
+        "   [GLOBE] Eval regime conditioning: "
         f"enabled={bool(agent_config_eval.get('regime_conditioning_enabled', False))} | "
+        f"mode={agent_config_eval.get('regime_conditioning_mode', 'concat')} | "
         f"hidden_dim={agent_config_eval.get('regime_conditioning_hidden_dim', 32)} | "
         f"dropout={agent_config_eval.get('regime_conditioning_dropout', 0.0)}"
     )
     print(
-        "   📉 Eval distributional critic: "
+        "   [DOWN] Eval distributional critic: "
         f"enabled={bool(agent_config_eval.get('distributional_critic_enabled', False))} | "
         f"num_quantiles={agent_config_eval.get('distributional_num_quantiles', 17)}"
     )
@@ -5902,7 +5908,7 @@ def evaluate_experiment6_checkpoint(
     )
     agent_eval.set_dirichlet_progress(1.0)
 
-    print("🔧 Building models before loading weights...")
+    print("[TOOL] Building models before loading weights...")
     if getattr(agent_eval, "is_sequential", False):
         seq_len = agent_config_eval.get("sequence_length", getattr(agent_eval, "sequence_length", 1) or 1)
         if getattr(agent_eval, "uses_structured_state_inputs", getattr(agent_eval, "uses_structured_fusion_inputs", False)):
@@ -5918,7 +5924,7 @@ def evaluate_experiment6_checkpoint(
         dummy_state = tf.zeros((1, state_dim), dtype=tf.float32)
     _ = agent_eval.actor(dummy_state)
     _ = agent_eval.critic(dummy_state)
-    print("   ✅ Models built successfully")
+    print("   [OK] Models built successfully")
 
     def _load_weights_with_compat(model, weights_path: str, label: str) -> None:
         try:
@@ -5928,14 +5934,14 @@ def evaluate_experiment6_checkpoint(
             # Keras 2↔3 checkpoint object-path drift can sometimes be recovered via by_name.
             try:
                 model.load_weights(weights_path, by_name=True, skip_mismatch=False)
-                print(f"   ⚠️ {label} loaded via by_name compatibility fallback")
+                print(f"   [WARN] {label} loaded via by_name compatibility fallback")
                 return
             except (TypeError, ValueError) as kw_exc:
                 # Keras 3 may reject by_name/skip_mismatch kwargs for this format.
-                print(f"   ❌ {label} load failed; by_name fallback unsupported in this runtime: {kw_exc}")
+                print(f"   [ERROR] {label} load failed; by_name fallback unsupported in this runtime: {kw_exc}")
                 raise primary_exc
             except Exception as fallback_exc:
-                print(f"   ❌ {label} load failed (primary + by_name fallback)")
+                print(f"   [ERROR] {label} load failed (primary + by_name fallback)")
                 print(f"      primary: {type(primary_exc).__name__}: {primary_exc}")
                 print(f"      fallback: {type(fallback_exc).__name__}: {fallback_exc}")
                 raise primary_exc
@@ -5943,10 +5949,10 @@ def evaluate_experiment6_checkpoint(
     print(f"📂 Loading checkpoint weights...")
     _load_weights_with_compat(agent_eval.actor, actor_weights_path, "actor")
     _load_weights_with_compat(agent_eval.critic, critic_weights_path, "critic")
-    print("   ✅ Weights loaded successfully")
+    print("   [OK] Weights loaded successfully")
 
     if load_only:
-        print("   ✅ Load-only compatibility check passed")
+        print("   [OK] Load-only compatibility check passed")
         return Experiment6Evaluation(
             actor_weights_path=actor_weights_path,
             critic_weights_path=critic_weights_path,
@@ -6528,7 +6534,7 @@ def evaluate_experiment6_checkpoint(
         stochastic_actions_list.append(run_actions)
         stochastic_alphas_list.append(run_alphas)
 
-        print(f"\n🎲 Run {run_idx + 1}/{num_eval_runs} (Seed={run_seed}):")
+        print(f"\n[RAND] Run {run_idx + 1}/{num_eval_runs} (Seed={run_seed}):")
         print(f"   Start Date: {run_start_date} | Regime: {run_regime}")
         print(f"   Days Traded: {step_count} ({trading_years_run:.2f} years)")
         print(f"   Total Return: {total_return_run*100:+.2f}%")
@@ -6602,7 +6608,7 @@ def evaluate_experiment6_checkpoint(
             print(f"   Mean excess over target: {df_stochastic['turnover_excess_mean'].mean()*100:.3f}%")
             print(f"   Mean executed/raw ratio: {df_stochastic['executed_to_raw_turnover_ratio'].mean():.3f}")
     else:
-        print("\n💡 Skipped stochastic evaluation (num_eval_runs=0)")
+        print("\n[IDEA] Skipped stochastic evaluation (num_eval_runs=0)")
 
     eval_results_path = None
     eval_log_dir = results_root / "logs"

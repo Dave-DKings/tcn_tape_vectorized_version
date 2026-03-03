@@ -43,6 +43,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from config import get_active_config, validate_agent_params, is_sequential_architecture
 from config import PROFILE_BALANCED_GROWTH, ALL_PROFILES_LIST
+from config import apply_run5_overrides
 from data_utils import DataProcessor
 from environment_tape_rl import PortfolioEnvTAPE as PortfolioEnvTF
 from agents.ppo_agent_tf import PPOAgentTF
@@ -69,7 +70,7 @@ class TrainingSession:
     """
     
     def __init__(self, phase: str = 'phase1', architecture: str = 'TCN', 
-                 config_override: Dict[str, Any] = None):
+                 config_override: Dict[str, Any] = None, use_run5: bool = False):
         """
         Initialize training session.
         
@@ -77,12 +78,18 @@ class TrainingSession:
             phase: Training phase ('phase1' for baseline)
             architecture: Neural network architecture (TCN, TCN_ATTENTION, TCN_FUSION)
             config_override: Optional config overrides
+            use_run5: If True, apply Run 5 overrides (FiLM, MVO, lower DD, etc.)
         """
         self.phase = phase
         self.architecture = architecture.upper()
         
         # Load configuration
         self.config = get_active_config(phase)
+        
+        # Apply Run 5 overrides if requested
+        self.use_run5 = use_run5
+        if use_run5:
+            apply_run5_overrides(self.config)
         
         # Set architecture in config
         if 'agent_params' not in self.config:
@@ -202,7 +209,7 @@ class TrainingSession:
         # Ensure sorted by threshold
         schedule = sorted(schedule, key=lambda s: s.get("threshold", 0))
 
-        # Past the last waypoint → return last value
+        # Past the last waypoint => return last value
         if current_step >= schedule[-1]["threshold"]:
             val = schedule[-1].get(value_key)
             return val
@@ -358,7 +365,7 @@ class TrainingSession:
                     logger.info(f"  {regime:12s}: {count:4d} dates ({pct:5.1f}%)")
             logger.info("=" * 80)
         
-        logger.info(f"✅ Data preparation completed")
+        logger.info(f"[OK] Data preparation completed")
         logger.info(f"   Shape: {processed_df.shape}")
         logger.info(f"   Date range: {processed_df['Date'].min()} to {processed_df['Date'].max()}")
         logger.info(f"   Assets: {data_processor.asset_tickers}")
@@ -630,7 +637,7 @@ class TrainingSession:
             name=f"PPOAgent_{self.architecture}"
         )
         
-        logger.info(f"✅ Agent created successfully")
+        logger.info(f"[OK] Agent created successfully")
         logger.info(f"   Architecture: {agent.architecture}")
         logger.info(f"   Sequential model: {agent.is_sequential}")
         logger.info(f"   State dimension: {state_dim}")
@@ -771,7 +778,7 @@ class TrainingSession:
             if should_log_episode:
                 logger.info(
                     "Episode %d TAPE scaling | Profile=%s | Score=%.4f | Sharpe=%.3f | Sortino=%.3f | "
-                    "MDD=%.2f%% | Turnover=%.3f | Skew=%.3f | mean_reward %.4f → %.4f",
+                    "MDD=%.2f%% | Turnover=%.3f | Skew=%.3f | mean_reward %.4f => %.4f",
                     self.episode,
                     current_profile['name'],
                     tape_score,
@@ -1145,7 +1152,7 @@ class TrainingSession:
             agent.actor.save_weights(os.path.join(best_model_dir, 'actor.weights.h5'))
             agent.critic.save_weights(os.path.join(best_model_dir, 'critic.weights.h5'))
             
-            logger.info(f"💾 New best model saved! Reward: {current_performance:.4f}")
+            logger.info(f"[SAVE] New best model saved! Reward: {current_performance:.4f}")
         
         # Save periodic checkpoint
         save_freq = self.config['training_params']['save_freq_episodes']
@@ -1156,7 +1163,7 @@ class TrainingSession:
             agent.actor.save_weights(os.path.join(checkpoint_dir, 'actor.weights.h5'))
             agent.critic.save_weights(os.path.join(checkpoint_dir, 'critic.weights.h5'))
             
-            logger.info(f"💾 Checkpoint saved at episode {self.episode}")
+            logger.info(f"[SAVE] Checkpoint saved at episode {self.episode}")
 
         tape_score = episode_stats.get('tape_score')
         tape_bonus = episode_stats.get('tape_bonus')
@@ -1240,7 +1247,7 @@ class TrainingSession:
             json.dump(metadata, metadata_file, indent=2)
 
         logger.info(
-            "💾 TAPE episode snapshot saved (%s, episode %d, score %.4f, bonus %.2f)",
+            "[SAVE] TAPE episode snapshot saved (%s, episode %d, score %.4f, bonus %.2f)",
             reason,
             self.episode,
             tape_score,
@@ -1259,20 +1266,20 @@ class TrainingSession:
             episodes_df = pd.DataFrame(self.episode_stats_list)
             episodes_file = os.path.join(self.results_dir, 'episodes.csv')
             episodes_df.to_csv(episodes_file, index=False)
-            logger.info(f"✅ Episodes stats saved: {episodes_file}")
+            logger.info(f"[OK] Episodes stats saved: {episodes_file}")
             
         # 2. Updates CSV
         if self.update_stats_list:
             updates_df = pd.DataFrame(self.update_stats_list)
             updates_file = os.path.join(self.results_dir, 'updates.csv')
             updates_df.to_csv(updates_file, index=False)
-            logger.info(f"✅ Updates stats saved: {updates_file}")
+            logger.info(f"[OK] Updates stats saved: {updates_file}")
             
         # Save training stats as JSON (legacy/backup)
         stats_file = os.path.join(self.results_dir, 'training_stats.json')
         with open(stats_file, 'w') as f:
             json.dump(self.training_stats, f, indent=2)
-        logger.info(f"✅ Training stats saved: {stats_file}")
+        logger.info(f"[OK] Training stats saved: {stats_file}")
         
         # Create training plots
         self.create_training_plots()
@@ -1281,7 +1288,7 @@ class TrainingSession:
         config_file = os.path.join(self.results_dir, 'training_config.json')
         with open(config_file, 'w') as f:
             json.dump(self.config, f, indent=2, default=str)
-        logger.info(f"✅ Configuration saved: {config_file}")
+        logger.info(f"[OK] Configuration saved: {config_file}")
         
         # Save metadata
         metadata = {
@@ -1292,12 +1299,16 @@ class TrainingSession:
             'best_performance': float(self.best_performance),
             'results_directory': self.results_dir,
             'training_date': datetime.now().isoformat(),
-            'active_feature_manifest_path': self.active_feature_manifest_path
+            'active_feature_manifest_path': self.active_feature_manifest_path,
+            'use_run5': getattr(self, 'use_run5', False),
+            'regime_conditioning_enabled': self.config.get('agent_params', {}).get('regime_conditioning_enabled', False),
+            'regime_conditioning_mode': self.config.get('agent_params', {}).get('regime_conditioning_mode', 'concat'),
+            'train_test_split_date': self.config.get('TRAIN_TEST_SPLIT_DATE', 'unknown'),
         }
         metadata_file = os.path.join(self.results_dir, 'training_metadata.json')
         with open(metadata_file, 'w') as f:
             json.dump(metadata, f, indent=2)
-        logger.info(f"✅ Metadata saved: {metadata_file}")
+        logger.info(f"[OK] Metadata saved: {metadata_file}")
         
         if self.rare_enabled and self.rare_records:
             summary_dir = self.rare_save_dir or os.path.join(self.results_dir, 'rare_models')
@@ -1316,7 +1327,7 @@ class TrainingSession:
             ]
             with open(summary_path, 'w') as f:
                 json.dump(summary_payload, f, indent=2)
-            logger.info("✅ Rare checkpoint summary saved: %s", summary_path)
+            logger.info("[OK] Rare checkpoint summary saved: %s", summary_path)
         
         logger.info("=" * 80)
     
@@ -1398,15 +1409,15 @@ class TrainingSession:
         plt.savefig(plot_file, dpi=300, bbox_inches='tight')
         plt.close()
         
-        logger.info(f"✅ Training plots saved: {plot_file}")
+        logger.info(f"[OK] Training plots saved: {plot_file}")
     
     def run_training(self):
         """
         Execute the complete training pipeline.
         """
         logger.info("=" * 80)
-        logger.info(f"🚀 STARTING TRAINING SESSION - {self.phase.upper()}")
-        logger.info(f"🏗️  Architecture: {self.architecture}")
+        logger.info(f"[START] STARTING TRAINING SESSION - {self.phase.upper()}")
+        logger.info(f"[ARCH] Architecture: {self.architecture}")
         logger.info("=" * 80)
         
         start_time = datetime.now()
@@ -1438,7 +1449,7 @@ class TrainingSession:
                 logger.info("=" * 80)
             
             logger.info("=" * 80)
-            logger.info(f"🎯 STARTING TRAINING LOOP")
+            logger.info(f"[TARGET] STARTING TRAINING LOOP")
             logger.info(f"   Max timesteps: {max_timesteps:,}")
             logger.info(f"   Update frequency: {self.config['training_params']['timesteps_per_ppo_update']}")
             logger.info(f"   Parallel envs: {self.num_parallel_envs}")
@@ -1527,7 +1538,7 @@ class TrainingSession:
                         self.update_stats_list.append(update_entry)
 
                     if self.total_timesteps >= max_timesteps:
-                        logger.info(f"✅ Reached maximum timesteps ({self.total_timesteps:,})")
+                        logger.info(f"[OK] Reached maximum timesteps ({self.total_timesteps:,})")
                         break
             else:
                 while self.total_timesteps < max_timesteps:
@@ -1564,7 +1575,7 @@ class TrainingSession:
                     self.save_checkpoint(agent, episode_stats)
 
                     if self.total_timesteps >= max_timesteps:
-                        logger.info(f"✅ Reached maximum timesteps ({self.total_timesteps:,})")
+                        logger.info(f"[OK] Reached maximum timesteps ({self.total_timesteps:,})")
                         break
             
             # 5. Save final model
@@ -1576,7 +1587,7 @@ class TrainingSession:
             os.makedirs(final_model_dir, exist_ok=True)
             agent.actor.save_weights(os.path.join(final_model_dir, 'actor.weights.h5'))
             agent.critic.save_weights(os.path.join(final_model_dir, 'critic.weights.h5'))
-            logger.info(f"✅ Final model saved: {final_model_dir}")
+            logger.info(f"[OK] Final model saved: {final_model_dir}")
             
             # 6. Save training results
             self.save_training_results()
@@ -1586,25 +1597,25 @@ class TrainingSession:
             training_duration = end_time - start_time
             
             logger.info("=" * 80)
-            logger.info("🎉 TRAINING COMPLETED SUCCESSFULLY!")
+            logger.info("[DONE] TRAINING COMPLETED SUCCESSFULLY!")
             logger.info("=" * 80)
-            logger.info(f"⏱️  Duration: {training_duration}")
-            logger.info(f"📈 Episodes: {self.episode}")
-            logger.info(f"🔢 Total timesteps: {self.total_timesteps:,}")
-            logger.info(f"🏆 Best performance: {self.best_performance:.4f}")
-            logger.info(f"💾 Results directory: {self.results_dir}")
+            logger.info(f"Duration: {training_duration}")
+            logger.info(f"Episodes: {self.episode}")
+            logger.info(f"Total timesteps: {self.total_timesteps:,}")
+            logger.info(f"Best performance: {self.best_performance:.4f}")
+            logger.info(f"[SAVE] Results directory: {self.results_dir}")
             logger.info("=" * 80)
             
         except KeyboardInterrupt:
             logger.warning("=" * 80)
-            logger.warning("⚠️  Training interrupted by user!")
+            logger.warning("[WARN] Training interrupted by user!")
             logger.warning("=" * 80)
             logger.info("Saving current progress...")
             self.save_training_results()
             
         except Exception as e:
             logger.error("=" * 80)
-            logger.error(f"❌ Training failed with error: {e}")
+            logger.error(f"[ERROR] Training failed with error: {e}")
             logger.error("=" * 80)
             raise
 
@@ -1655,6 +1666,10 @@ Available Architectures:
                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                        help='Logging level (default: INFO)')
     
+    parser.add_argument('--run5', action='store_true', default=False,
+                       help='Apply Run 5 overrides (FiLM regime conditioning, MVO loss, '
+                            'lighter turnover, lower DD trigger, COVID stress split)')
+    
     args = parser.parse_args()
     
     # Set logging level
@@ -1685,7 +1700,8 @@ Available Architectures:
         session = TrainingSession(
             phase=args.phase, 
             architecture=args.architecture,
-            config_override=config_override
+            config_override=config_override,
+            use_run5=args.run5
         )
         session.run_training()
     except Exception as e:

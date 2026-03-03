@@ -778,7 +778,7 @@ class PortfolioEnvTAPE(gym.Env):
         nan_count = np.isnan(self.feature_matrix).sum()
         inf_count = np.isinf(self.feature_matrix).sum()
         if nan_count > 0 or inf_count > 0:
-            logger.warning(f"⚠️  Feature matrix has {nan_count} NaN and {inf_count} inf values BEFORE cleaning")
+            logger.warning(f"[WARN]  Feature matrix has {nan_count} NaN and {inf_count} inf values BEFORE cleaning")
         
         # Handle any NaN values
         self.feature_matrix = np.nan_to_num(self.feature_matrix, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -787,7 +787,7 @@ class PortfolioEnvTAPE(gym.Env):
         nan_after = np.isnan(self.feature_matrix).sum()
         inf_after = np.isinf(self.feature_matrix).sum()
         if nan_after > 0 or inf_after > 0:
-            logger.error(f"❌ Feature matrix STILL has {nan_after} NaN and {inf_after} inf values AFTER cleaning!")
+            logger.error(f"[ERROR] Feature matrix STILL has {nan_after} NaN and {inf_after} inf values AFTER cleaning!")
         
         logger.info(f"Feature matrix built: shape {self.feature_matrix.shape}")
         if self.structured_observation:
@@ -857,7 +857,7 @@ class PortfolioEnvTAPE(gym.Env):
         """
         Reset the environment to initial state.
         
-        🔧 CRITICAL FIX #4: Proper seed + random_start interaction
+        [TOOL] CRITICAL FIX #4: Proper seed + random_start interaction
         - Always initialize RNG (with seed if provided, or create new one)
         - If mode='train' OR random_start=True: Use RNG to pick random starting day
         - Otherwise: Start from day 0 (deterministic evaluation)
@@ -1079,7 +1079,7 @@ class PortfolioEnvTAPE(gym.Env):
                     excess_ratio = (actual_turnover_this_step - self.target_turnover_per_step) / max(self.target_turnover_per_step, 1e-8)
                     turnover_reward = -excess_ratio * self.turnover_penalty_scalar
                 else:
-                    # Under ceiling → no reward, no penalty
+                    # Under ceiling => no reward, no penalty
                     turnover_reward = 0.0
             else:
                 turnover_reward = 0.0
@@ -1453,20 +1453,20 @@ class PortfolioEnvTAPE(gym.Env):
             # Validate and re-normalize if needed
             weight_sum = np.sum(weights)
             if not np.isclose(weight_sum, 1.0, atol=1e-6):
-                logger.warning(f"⚠️  Action sum = {weight_sum:.6f} (expected 1.0). Re-normalizing.")
+                logger.warning(f"[WARN]  Action sum = {weight_sum:.6f} (expected 1.0). Re-normalizing.")
                 weights = weights / weight_sum
             # Ensure non-negative
             if np.any(weights < 0):
-                logger.warning(f"⚠️  Negative weights detected: {weights}. Clipping to 0.")
+                logger.warning(f"[WARN]  Negative weights detected: {weights}. Clipping to 0.")
                 weights = np.maximum(weights, 0.0)
                 weights = weights / np.sum(weights)  # Re-normalize after clipping
         else:
             # Fallback (should never reach here due to __init__ validation)
             weights = self._softmax_normalization(action)
         
-        # 🔥 CRITICAL: Check for NaN/Inf in weights
+        # [HOT] CRITICAL: Check for NaN/Inf in weights
         if np.any(np.isnan(weights)) or np.any(np.isinf(weights)):
-            logger.error(f"⚠️  NaN/Inf detected in weights! Action: {action}, Weights: {weights}")
+            logger.error(f"[WARN]  NaN/Inf detected in weights! Action: {action}, Weights: {weights}")
             weights = np.ones(self.num_assets + 1) / (self.num_assets + 1)  # Fallback to equal weights
             logger.error(f"   Falling back to equal weights: {weights}")
         
@@ -1547,9 +1547,9 @@ class PortfolioEnvTAPE(gym.Env):
             # portfolio_return = sum(asset_returns * weights)
             portfolio_return = np.sum(all_returns * weights)
             
-            # 🔥 CRITICAL: Check for NaN/Inf in portfolio return
+            # [HOT] CRITICAL: Check for NaN/Inf in portfolio return
             if np.isnan(portfolio_return) or np.isinf(portfolio_return):
-                logger.error(f"⚠️  NaN/Inf in portfolio_return! Day: {self.day}")
+                logger.error(f"[WARN]  NaN/Inf in portfolio_return! Day: {self.day}")
                 logger.error(f"   Returns: {all_returns}")
                 logger.error(f"   Weights: {weights}")
                 logger.error(f"   Portfolio value: {self.portfolio_value}")
@@ -1559,9 +1559,9 @@ class PortfolioEnvTAPE(gym.Env):
             # new_portfolio_value = portfolio_value * (1 + portfolio_return)
             new_portfolio_value = self.portfolio_value * (1.0 + portfolio_return)
             
-            # 🔥 CRITICAL: Check for NaN/Inf in new portfolio value
+            # [HOT] CRITICAL: Check for NaN/Inf in new portfolio value
             if np.isnan(new_portfolio_value) or np.isinf(new_portfolio_value):
-                logger.error(f"⚠️  NaN/Inf in new_portfolio_value after return calculation!")
+                logger.error(f"[WARN]  NaN/Inf in new_portfolio_value after return calculation!")
                 logger.error(f"   Old value: {self.portfolio_value}, Return: {portfolio_return}")
                 new_portfolio_value = self.portfolio_value  # Fallback to previous value
             
@@ -1586,16 +1586,16 @@ class PortfolioEnvTAPE(gym.Env):
         # Subtract transaction costs from portfolio value
         new_portfolio_value -= transaction_costs
         
-        # 🔥 CRITICAL: Check for NaN/Inf after transaction costs
+        # [HOT] CRITICAL: Check for NaN/Inf after transaction costs
         if np.isnan(new_portfolio_value) or np.isinf(new_portfolio_value):
-            logger.error(f"⚠️  NaN/Inf after transaction costs!")
+            logger.error(f"[WARN]  NaN/Inf after transaction costs!")
             logger.error(f"   Transaction costs: {transaction_costs}, Turnover: {turnover}")
             new_portfolio_value = self.portfolio_value  # Fallback
         
         # Ensure portfolio value doesn't go negative or become NaN
         if np.isnan(new_portfolio_value):
             new_portfolio_value = self.initial_balance  # Reset to initial
-            logger.error(f"⚠️  Portfolio value was NaN, reset to initial balance")
+            logger.error(f"[WARN]  Portfolio value was NaN, reset to initial balance")
         else:
             new_portfolio_value = max(new_portfolio_value, 1.0)
         
@@ -1715,7 +1715,7 @@ class PortfolioEnvTAPE(gym.Env):
             'day': self.day,
             'date': self.dates[self.day] if self.day < len(self.dates) else None,
             'total_return': (self.portfolio_value / self.initial_balance) - 1.0,
-            'sharpe_ratio': float(current_sharpe),  # ✅ FIX: Include current Sharpe ratio
+            'sharpe_ratio': float(current_sharpe),  # [OK] FIX: Include current Sharpe ratio
             'episode_step': self.episode_step_count,
             'episode_length_limit': self.episode_length_limit,
             'drawdown_lambda': self.drawdown_lambda if self.drawdown_constraint_enabled else 0.0,
@@ -1978,7 +1978,7 @@ class PortfolioEnvTAPE(gym.Env):
         Benefits:
         - Adds stochastic exploration to portfolio weights
         - Samples are guaranteed to sum to 1.0
-        - Higher α_i → more probability mass on asset i
+        - Higher α_i => more probability mass on asset i
         - Natural for portfolio allocation (think Bayesian prior)
         
         Trade-offs vs Softmax:
@@ -1996,18 +1996,18 @@ class PortfolioEnvTAPE(gym.Env):
         # Method 1: Exponential (similar to softmax preparation)
         # α_i = exp(action_i) * scale
         
-        # 🔥 CRITICAL: Clip actions to prevent overflow in exp()
+        # [HOT] CRITICAL: Clip actions to prevent overflow in exp()
         actions_clipped = np.clip(actions, -20.0, 20.0)  # Prevent exp(x) overflow
         actions_shifted = actions_clipped - np.max(actions_clipped)  # Numerical stability
         alpha = np.exp(actions_shifted) * self.dirichlet_alpha_scale
         
         # Ensure alpha is in valid range [0.1, 100.0]
-        # Too small → degenerate distribution, Too large → numerical instability
+        # Too small => degenerate distribution, Too large => numerical instability
         alpha = np.clip(alpha, 0.1, 100.0)
         
-        # 🔥 CRITICAL: Validate alpha before sampling
+        # [HOT] CRITICAL: Validate alpha before sampling
         if np.any(np.isnan(alpha)) or np.any(np.isinf(alpha)):
-            logger.error(f"⚠️  Invalid alpha for Dirichlet! Actions: {actions}")
+            logger.error(f"[WARN]  Invalid alpha for Dirichlet! Actions: {actions}")
             logger.error(f"   Alpha: {alpha}")
             weights = np.ones_like(actions) / len(actions)
             return weights.astype(np.float32)
@@ -2020,9 +2020,9 @@ class PortfolioEnvTAPE(gym.Env):
             else:
                 weights = np.random.dirichlet(alpha).astype(np.float32)
             
-            # 🔥 CRITICAL: Validate sampled weights
+            # [HOT] CRITICAL: Validate sampled weights
             if np.any(np.isnan(weights)) or np.any(np.isinf(weights)) or not np.isclose(np.sum(weights), 1.0):
-                logger.error(f"⚠️  Invalid weights from Dirichlet! Alpha: {alpha}, Weights: {weights}")
+                logger.error(f"[WARN]  Invalid weights from Dirichlet! Alpha: {alpha}, Weights: {weights}")
                 weights = np.ones_like(actions) / len(actions)
                 weights = weights.astype(np.float32)
                 
@@ -2052,7 +2052,7 @@ class PortfolioEnvTAPE(gym.Env):
         
         # Check BEFORE cleaning
         if np.isnan(observation).any() or np.isinf(observation).any():
-            logger.error(f"❌ Observation at day {self.day} has NaN/inf BEFORE nan_to_num!")
+            logger.error(f"[ERROR] Observation at day {self.day} has NaN/inf BEFORE nan_to_num!")
             logger.error(f"   NaN count: {np.isnan(observation).sum()}")
             logger.error(f"   Inf count: {np.isinf(observation).sum()}")
         
@@ -2060,7 +2060,7 @@ class PortfolioEnvTAPE(gym.Env):
         
         # Check AFTER cleaning
         if np.isnan(observation).any() or np.isinf(observation).any():
-            logger.error(f"❌ Observation at day {self.day} STILL has NaN/inf AFTER nan_to_num!")
+            logger.error(f"[ERROR] Observation at day {self.day} STILL has NaN/inf AFTER nan_to_num!")
         
         return observation
     
@@ -2113,7 +2113,7 @@ class PortfolioEnvTAPE(gym.Env):
 # Create an alias so existing code can use PortfolioEnvTF name
 PortfolioEnvTF = PortfolioEnvTAPE
 
-logger.info("✅ TAPE Portfolio Environment loaded successfully")
+logger.info("[OK] TAPE Portfolio Environment loaded successfully")
 logger.info("   Key changes:")
 logger.info("   1. Reward = Portfolio Value (project baseline pattern)")
 logger.info("   2. Termination = Data exhausted only (no balance thresholds)")

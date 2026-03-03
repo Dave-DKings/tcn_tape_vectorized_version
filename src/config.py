@@ -317,7 +317,7 @@ PROFILE_BALANCED_GROWTH = {
     "k_plus":  np.array([1.0, 1.0, 1.0, 4.0, 1.0], dtype=np.float32),
     "weights":   np.array([0.30, 0.25, 0.25, 0.15, 0.05], dtype=np.float32),
     "metrics_order": METRICS_ORDER,
-    # MDD stored as negative: higher = less drawdown = better → 'increasing'
+    # MDD stored as negative: higher = less drawdown = better => 'increasing'
     "directions": ['increasing', 'increasing', 'increasing', 'decreasing', 'increasing'],
     "a_bounds": np.array([-2.0, -1.0, -0.30, 0.0, -1.0]),
     "b_bounds": np.array([3.0, 4.0, 0.0, 0.80, 1.0]),
@@ -544,7 +544,7 @@ PHASE1_CONFIG = {
 
         # Deterministic evaluation mode
         # Options: 'mean', 'mode', 'mean_plus_noise'
-        "evaluation_mode": "mode",  # ✅ RECOMMENDED: Shows true learned policy
+        "evaluation_mode": "mode",  # [OK] RECOMMENDED: Shows true learned policy
         
         # PPO Algorithm parameters
         # Stabilized PPO regime for better out-of-sample Sharpe retention.
@@ -735,7 +735,7 @@ PHASE1_CONFIG = {
         "ra_kl_min_target_kl": 0.008,
         "ra_kl_max_target_kl": 0.040,
 
-        # Turnover curriculum matching 2.0 → 1.75 → 1.50 → 1.25 request
+        # Turnover curriculum matching 2.0 => 1.75 => 1.50 => 1.25 request
         "turnover_penalty_curriculum": {
             0: 0.75,
             30_000: 1.25,
@@ -940,7 +940,7 @@ PHASE2_CONFIG = {
         
         # Deterministic evaluation mode
         # Options: 'mean', 'mode', 'mean_plus_noise'
-        "evaluation_mode": "mode",  # ✅ RECOMMENDED: Shows true learned policy
+        "evaluation_mode": "mode",  # [OK] RECOMMENDED: Shows true learned policy
         
         # PPO Algorithm parameters
         "ppo_params": {
@@ -1105,6 +1105,46 @@ PHASE2_CONFIG = {
     }
 }
 
+# =============================================================================
+# RUN 5 OVERRIDES — toggleable fixes from Run 4 analysis
+# =============================================================================
+# Apply via: apply_run5_overrides(config)
+# Revert to Run 4: simply don't call the function.
+#
+# Changes vs Run 4:
+#   1. Train/test split -> COVID stress (train <= 2019, test from 2020)
+#   2. Regime conditioning enabled with FiLM modulation
+#   3. MVO auxiliary loss enabled (was 0.0)
+#   4. Lighter turnover penalty (0.25->1.00 vs 0.75->2.00)
+#   5. Lower drawdown trigger (target 0.12 vs 0.18)
+RUN5_OVERRIDES = {
+    # FIX 1: Train/test split -> COVID stress test
+    "train_test_split": TRAIN_TEST_SPLIT_DATE_COVID_STRESS,
+
+    # FIX 2: Enable regime conditioning with FiLM modulation
+    "regime_conditioning_enabled": True,
+    "regime_conditioning_hidden_dim": 32,
+    "regime_conditioning_dropout": 0.05,
+    "regime_conditioning_mode": "film",  # 'concat' for legacy, 'film' for FiLM
+
+    # FIX 3: Enable MVO auxiliary loss
+    "risk_aux_mvo_coef": 0.02,
+
+    # FIX 4: Lighter turnover penalty curriculum
+    "turnover_penalty_curriculum": {
+        0:        0.25,
+        100_000:  0.50,
+        200_000:  0.75,
+        300_000:  0.90,
+        400_000:  1.00,
+    },
+
+    # FIX 5: Lower drawdown trigger
+    "drawdown_constraint_target": 0.12,
+    "drawdown_constraint_tolerance": -0.01,
+}
+
+
 def get_active_config(phase_name: str = None):
     """Selects the active configuration based on phase_name or environment variable."""
     if phase_name is None:
@@ -1115,6 +1155,75 @@ def get_active_config(phase_name: str = None):
     
     print(f"Warning: Invalid phase_name '{phase_name}'. Defaulting to Phase 1 Config.")
     return PHASE1_CONFIG
+
+
+def apply_run5_overrides(config: dict, overrides: dict = None) -> dict:
+    """Apply Run 5 fixes to a config dict. Modifies config in-place and returns it.
+
+    Usage in training notebook:
+        config = get_active_config("phase1")
+        apply_run5_overrides(config)  # <= adds all Run 5 fixes
+
+    To revert to Run 4: simply don't call this function.
+
+    Args:
+        config: Phase config dict (e.g. PHASE1_CONFIG).
+        overrides: Override dict (defaults to RUN5_OVERRIDES).
+
+    Returns:
+        The modified config dict (same object, modified in place).
+    """
+    global TRAIN_TEST_SPLIT_DATE
+    if overrides is None:
+        overrides = RUN5_OVERRIDES
+
+    # --- FIX 1: Train/test split ---
+    split_date = overrides.get("train_test_split")
+    if split_date:
+        TRAIN_TEST_SPLIT_DATE = split_date
+        print(f"[Run5] Train/test split => {split_date}")
+
+    # --- FIX 2: Regime conditioning ---
+    agent = config.get("agent_params", {})
+    if "regime_conditioning_enabled" in overrides:
+        agent["regime_conditioning_enabled"] = overrides["regime_conditioning_enabled"]
+    if "regime_conditioning_hidden_dim" in overrides:
+        agent["regime_conditioning_hidden_dim"] = overrides["regime_conditioning_hidden_dim"]
+    if "regime_conditioning_dropout" in overrides:
+        agent["regime_conditioning_dropout"] = overrides["regime_conditioning_dropout"]
+    if "regime_conditioning_mode" in overrides:
+        agent["regime_conditioning_mode"] = overrides["regime_conditioning_mode"]
+
+    # --- FIX 3: MVO auxiliary loss ---
+    ppo = agent.get("ppo_params", {})
+    if "risk_aux_mvo_coef" in overrides:
+        ppo["risk_aux_mvo_coef"] = overrides["risk_aux_mvo_coef"]
+        print(f"[Run5] MVO aux coef => {overrides['risk_aux_mvo_coef']}")
+
+    # --- FIX 4: Turnover penalty curriculum ---
+    training = config.get("training_params", {})
+    if "turnover_penalty_curriculum" in overrides:
+        training["turnover_penalty_curriculum"] = copy.deepcopy(overrides["turnover_penalty_curriculum"])
+        print(f"[Run5] Turnover penalty => {overrides['turnover_penalty_curriculum']}")
+
+    # --- FIX 5: Drawdown constraint ---
+    env = config.get("environment_params", {})
+    dd = env.get("drawdown_constraint", {})
+    if "drawdown_constraint_target" in overrides:
+        dd["target"] = overrides["drawdown_constraint_target"]
+        print(f"[Run5] DD target => {overrides['drawdown_constraint_target']}")
+    if "drawdown_constraint_tolerance" in overrides:
+        dd["tolerance"] = overrides["drawdown_constraint_tolerance"]
+
+    regime_mode = overrides.get("regime_conditioning_mode", "concat")
+    regime_on = overrides.get("regime_conditioning_enabled", False)
+    print(
+        f"[Run5] Regime conditioning: enabled={regime_on}, mode={regime_mode}, "
+        f"hidden_dim={overrides.get('regime_conditioning_hidden_dim', 32)}"
+    )
+    print("[Run5] All overrides applied successfully.")
+    return config
+
 
 def validate_profile_manager_config(config: dict) -> bool:
     """Profile manager deprecated; keep for backwards compatibility."""

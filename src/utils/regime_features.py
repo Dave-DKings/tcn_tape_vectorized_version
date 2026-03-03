@@ -73,8 +73,8 @@ def compute_trend(
     """
     Compute trend indicator as difference between short and long MA.
     
-    Positive trend → short MA > long MA (uptrend)
-    Negative trend → short MA < long MA (downtrend)
+    Positive trend => short MA > long MA (uptrend)
+    Negative trend => short MA < long MA (downtrend)
     
     Args:
         prices: Array of prices (or portfolio values)

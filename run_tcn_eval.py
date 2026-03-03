@@ -27,7 +27,7 @@ tf.config.set_visible_devices([], 'GPU')
 from src.data_utils import DataProcessor
 from src.agents.ppo_agent_tf import PPOAgentTF
 from src.environment_tape_rl import PortfolioEnvTAPE
-from src.config import get_active_config
+from src.config import get_active_config, apply_run5_overrides
 from src.reproducibility_helper import set_all_seeds
 from src.notebook_helpers.tcn_phase1 import split_dataset_by_date
 
@@ -37,7 +37,7 @@ CHECKPOINT_EPISODE = 167
 RANDOM_SEED = 42
 
 
-def run_tcn_evaluation(checkpoint_path=None, checkpoint_episode=None):
+def run_tcn_evaluation(checkpoint_path=None, checkpoint_episode=None, run5=False):
     """Run TCN agent evaluation and save daily portfolio values."""
     
     # Use defaults if not provided
@@ -58,12 +58,16 @@ def run_tcn_evaluation(checkpoint_path=None, checkpoint_episode=None):
     print("Loading configuration...")
     config = get_active_config("phase1")
     
+    # Apply Run 5 overrides if requested
+    if run5:
+        apply_run5_overrides(config)
+    
     # Ensure TCN architecture is set
     config['agent_params']['actor_critic_type'] = 'TCN'
     config['agent_params']['use_covariance'] = True
     config['agent_params']['evaluation_mode'] = 'mode'  # Deterministic
     
-    print(f"✅ Config loaded (architecture: {config['agent_params']['actor_critic_type']})\n")
+    print(f"[OK] Config loaded (architecture: {config['agent_params']['actor_critic_type']})\n")
     
     # Load and process data
     # prepare_features_phase1 handles loading, splitting, and normalization
@@ -78,7 +82,7 @@ def run_tcn_evaluation(checkpoint_path=None, checkpoint_episode=None):
     split_date = config.get('TRAIN_TEST_SPLIT_DATE', '2019-12-31')
     phase1_data = split_dataset_by_date(df_processed, split_date)
     
-    print(f"✅ Data loaded:")
+    print(f"[OK] Data loaded:")
     print(f"   Train shape: {phase1_data['train']['features'].shape}")
     print(f"   Test shape: {phase1_data['test']['features'].shape}\n")
     
@@ -91,7 +95,7 @@ def run_tcn_evaluation(checkpoint_path=None, checkpoint_episode=None):
         phase='test',
         initial_capital=config['initial_capital']
     )
-    print(f"✅ Environment created\n")
+    print(f"[OK] Environment created\n")
     
     # Create agent
     print("Initializing TCN agent...")
@@ -100,15 +104,15 @@ def run_tcn_evaluation(checkpoint_path=None, checkpoint_episode=None):
         action_dim=test_env.action_space.shape[0],
         config_dict=config['agent_params']
     )
-    print(f"✅ Agent initialized\n")
+    print(f"[OK] Agent initialized\n")
     
     # Load checkpoint weights
     print(f"Loading checkpoint weights from {checkpoint_path}...")
     try:
         agent.load_weights(checkpoint_path)
-        print(f"✅ Weights loaded successfully\n")
+        print(f"[OK] Weights loaded successfully\n")
     except Exception as e:
-        print(f"❌ Error loading weights: {e}")
+        print(f"[ERROR] Error loading weights: {e}")
         print(f"   Checkpoint path: {checkpoint_path}")
         return
     
@@ -143,7 +147,7 @@ def run_tcn_evaluation(checkpoint_path=None, checkpoint_episode=None):
         if step_count % 100 == 0:
             print(f"   Step {step_count}/{len(phase1_data['test']['prices'])}")
     
-    print(f"✅ Evaluation complete ({step_count} steps)\n")
+    print(f"[OK] Evaluation complete ({step_count} steps)\n")
     
     # Create results DataFrame
     result_df = pd.DataFrame({
@@ -172,7 +176,7 @@ def run_tcn_evaluation(checkpoint_path=None, checkpoint_episode=None):
     print(f"Final Value: ${portfolio_values[-1]:,.2f}")
     total_return = (portfolio_values[-1] / config['initial_capital'] - 1) * 100
     print(f"Total Return: {total_return:.2f}%")
-    print(f"\n✅ Results saved to: {output_path}")
+    print(f"\n[OK] Results saved to: {output_path}")
     print("="*80)
 
 
@@ -182,10 +186,13 @@ if __name__ == '__main__':
                         help='Path to model checkpoint')
     parser.add_argument('--episode', type=int, default=CHECKPOINT_EPISODE,
                         help='Checkpoint episode number')
+    parser.add_argument('--run5', action='store_true', default=False,
+                        help='Apply Run 5 overrides (COVID stress split, FiLM, etc.)')
     
     args = parser.parse_args()
     
     run_tcn_evaluation(
         checkpoint_path=args.checkpoint,
-        checkpoint_episode=args.episode
+        checkpoint_episode=args.episode,
+        run5=args.run5
     )
