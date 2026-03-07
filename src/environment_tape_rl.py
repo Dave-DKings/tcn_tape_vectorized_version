@@ -407,6 +407,8 @@ class PortfolioEnvTAPE(gym.Env):
                 self._regime_date_indices.setdefault(regime, []).append(idx)
             logger.info(f"Regime-balanced sampling ready: "
                         f"{{{', '.join(f'{k}: {len(v)}' for k, v in self._regime_date_indices.items())}}}")
+        self._regime_sample_counts = {}  # tracks how many episodes started in each regime
+        self._regime_sample_total = 0
 
         # Build return matrix: (days, assets)
         self._build_return_matrix()
@@ -907,6 +909,7 @@ class PortfolioEnvTAPE(gym.Env):
             if options and isinstance(options, dict):
                 requested_regime = options.get('volatility_regime')
 
+            _sampled_regime = None  # track which regime was actually used
             if (requested_regime == 'all' or requested_regime is None) and self._regime_date_indices:
                 # "all" curriculum phase or no curriculum: sample regime bucket uniformly,
                 # then sample a start date within that bucket. This gives underrepresented
@@ -918,20 +921,37 @@ class PortfolioEnvTAPE(gym.Env):
                     valid_starts = [i for i in self._regime_date_indices[chosen_regime] if i <= max_start]
                     if valid_starts:
                         self.day = valid_starts[self.np_random.randint(0, len(valid_starts))]
+                        _sampled_regime = chosen_regime
                     else:
                         self.day = self.np_random.randint(0, max_start + 1) if max_start > 0 else 0
+                        _sampled_regime = 'fallback'
                 else:
                     self.day = self.np_random.randint(0, max_start + 1) if max_start > 0 else 0
+                    _sampled_regime = 'fallback'
             elif requested_regime and requested_regime != 'all' and requested_regime in self._regime_date_indices:
                 # Specific curriculum phase (e.g. 'low_vol', 'medium_vol'): sample within that regime
                 valid_starts = [i for i in self._regime_date_indices[requested_regime] if i <= max_start]
                 if valid_starts:
                     self.day = valid_starts[self.np_random.randint(0, len(valid_starts))]
+                    _sampled_regime = requested_regime
                 else:
                     self.day = self.np_random.randint(0, max_start + 1) if max_start > 0 else 0
+                    _sampled_regime = 'fallback'
             else:
                 # Fallback: original uniform random
                 self.day = self.np_random.randint(0, max_start + 1) if max_start > 0 else 0
+                _sampled_regime = 'uniform'
+
+            # --- Regime sampling diagnostics ---
+            if _sampled_regime:
+                self._regime_sample_counts[_sampled_regime] = self._regime_sample_counts.get(_sampled_regime, 0) + 1
+                self._regime_sample_total += 1
+                if self._regime_sample_total % 10 == 0:
+                    dist_str = ', '.join(
+                        f'{k}: {v} ({v/self._regime_sample_total:.1%})'
+                        for k, v in sorted(self._regime_sample_counts.items())
+                    )
+                    logger.info(f"Regime sampling distribution after {self._regime_sample_total} episodes: {{{dist_str}}}")
         else:
             # Deterministic: always start from day 0 (for evaluation/testing)
             self.day = 0
