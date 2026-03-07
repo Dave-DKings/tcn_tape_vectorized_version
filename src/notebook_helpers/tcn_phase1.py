@@ -2558,6 +2558,20 @@ def run_experiment6_tape(
     else:
         print("   🔓 Drawdown dual controller: disabled (de-constrained mode)")
 
+    # --- Regime-balanced sampling: add volatility_regime column before env creation ---
+    if training_params.get('use_curriculum_learning', False) and 'volatility_regime' not in experiment_train_df.columns:
+        try:
+            from src.data_utils import calculate_volatility_regimes
+            experiment_train_df = calculate_volatility_regimes(experiment_train_df, window=30)
+            if 'volatility_regime' in experiment_train_df.columns:
+                regime_counts = experiment_train_df.groupby('volatility_regime')['Date'].nunique()
+                total_dates = experiment_train_df['Date'].nunique()
+                print(f"   🎲 Volatility regimes computed for regime-balanced sampling:")
+                for regime, count in sorted(regime_counts.items()):
+                    print(f"      {regime}: {count} dates ({count/total_dates:.1%})")
+        except Exception as e:
+            print(f"   [WARN] Could not compute volatility regimes: {e}")
+
     def _create_train_env() -> PortfolioEnvTAPE:
         env_obj = PortfolioEnvTAPE(
             config=config,
