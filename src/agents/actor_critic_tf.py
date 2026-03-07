@@ -599,7 +599,8 @@ class DirichletActor(Model):
             exp_clip = _DEFAULT_EXP_CLIP
         self._alpha_activation = alpha_activation.lower().strip()
         self._exp_clip = exp_clip
-        self._version_flag = "v2_updated" 
+        self._exp_tanh_scale = float(kwargs.get('exp_tanh_scale', 2.5))
+        self._version_flag = "v2_updated"
         
         # Dirichlet Controls
         self._logit_temperature = float(logit_temperature) if logit_temperature else 1.0
@@ -694,8 +695,9 @@ class DirichletActor(Model):
         elif activation == "exp_tanh":
             # PERF-FIX #4c: exp(tanh(x) * scale) + eps
             # Bounded output prevents alpha explosion and naturally encourages
-            # diversity. Range: [exp(-scale), exp(scale)] ~ [0.08, 12.2] for scale=2.5
-            exp_tanh_scale = 2.5
+            # diversity. Configurable via dirichlet_exp_tanh_scale.
+            # scale=2.5 -> range [0.08, 12.2], scale=3.5 -> range [0.03, 33.1]
+            exp_tanh_scale = getattr(self, '_exp_tanh_scale', 2.5)
             alpha = tf.exp(tf.nn.tanh(scaled_logits) * exp_tanh_scale) + eps
         else:
             # Default / legacy: softplus + adaptive epsilon
@@ -1150,6 +1152,7 @@ class TCNFusionActor(DirichletActor):
         adaptive_temperature_min: float = 0.8,
         adaptive_temperature_max: float = 2.5,
         dual_head_enabled: Optional[bool] = None,
+        exp_tanh_scale: float = 2.5,
     ):
         if tcn_filters is None:
             tcn_filters = _DEFAULT_TCN_FILTERS
@@ -1216,6 +1219,7 @@ class TCNFusionActor(DirichletActor):
             adaptive_temperature_min=adaptive_temperature_min,
             adaptive_temperature_max=adaptive_temperature_max,
             dual_head_enabled=bool(dual_head_enabled),
+            exp_tanh_scale=exp_tanh_scale,
         )
 
         self.input_dim = int(input_dim)
@@ -2547,6 +2551,7 @@ def create_actor_critic(architecture: str,
             fusion_context_cross_attention_dropout=config.get('fusion_context_cross_attention_dropout', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_DROPOUT),
             fusion_per_asset_alpha_head=config.get('fusion_per_asset_alpha_head', _DEFAULT_FUSION_PER_ASSET_ALPHA_HEAD),
             dual_head_enabled=dual_head_enabled_cfg,
+            exp_tanh_scale=float(config.get('dirichlet_exp_tanh_scale', 2.5)),
             **recurrent_kwargs,
             **regime_kwargs,
             **epsilon_kwargs,
