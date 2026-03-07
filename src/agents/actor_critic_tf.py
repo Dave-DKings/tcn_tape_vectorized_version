@@ -1383,6 +1383,18 @@ class TCNFusionActor(DirichletActor):
                     name=f"{name}_regime_fusion",
                 )
                 self.regime_dropout = layers.Dropout(float(max(0.0, regime_conditioning_dropout)))
+
+        # Per-asset FiLM: condition on asset identity for per-asset differentiation
+        self.asset_film_layer = None
+        if self.asset_identity_enabled and self.per_asset_alpha_head_enabled:
+            self.asset_film_layer = FiLMLayer(
+                feature_dim=self.fusion_embed_dim,
+                conditioning_dim=self.fusion_embed_dim,
+                hidden_dim=32,
+                dropout=0.05,
+                name=f"{name}_asset_film",
+            )
+
         sanitized_alpha_head_dims = [int(x) for x in (fusion_alpha_head_hidden_dims or []) if int(x) > 0]
         self.use_richer_alpha_head = len(sanitized_alpha_head_dims) > 0
         self.alpha_pre_norm = None
@@ -1602,6 +1614,15 @@ class TCNFusionActor(DirichletActor):
                     fused = self.regime_fusion(tf.concat([fused, regime_embed], axis=-1), training=training)
                     if self.regime_dropout is not None:
                         fused = self.regime_dropout(fused, training=training)
+
+        # --- Per-asset FiLM: condition on asset identity for differentiation ---
+        if self.asset_film_layer is not None and self.asset_identity_embed is not None:
+            batch_size = tf.shape(x_assets)[0]
+            identity = tf.tile(self.asset_identity_embed[tf.newaxis, :, :], [batch_size, 1, 1])
+            x_flat = tf.reshape(x_assets, (-1, self.fusion_embed_dim))
+            id_flat = tf.reshape(identity, (-1, self.fusion_embed_dim))
+            x_flat = self.asset_film_layer(x_flat, id_flat, training=training)
+            x_assets = tf.reshape(x_flat, (batch_size, self.num_assets, self.fusion_embed_dim))
 
         # --- Change 3: Per-asset alpha head OR legacy pooled head ---
         if self.per_asset_alpha_head_enabled and self.per_asset_logit_head is not None:
