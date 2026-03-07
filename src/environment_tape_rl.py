@@ -392,7 +392,22 @@ class PortfolioEnvTAPE(gym.Env):
             self.total_days = len(self.dates)
         else:
             raise ValueError("processed_data must have a 'Date' column")
-        
+
+        # Regime-balanced sampling: precompute date -> regime index mapping
+        self._regime_date_indices = {}
+        if 'volatility_regime' in processed_data.columns:
+            date_to_regime = (
+                processed_data[['Date', 'volatility_regime']]
+                .drop_duplicates(subset='Date')
+                .set_index('Date')['volatility_regime']
+                .to_dict()
+            )
+            for idx, date in enumerate(self.dates):
+                regime = date_to_regime.get(date, 'medium_vol')
+                self._regime_date_indices.setdefault(regime, []).append(idx)
+            logger.info(f"Regime-balanced sampling ready: "
+                        f"{{{', '.join(f'{k}: {len(v)}' for k, v in self._regime_date_indices.items())}}}")
+
         # Build return matrix: (days, assets)
         self._build_return_matrix()
         
@@ -879,15 +894,44 @@ class PortfolioEnvTAPE(gym.Env):
         elif not hasattr(self, 'np_random'):
             self.np_random = np.random.RandomState()
         
-        # � STEP 2: Determine starting day based on mode and random_start flag
+        # STEP 2: Determine starting day based on mode and random_start flag
         if self.mode == 'train' or self.random_start:
-            # Random starting point using the initialized RNG.
             # Reserve enough room for the active episode limit so curriculum horizons
             # are respected; fall back to 252 when no explicit limit is set.
             reserve_horizon = int(self.episode_length_limit) if self.episode_length_limit is not None else 252
             reserve_horizon = max(1, reserve_horizon)
             max_start = max(0, len(self.dates) - reserve_horizon)
-            self.day = self.np_random.randint(0, max_start + 1) if max_start > 0 else 0
+
+            # Regime-balanced sampling: determine requested regime from options
+            requested_regime = None
+            if options and isinstance(options, dict):
+                requested_regime = options.get('volatility_regime')
+
+            if (requested_regime == 'all' or requested_regime is None) and self._regime_date_indices:
+                # "all" curriculum phase or no curriculum: sample regime bucket uniformly,
+                # then sample a start date within that bucket. This gives underrepresented
+                # regimes (e.g. high_vol/bear) equal episode probability.
+                available_regimes = [r for r, indices in self._regime_date_indices.items()
+                                     if any(i <= max_start for i in indices)]
+                if available_regimes:
+                    chosen_regime = available_regimes[self.np_random.randint(0, len(available_regimes))]
+                    valid_starts = [i for i in self._regime_date_indices[chosen_regime] if i <= max_start]
+                    if valid_starts:
+                        self.day = valid_starts[self.np_random.randint(0, len(valid_starts))]
+                    else:
+                        self.day = self.np_random.randint(0, max_start + 1) if max_start > 0 else 0
+                else:
+                    self.day = self.np_random.randint(0, max_start + 1) if max_start > 0 else 0
+            elif requested_regime and requested_regime != 'all' and requested_regime in self._regime_date_indices:
+                # Specific curriculum phase (e.g. 'low_vol', 'medium_vol'): sample within that regime
+                valid_starts = [i for i in self._regime_date_indices[requested_regime] if i <= max_start]
+                if valid_starts:
+                    self.day = valid_starts[self.np_random.randint(0, len(valid_starts))]
+                else:
+                    self.day = self.np_random.randint(0, max_start + 1) if max_start > 0 else 0
+            else:
+                # Fallback: original uniform random
+                self.day = self.np_random.randint(0, max_start + 1) if max_start > 0 else 0
         else:
             # Deterministic: always start from day 0 (for evaluation/testing)
             self.day = 0

@@ -312,7 +312,7 @@ PROFILE_BALANCED_GROWTH = {
     # Asymmetric Sigmoid: mu is the 50% utility midpoint, k controls steepness
     "mu": np.array([1.0, 1.3, -0.15, 0.60, 0.0], dtype=np.float32),
     # k_minus: steepness BELOW target (penalty for increasing, reward for decreasing)
-    "k_minus": np.array([4.0, 3.0, 5.0, 1.0, 2.0], dtype=np.float32),
+    "k_minus": np.array([4.0, 3.0, 3.0, 1.0, 2.0], dtype=np.float32),
     # k_plus:  steepness ABOVE target (reward for increasing, penalty for decreasing)
     "k_plus":  np.array([1.0, 1.0, 1.0, 4.0, 1.0], dtype=np.float32),
     "weights":   np.array([0.30, 0.25, 0.25, 0.15, 0.05], dtype=np.float32),
@@ -617,9 +617,9 @@ PHASE1_CONFIG = {
         # STATE-OF-THE-ART FIX #4: Curriculum Learning
         "use_curriculum_learning": True,
         "curriculum_phases": [
-            {"name": "low_vol", "timesteps_fraction": 0.30},    # First 30% on low volatility
-            {"name": "medium_vol", "timesteps_fraction": 0.40},  # Next 40% on medium volatility
-            {"name": "all", "timesteps_fraction": 0.30}          # Final 30% on all data
+            {"name": "all", "timesteps_fraction": 0.30},    # Regime-balanced from start
+            {"name": "all", "timesteps_fraction": 0.40},    # Regime-balanced throughout
+            {"name": "all", "timesteps_fraction": 0.30}     # Regime-balanced to end
         ],
 
         # PERF-FIX #2 + #5: Smooth schedule transitions with wider spacing for 500K budget.
@@ -995,9 +995,9 @@ PHASE2_CONFIG = {
         # STATE-OF-THE-ART FIX #4: Curriculum Learning
         "use_curriculum_learning": True,
         "curriculum_phases": [
-            {"name": "low_vol", "timesteps_fraction": 0.30},    # First 30% on low volatility
-            {"name": "medium_vol", "timesteps_fraction": 0.40},  # Next 40% on medium volatility
-            {"name": "all", "timesteps_fraction": 0.30}          # Final 30% on all data
+            {"name": "all", "timesteps_fraction": 0.30},    # Regime-balanced from start
+            {"name": "all", "timesteps_fraction": 0.40},    # Regime-balanced throughout
+            {"name": "all", "timesteps_fraction": 0.30}     # Regime-balanced to end
         ],
 
         # Enable episode-length curriculum with smooth overlap ramps.
