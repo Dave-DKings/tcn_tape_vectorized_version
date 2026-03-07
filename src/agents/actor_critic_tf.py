@@ -589,6 +589,8 @@ class DirichletActor(Model):
         dual_head_enabled: bool = False,
         **kwargs,
     ):
+        # Extract custom params before passing kwargs to Keras Layer
+        self._exp_tanh_scale = float(kwargs.pop('exp_tanh_scale', 2.5))
         super(DirichletActor, self).__init__(name=name, **kwargs)
         self._epsilon_max_value = float(epsilon_start)
         self._epsilon_min_value = float(epsilon_min)
@@ -599,7 +601,6 @@ class DirichletActor(Model):
             exp_clip = _DEFAULT_EXP_CLIP
         self._alpha_activation = alpha_activation.lower().strip()
         self._exp_clip = exp_clip
-        self._exp_tanh_scale = float(kwargs.get('exp_tanh_scale', 2.5))
         self._version_flag = "v2_updated"
         
         # Dirichlet Controls
