@@ -2558,26 +2558,33 @@ def run_experiment6_tape(
     else:
         print("   🔓 Drawdown dual controller: disabled (de-constrained mode)")
 
-    # --- Regime-balanced sampling: add volatility_regime column before env creation ---
+    # --- Regime-balanced sampling: ensure volatility_regime exists and log final status ---
     _regime_sampling_enabled = training_params.get('use_curriculum_learning', False)
-    print(f"   [DEBUG] Regime-balanced sampling: use_curriculum_learning={_regime_sampling_enabled}, "
-          f"volatility_regime in df={'volatility_regime' in experiment_train_df.columns}")
-    if 'volatility_regime' not in experiment_train_df.columns:
+    _has_regime_col_pre = 'volatility_regime' in experiment_train_df.columns
+    _regime_source = "existing" if _has_regime_col_pre else "computed"
+    print(
+        "   [DEBUG] Regime-balanced sampling: "
+        f"use_curriculum_learning={_regime_sampling_enabled}, "
+        f"volatility_regime pre-existing={_has_regime_col_pre}"
+    )
+    if not _has_regime_col_pre:
         try:
             from src.data_utils import calculate_volatility_regimes
             experiment_train_df = calculate_volatility_regimes(experiment_train_df, window=30)
-            if 'volatility_regime' in experiment_train_df.columns:
-                regime_counts = experiment_train_df.groupby('volatility_regime')['Date'].nunique()
-                total_dates = experiment_train_df['Date'].nunique()
-                print(f"   🎲 Volatility regimes computed for regime-balanced sampling:")
-                for regime, count in sorted(regime_counts.items()):
-                    print(f"      {regime}: {count} dates ({count/total_dates:.1%})")
-            else:
-                print(f"   [WARN] calculate_volatility_regimes ran but column not added")
         except Exception as e:
             import traceback
             print(f"   [WARN] Could not compute volatility regimes: {e}")
             traceback.print_exc()
+
+    _has_regime_col_post = 'volatility_regime' in experiment_train_df.columns
+    if _has_regime_col_post:
+        regime_counts = experiment_train_df.groupby('volatility_regime')['Date'].nunique()
+        total_dates = max(1, int(experiment_train_df['Date'].nunique()))
+        print(f"   🎲 Volatility regimes ready for sampling ({_regime_source}):")
+        for regime, count in sorted(regime_counts.items()):
+            print(f"      {regime}: {count} dates ({count/total_dates:.1%})")
+    else:
+        print("   [WARN] volatility_regime unavailable after preparation; sampling will fall back to uniform starts.")
 
     def _create_train_env() -> PortfolioEnvTAPE:
         env_obj = PortfolioEnvTAPE(
@@ -2620,6 +2627,33 @@ def run_experiment6_tape(
     if parallel_rollout_enabled:
         for _ in range(1, num_parallel_envs):
             train_envs.append(_create_train_env())
+
+    # Visible regime-sampling diagnostics (aggregated across vectorized train envs).
+    def _aggregate_regime_sampling_stats(envs: List[PortfolioEnvTAPE]) -> Tuple[int, Dict[str, int]]:
+        total_samples = 0
+        counts: Dict[str, int] = {}
+        for env_obj in envs:
+            env_total = int(getattr(env_obj, "_regime_sample_total", 0) or 0)
+            env_counts = getattr(env_obj, "_regime_sample_counts", {}) or {}
+            total_samples += env_total
+            if isinstance(env_counts, dict):
+                for regime_name, regime_count in env_counts.items():
+                    key = str(regime_name)
+                    counts[key] = counts.get(key, 0) + int(regime_count)
+        return total_samples, counts
+
+    if _regime_sampling_enabled:
+        regime_bucket_sizes = {
+            str(name): int(len(indices))
+            for name, indices in (getattr(env_train, "_regime_date_indices", {}) or {}).items()
+        }
+        if regime_bucket_sizes:
+            bucket_total = max(1, int(sum(regime_bucket_sizes.values())))
+            print("   🧭 Regime start buckets (train env):")
+            for regime_name, regime_count in sorted(regime_bucket_sizes.items()):
+                print(f"      {regime_name}: {regime_count} dates ({regime_count / bucket_total:.1%})")
+        else:
+            print("   [WARN] Regime start buckets are empty; reset() will use uniform random starts.")
 
     if getattr(env_train, "drawdown_constraint_enabled", False):
         print(
@@ -5094,6 +5128,14 @@ def run_experiment6_tape(
                     f"std={alpha_std_val:.2f} | "
                     f"range=[{alpha_min_val:.2f}, {alpha_max_val:.2f}]"
                 )
+                if _regime_sampling_enabled:
+                    regime_total_samples, regime_counts = _aggregate_regime_sampling_stats(train_envs)
+                    if regime_total_samples > 0 and regime_counts:
+                        regime_dist = ", ".join(
+                            f"{name}={count} ({count / regime_total_samples:.1%})"
+                            for name, count in sorted(regime_counts.items())
+                        )
+                        print(f"   🧭 Regime Start Dist (train resets): {regime_dist}")
                 # Warning if alpha seems stuck (TCN not learning asset discrimination).
                 if (
                     update_count > alpha_diversity_warning_after_updates
