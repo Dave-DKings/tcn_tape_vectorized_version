@@ -1891,6 +1891,7 @@ class PPOAgentTF:
             'alpha_max': 0.0,
             'alpha_mean': 0.0,
             'alpha_std': 0.0,  # Track alpha diversity for TCN learning
+            'alpha_per_asset': np.zeros(self.action_dim, dtype=np.float64),  # Per-asset alpha means
             # NEW: PPO ratio statistics
             'ratio_mean': 0.0,
             'ratio_std': 0.0,
@@ -2016,6 +2017,7 @@ class PPOAgentTF:
                 stats['alpha_max'] += float(np.max(alpha_batch))
                 stats['alpha_mean'] += float(np.mean(alpha_batch))
                 stats['alpha_std'] += float(np.std(alpha_batch))  # Track alpha diversity
+                stats['alpha_per_asset'] += np.mean(alpha_batch, axis=0).astype(np.float64)  # Per-asset means
                 stats['ratio_mean'] += float(ratio_mean)
                 stats['ratio_std'] += float(ratio_std)
                 stats['approx_kl'] += float(approx_kl)
@@ -2063,7 +2065,8 @@ class PPOAgentTF:
                        'actor_grad_norm', 'critic_grad_norm', 'alpha_min', 'alpha_max', 'alpha_mean', 'alpha_std',
                        'ratio_mean', 'ratio_std', 'approx_kl', 'clip_fraction', 'value_clip_fraction']:
                 stats[key] /= num_updates
-        
+            stats['alpha_per_asset'] /= num_updates
+
         # Remove temporary counter
         del stats['num_grad_updates']
         

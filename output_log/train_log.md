@@ -2,7 +2,7 @@
 Architecture: TCN_FUSION
 max_total_timesteps: 500000
 num_parallel_envs: 4
-[OK] Actuarial feature check passed: {'Actuarial_Prob_30d': 54767, 'Actuarial_Reserve_Severity': 54767, 'Actuarial_Expected_Recovery': 54767, 'Actuarial_Prob_60d': 54767}
+[OK] Actuarial feature check passed: {'Actuarial_Reserve_Severity': 54767, 'Actuarial_Prob_30d': 54767, 'Actuarial_Prob_60d': 54767, 'Actuarial_Expected_Recovery': 54767}
 [OK] Fundamental feature check passed: none present
 
 ================================================================================
@@ -86,8 +86,8 @@ Covariance Features: Yes
    [DOWN] PPO GAE-λ schedule: 0.9200@0 => 0.9500@150,000 => 0.9700@350,000
    📐 PPO rollout schedule: 1008@0 => 1512@150,000 => 2016@300,000
    🧺 PPO batch-size schedule: 252@0 => 336@150,000 => 504@300,000
-📊 Training metrics will stream to /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/logs/Exp6_TCN_FUSION_Enhanced_TAPE_training_20260307_121614_episodes.csv
-🧪 Step diagnostics will stream to /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/logs/Exp6_TCN_FUSION_Enhanced_TAPE_training_20260307_121614_step_diagnostics.csv
+📊 Training metrics will stream to /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/logs/Exp6_TCN_FUSION_Enhanced_TAPE_training_20260308_052615_episodes.csv
+🧪 Step diagnostics will stream to /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/logs/Exp6_TCN_FUSION_Enhanced_TAPE_training_20260308_052615_step_diagnostics.csv
 
 🎯 Starting THREE-COMPONENT TAPE v3 training (with curriculum)...
    Total timesteps: 500,000
@@ -123,42 +123,158 @@ Covariance Features: Yes
    🧷 Legacy checkpoint routes: configurable
    [WARN] Checkpoint selector default: legacy high-watermark path
    💾 High-watermark checkpoints: enabled (Sharpe >= 0.70, MDD <= 25.0%, skip_on_det_validation=True)
-[RCPT] Active feature manifest saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/logs/Exp6_TCN_FUSION_Enhanced_TAPE_training_20260307_121614_active_feature_manifest.json
-[RCPT] Training metadata saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/logs/Exp6_TCN_FUSION_Enhanced_TAPE_training_20260307_121614_metadata.json
-      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00003_shp1p117_actor.weights.h5 (Sharpe=1.117, MDD=10.69%)
-      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00010_shp0p926_actor.weights.h5 (Sharpe=0.926, MDD=14.64%)
-[CYCLE] Update 10/348 | Step 10,080/500,000 | Episode 12 | Time: 585.4s
-   📊 Metrics: Return=+22.59% | Sharpe=0.432 | DD=14.28% | Turnover=32.39%
-   🎚️ Intra-Step TAPE: potential=0.7410 | delta_reward=+0.0000
+[RCPT] Active feature manifest saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/logs/Exp6_TCN_FUSION_Enhanced_TAPE_training_20260308_052615_active_feature_manifest.json
+[RCPT] Training metadata saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/logs/Exp6_TCN_FUSION_Enhanced_TAPE_training_20260308_052615_metadata.json
+      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00002_shp0p719_actor.weights.h5 (Sharpe=0.719, MDD=11.60%)
+      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00003_shp1p254_actor.weights.h5 (Sharpe=1.254, MDD=8.95%)
+[CYCLE] Update 10/348 | Step 10,080/500,000 | Episode 12 | Time: 1018.2s
+   📊 Metrics: Return=-0.62% | Sharpe=-0.078 | DD=17.91% | Turnover=61.79%
+   🎚️ Intra-Step TAPE: potential=0.7399 | delta_reward=+0.0005
    🎯 Profile: BalancedGrowth
-   [BRAIN] Training: actor_loss=0.0847 | critic_loss=0.7326 | mean_adv=-0.0000
-   🧮 Loss Detail: critic_scaled=0.3663 | risk_aux_total=0.0733 | sharpe_proxy=0.0000 | sharpe_loss=0.0000 | mvo_loss=0.0007 | cvar_proxy=1.8165 | cvar_loss=0.0727 | cvar_coef=0.0400
+   [BRAIN] Training: actor_loss=0.0834 | critic_loss=0.5000 | mean_adv=0.0000
+   🧮 Loss Detail: critic_scaled=0.2500 | risk_aux_total=0.0764 | sharpe_proxy=0.0000 | sharpe_loss=0.0000 | mvo_loss=0.0006 | cvar_proxy=1.8969 | cvar_loss=0.0759 | cvar_coef=0.0400
    ⚙️ Optimizer: actor_lr=0.000030 | critic_lr=0.000150 | target_kl=0.0000 | rollout=1008 | batch_size=252 | gamma=0.9900 | gae_lambda=0.9200
-   🔬 Alpha Diversity: mean=1.69 | std=1.62 | range=[0.37, 11.40]
+   🔬 Alpha Diversity: mean=1.78 | std=1.05 | range=[0.43, 6.27]
    🧭 Regime Start Dist (train resets): high_vol=6 (37.5%), low_vol=6 (37.5%), medium_vol=4 (25.0%)
-      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00014_shp0p913_actor.weights.h5 (Sharpe=0.913, MDD=8.67%)
-      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00017_shp0p919_actor.weights.h5 (Sharpe=0.919, MDD=8.00%)
-      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00018_shp0p909_actor.weights.h5 (Sharpe=0.909, MDD=9.61%)
-[CYCLE] Update 20/348 | Step 20,160/500,000 | Episode 24 | Time: 1162.4s
-   📊 Metrics: Return=+13.18% | Sharpe=0.243 | DD=13.43% | Turnover=41.11%
-   🎚️ Intra-Step TAPE: potential=0.5505 | delta_reward=+0.0017
+[CYCLE] Update 20/348 | Step 20,160/500,000 | Episode 24 | Time: 2009.3s
+   📊 Metrics: Return=+1.28% | Sharpe=-0.074 | DD=13.01% | Turnover=53.76%
+   🎚️ Intra-Step TAPE: potential=0.4056 | delta_reward=+0.0014
    🎯 Profile: BalancedGrowth
-   [BRAIN] Training: actor_loss=0.0712 | critic_loss=0.1827 | mean_adv=0.0000
-   🧮 Loss Detail: critic_scaled=0.0913 | risk_aux_total=0.0650 | sharpe_proxy=0.0000 | sharpe_loss=0.0000 | mvo_loss=0.0005 | cvar_proxy=1.6109 | cvar_loss=0.0644 | cvar_coef=0.0400
+   [BRAIN] Training: actor_loss=0.0767 | critic_loss=0.1877 | mean_adv=0.0000
+   🧮 Loss Detail: critic_scaled=0.0938 | risk_aux_total=0.0648 | sharpe_proxy=0.0000 | sharpe_loss=0.0000 | mvo_loss=0.0005 | cvar_proxy=1.6070 | cvar_loss=0.0643 | cvar_coef=0.0400
    ⚙️ Optimizer: actor_lr=0.000030 | critic_lr=0.000150 | target_kl=0.0000 | rollout=1008 | batch_size=252 | gamma=0.9900 | gae_lambda=0.9200
-   🔬 Alpha Diversity: mean=1.26 | std=1.07 | range=[0.27, 5.79]
+   🔬 Alpha Diversity: mean=1.43 | std=1.43 | range=[0.29, 7.69]
    🧭 Regime Start Dist (train resets): high_vol=10 (35.7%), low_vol=11 (39.3%), medium_vol=7 (25.0%)
-      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00034_shp0p802_actor.weights.h5 (Sharpe=0.802, MDD=13.13%)
-[CYCLE] Update 30/348 | Step 30,240/500,000 | Episode 40 | Time: 1736.2s
-   📊 Metrics: Return=-12.43% | Sharpe=-0.184 | DD=40.28% | Turnover=28.64%
+[CYCLE] Update 30/348 | Step 30,240/500,000 | Episode 40 | Time: 3006.7s
+   📊 Metrics: Return=-5.16% | Sharpe=-0.094 | DD=30.64% | Turnover=32.34%
    🎯 Profile: BalancedGrowth
-   [BRAIN] Training: actor_loss=0.1223 | critic_loss=0.2427 | mean_adv=-0.0000
-   🧮 Loss Detail: critic_scaled=0.1213 | risk_aux_total=0.1070 | sharpe_proxy=0.0000 | sharpe_loss=0.0000 | mvo_loss=0.0007 | cvar_proxy=2.6574 | cvar_loss=0.1063 | cvar_coef=0.0400
+   [BRAIN] Training: actor_loss=0.1151 | critic_loss=0.2946 | mean_adv=0.0000
+   🧮 Loss Detail: critic_scaled=0.1473 | risk_aux_total=0.1075 | sharpe_proxy=0.0000 | sharpe_loss=0.0000 | mvo_loss=0.0007 | cvar_proxy=2.6686 | cvar_loss=0.1067 | cvar_coef=0.0400
    ⚙️ Optimizer: actor_lr=0.000030 | critic_lr=0.000150 | target_kl=0.0000 | rollout=1008 | batch_size=252 | gamma=0.9900 | gae_lambda=0.9200
-   🔬 Alpha Diversity: mean=1.86 | std=1.85 | range=[0.28, 9.55]
+   🔬 Alpha Diversity: mean=1.24 | std=1.57 | range=[0.28, 9.20]
    🧭 Regime Start Dist (train resets): high_vol=19 (43.2%), low_vol=14 (31.8%), medium_vol=11 (25.0%)
-   🔒 Drawdown λ snapshot=0.000 (peak 0.000, dd 0.00% / trig 21.00%) | terminal=0.657 (peak 0.657) | TAPE=0.2245
-      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00042_shp0p752_actor.weights.h5 (Sharpe=0.752, MDD=13.17%)
-      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00043_shp0p760_actor.weights.h5 (Sharpe=0.760, MDD=13.26%)
-      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00046_shp0p772_actor.weights.h5 (Sharpe=0.772, MDD=13.32%)
-      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00047_shp0p903_actor.weights.h5 (Sharpe=0.903, MDD=7.09%)
+   🔒 Drawdown λ snapshot=0.025 (peak 0.025, dd 0.00% / trig 21.00%) | terminal=0.172 (peak 0.172) | TAPE=0.2264
+[CYCLE] Update 40/348 | Step 40,320/500,000 | Episode 52 | Time: 4006.4s
+   📊 Metrics: Return=-12.57% | Sharpe=-0.200 | DD=39.43% | Turnover=34.45%
+   🎚️ Intra-Step TAPE: potential=0.6735 | delta_reward=+0.0005
+   🎯 Profile: BalancedGrowth
+   [BRAIN] Training: actor_loss=0.0879 | critic_loss=0.1231 | mean_adv=-0.0000
+   🧮 Loss Detail: critic_scaled=0.0616 | risk_aux_total=0.0819 | sharpe_proxy=0.0000 | sharpe_loss=0.0000 | mvo_loss=0.0009 | cvar_proxy=2.0256 | cvar_loss=0.0810 | cvar_coef=0.0400
+   ⚙️ Optimizer: actor_lr=0.000030 | critic_lr=0.000150 | target_kl=0.0000 | rollout=1008 | batch_size=252 | gamma=0.9900 | gae_lambda=0.9200
+   🔬 Alpha Diversity: mean=2.41 | std=4.54 | range=[0.24, 24.38]
+   🧭 Regime Start Dist (train resets): high_vol=24 (42.9%), low_vol=18 (32.1%), medium_vol=14 (25.0%)
+      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00057_shp0p834_actor.weights.h5 (Sharpe=0.834, MDD=12.88%)
+[CYCLE] Update 50/348 | Step 50,400/500,000 | Episode 64 | Time: 5005.4s
+   📊 Metrics: Return=-7.43% | Sharpe=-0.123 | DD=36.19% | Turnover=27.95%
+   🎚️ Intra-Step TAPE: potential=0.2200 | delta_reward=+0.0000
+   🎯 Profile: BalancedGrowth
+   [BRAIN] Training: actor_loss=0.0969 | critic_loss=0.1137 | mean_adv=-0.0000
+   🧮 Loss Detail: critic_scaled=0.0569 | risk_aux_total=0.0884 | sharpe_proxy=0.0000 | sharpe_loss=0.0000 | mvo_loss=0.0008 | cvar_proxy=2.1882 | cvar_loss=0.0875 | cvar_coef=0.0400
+   ⚙️ Optimizer: actor_lr=0.000030 | critic_lr=0.000150 | target_kl=0.0000 | rollout=1008 | batch_size=252 | gamma=0.9900 | gae_lambda=0.9200
+   🔬 Alpha Diversity: mean=2.97 | std=4.71 | range=[0.29, 23.26]
+   🧭 Regime Start Dist (train resets): high_vol=27 (39.7%), low_vol=24 (35.3%), medium_vol=17 (25.0%)
+      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00068_shp0p897_actor.weights.h5 (Sharpe=0.897, MDD=12.97%)
+      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00069_shp1p005_actor.weights.h5 (Sharpe=1.005, MDD=12.36%)
+      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00078_shp0p962_actor.weights.h5 (Sharpe=0.962, MDD=7.99%)
+[CYCLE] Update 60/348 | Step 60,480/500,000 | Episode 80 | Time: 5998.3s
+   📊 Metrics: Return=+19.73% | Sharpe=0.421 | DD=12.70% | Turnover=35.00%
+   🎯 Profile: BalancedGrowth
+   [BRAIN] Training: actor_loss=0.0829 | critic_loss=0.1243 | mean_adv=0.0000
+   🧮 Loss Detail: critic_scaled=0.0621 | risk_aux_total=0.0713 | sharpe_proxy=0.0000 | sharpe_loss=0.0000 | mvo_loss=0.0006 | cvar_proxy=1.7668 | cvar_loss=0.0707 | cvar_coef=0.0400
+   ⚙️ Optimizer: actor_lr=0.000030 | critic_lr=0.000150 | target_kl=0.0000 | rollout=1008 | batch_size=252 | gamma=0.9900 | gae_lambda=0.9200
+   🔬 Alpha Diversity: mean=3.19 | std=4.24 | range=[0.33, 22.73]
+   🧭 Regime Start Dist (train resets): high_vol=34 (40.5%), low_vol=29 (34.5%), medium_vol=21 (25.0%)
+   🔒 Drawdown λ snapshot=0.580 (peak 0.580, dd 0.00% / trig 21.00%) | terminal=0.000 (peak 0.000) | TAPE=0.2741
+      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00081_shp0p887_actor.weights.h5 (Sharpe=0.887, MDD=11.71%)
+      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00083_shp0p753_actor.weights.h5 (Sharpe=0.753, MDD=11.82%)
+      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00088_shp1p008_actor.weights.h5 (Sharpe=1.008, MDD=6.99%)
+      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00090_shp0p725_actor.weights.h5 (Sharpe=0.725, MDD=12.76%)
+[CYCLE] Update 70/348 | Step 70,560/500,000 | Episode 92 | Time: 6998.0s
+   📊 Metrics: Return=+9.20% | Sharpe=0.142 | DD=12.67% | Turnover=36.41%
+   🎚️ Intra-Step TAPE: potential=0.2493 | delta_reward=-0.0001
+   🎯 Profile: BalancedGrowth
+   [BRAIN] Training: actor_loss=0.0653 | critic_loss=0.0986 | mean_adv=-0.0000
+   🧮 Loss Detail: critic_scaled=0.0493 | risk_aux_total=0.0549 | sharpe_proxy=0.0000 | sharpe_loss=0.0000 | mvo_loss=0.0005 | cvar_proxy=1.3604 | cvar_loss=0.0544 | cvar_coef=0.0400
+   ⚙️ Optimizer: actor_lr=0.000030 | critic_lr=0.000150 | target_kl=0.0000 | rollout=1008 | batch_size=252 | gamma=0.9900 | gae_lambda=0.9200
+   🔬 Alpha Diversity: mean=2.88 | std=3.97 | range=[0.34, 21.61]
+   🧭 Regime Start Dist (train resets): high_vol=38 (39.6%), low_vol=35 (36.5%), medium_vol=23 (24.0%)
+      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00096_shp0p906_actor.weights.h5 (Sharpe=0.906, MDD=12.13%)
+      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00101_shp0p987_actor.weights.h5 (Sharpe=0.987, MDD=7.67%)
+[CYCLE] Update 80/348 | Step 80,640/500,000 | Episode 104 | Time: 7998.6s
+   📊 Metrics: Return=+4.24% | Sharpe=0.003 | DD=22.14% | Turnover=24.22%
+   🎚️ Intra-Step TAPE: potential=0.3341 | delta_reward=+0.0002
+   🎯 Profile: BalancedGrowth
+   [BRAIN] Training: actor_loss=0.0658 | critic_loss=0.0863 | mean_adv=-0.0000
+   🧮 Loss Detail: critic_scaled=0.0431 | risk_aux_total=0.0578 | sharpe_proxy=0.0000 | sharpe_loss=0.0000 | mvo_loss=0.0005 | cvar_proxy=1.4314 | cvar_loss=0.0573 | cvar_coef=0.0400
+   ⚙️ Optimizer: actor_lr=0.000030 | critic_lr=0.000150 | target_kl=0.0000 | rollout=1008 | batch_size=252 | gamma=0.9900 | gae_lambda=0.9200
+   🔬 Alpha Diversity: mean=3.48 | std=4.10 | range=[0.49, 22.41]
+   🧭 Regime Start Dist (train resets): high_vol=42 (38.9%), low_vol=40 (37.0%), medium_vol=26 (24.1%)
+      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00105_shp1p051_actor.weights.h5 (Sharpe=1.051, MDD=7.57%)
+      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00107_shp0p765_actor.weights.h5 (Sharpe=0.765, MDD=12.43%)
+      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00117_shp0p774_actor.weights.h5 (Sharpe=0.774, MDD=7.14%)
+
+📚 EPISODE HORIZON UPDATE at 90,720 steps:
+   Episode horizon: 774 steps
+[CYCLE] Update 90/348 | Step 90,720/500,000 | Episode 120 | Time: 8997.7s
+   📊 Metrics: Return=-3.01% | Sharpe=-0.223 | DD=21.52% | Turnover=28.42%
+   🎯 Profile: BalancedGrowth
+   [BRAIN] Training: actor_loss=0.0606 | critic_loss=0.1742 | mean_adv=-0.0000
+   🧮 Loss Detail: critic_scaled=0.0871 | risk_aux_total=0.0481 | sharpe_proxy=0.0000 | sharpe_loss=0.0000 | mvo_loss=0.0006 | cvar_proxy=1.1873 | cvar_loss=0.0475 | cvar_coef=0.0400
+   ⚙️ Optimizer: actor_lr=0.000030 | critic_lr=0.000150 | target_kl=0.0000 | rollout=1008 | batch_size=252 | gamma=0.9900 | gae_lambda=0.9200
+   🔬 Alpha Diversity: mean=3.44 | std=5.05 | range=[0.34, 24.93]
+   🧭 Regime Start Dist (train resets): high_vol=48 (38.7%), low_vol=46 (37.1%), medium_vol=30 (24.2%)
+   🔒 Drawdown λ snapshot=0.000 (peak 0.000, dd 0.00% / trig 21.00%) | terminal=0.000 (peak 0.001) | TAPE=0.2287
+
+📚 EPISODE HORIZON UPDATE at 91,728 steps:
+   Episode horizon: 800 steps
+
+📚 EPISODE HORIZON UPDATE at 92,736 steps:
+   Episode horizon: 825 steps
+
+📚 EPISODE HORIZON UPDATE at 93,744 steps:
+   Episode horizon: 850 steps
+
+📚 EPISODE HORIZON UPDATE at 94,752 steps:
+   Episode horizon: 876 steps
+
+📚 EPISODE HORIZON UPDATE at 95,760 steps:
+   Episode horizon: 901 steps
+
+📚 EPISODE HORIZON UPDATE at 96,768 steps:
+   Episode horizon: 927 steps
+
+📚 EPISODE HORIZON UPDATE at 97,776 steps:
+   Episode horizon: 952 steps
+
+📚 EPISODE HORIZON UPDATE at 98,784 steps:
+   Episode horizon: 977 steps
+
+📚 EPISODE HORIZON UPDATE at 99,792 steps:
+   Episode horizon: 1003 steps
+
+📚 TURNOVER CURRICULUM UPDATE at 100,800 steps:
+   Turnover penalty scalar: 0.5
+
+📚 EPISODE HORIZON UPDATE at 100,800 steps:
+   Episode horizon: 1008 steps
+[CYCLE] Update 100/348 | Step 100,800/500,000 | Episode 128 | Time: 9991.7s
+   📊 Metrics: Return=+17.00% | Sharpe=0.242 | DD=15.24% | Turnover=27.71%
+   🎚️ Intra-Step TAPE: potential=0.4837 | delta_reward=+0.0001
+   🎯 Profile: BalancedGrowth
+   [BRAIN] Training: actor_loss=0.0977 | critic_loss=0.1498 | mean_adv=0.0000
+   🧮 Loss Detail: critic_scaled=0.0749 | risk_aux_total=0.0856 | sharpe_proxy=0.0000 | sharpe_loss=0.0000 | mvo_loss=0.0009 | cvar_proxy=2.1170 | cvar_loss=0.0847 | cvar_coef=0.0400
+   ⚙️ Optimizer: actor_lr=0.000030 | critic_lr=0.000150 | target_kl=0.0000 | rollout=1008 | batch_size=252 | gamma=0.9900 | gae_lambda=0.9200
+   🔬 Alpha Diversity: mean=3.99 | std=6.26 | range=[0.29, 29.20]
+   🧭 Regime Start Dist (train resets): high_vol=52 (39.4%), low_vol=47 (35.6%), medium_vol=33 (25.0%)
+      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00134_shp0p907_actor.weights.h5 (Sharpe=0.907, MDD=12.14%)
+[CYCLE] Update 110/348 | Step 110,880/500,000 | Episode 140 | Time: 10995.9s
+   📊 Metrics: Return=-8.81% | Sharpe=-0.129 | DD=36.36% | Turnover=19.05%
+   🎚️ Intra-Step TAPE: potential=0.2253 | delta_reward=-0.0000
+   🎯 Profile: BalancedGrowth
+   [BRAIN] Training: actor_loss=0.1009 | critic_loss=0.1402 | mean_adv=-0.0000
+   🧮 Loss Detail: critic_scaled=0.0701 | risk_aux_total=0.0871 | sharpe_proxy=0.0000 | sharpe_loss=0.0000 | mvo_loss=0.0008 | cvar_proxy=2.1572 | cvar_loss=0.0863 | cvar_coef=0.0400
+   ⚙️ Optimizer: actor_lr=0.000030 | critic_lr=0.000150 | target_kl=0.0000 | rollout=1008 | batch_size=252 | gamma=0.9900 | gae_lambda=0.9200
+   🔬 Alpha Diversity: mean=5.21 | std=7.14 | range=[0.38, 29.98]
+   🧭 Regime Start Dist (train resets): high_vol=57 (39.6%), low_vol=51 (35.4%), medium_vol=36 (25.0%)
+   🔒 Drawdown λ snapshot=0.000 (peak 0.000, dd 11.04% / trig 21.00%) | terminal=0.000 (peak 0.516) | TAPE=0.2252
+      💾 Sharpe-threshold checkpoint saved: /content/tcn_tape_vectorized_version_clean/tcn_fusion_results/high_watermark_checkpoints/exp6_tape_hw_ep00141_shp0p888_actor.weights.h5 (Sharpe=0.888, MDD=11.04%)

@@ -2558,6 +2558,12 @@ def run_experiment6_tape(
     else:
         print("   🔓 Drawdown dual controller: disabled (de-constrained mode)")
 
+    # --- Position constraints log ---
+    _max_pos_raw = float(training_params.get('max_single_position', 20.0))
+    _max_pos = _max_pos_raw / 100.0 if _max_pos_raw > 1.0 else _max_pos_raw
+    _min_cash = float(training_params.get('min_cash_position', 0.05))
+    print(f"   📐 Position constraints: max_single_asset={_max_pos:.0%}, min_cash={_min_cash:.0%}")
+
     # --- Regime-balanced sampling: ensure volatility_regime exists and log final status ---
     _regime_sampling_enabled = training_params.get('use_curriculum_learning', False)
     _has_regime_col_pre = 'volatility_regime' in experiment_train_df.columns
@@ -4933,6 +4939,7 @@ def run_experiment6_tape(
         alpha_max_value = update_metrics.get("alpha_max", 0.0)
         alpha_mean_value = update_metrics.get("alpha_mean", 0.0)
         alpha_std_value = update_metrics.get("alpha_std", 0.0)  # Track alpha diversity
+        alpha_per_asset = update_metrics.get("alpha_per_asset", None)  # Per-asset alpha means
         ratio_mean_value = update_metrics.get("ratio_mean", 0.0)
         ratio_std_value = update_metrics.get("ratio_std", 0.0)
 
@@ -5128,6 +5135,16 @@ def run_experiment6_tape(
                     f"std={alpha_std_val:.2f} | "
                     f"range=[{alpha_min_val:.2f}, {alpha_max_val:.2f}]"
                 )
+                # Per-asset alpha breakdown for rotation diagnostics
+                if alpha_per_asset is not None:
+                    import numpy as _np
+                    _pa = _np.asarray(alpha_per_asset).flatten()
+                    _tickers = list(config.get("ASSET_TICKERS", [])) or [f"A{i}" for i in range(len(_pa))]
+                    if len(_tickers) == len(_pa):
+                        _ranked = sorted(zip(_tickers, _pa), key=lambda x: -x[1])
+                        _top3 = " | ".join(f"{t}={a:.2f}" for t, a in _ranked[:3])
+                        _bot3 = " | ".join(f"{t}={a:.2f}" for t, a in _ranked[-3:])
+                        print(f"   🏷️ Alpha Per-Asset  TOP: {_top3}  BOT: {_bot3}")
                 if _regime_sampling_enabled:
                     regime_total_samples, regime_counts = _aggregate_regime_sampling_stats(train_envs)
                     if regime_total_samples > 0 and regime_counts:
