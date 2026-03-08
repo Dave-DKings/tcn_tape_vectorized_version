@@ -519,7 +519,7 @@ PHASE1_CONFIG = {
         "dual_head_eval_deterministic_rho": 0.90,
         "dual_head_eval_stochastic_rho": 0.60,
         "dual_head_projection_use_constraints": False,
-        "dual_head_projection_max_single_position": 0.20,
+        "dual_head_projection_max_single_position": 0.95,
         "dual_head_projection_min_cash_position": 0.05,
 
         # Dirichlet alpha activation (controls action concentration)
@@ -602,7 +602,7 @@ PHASE1_CONFIG = {
         "entropy_coefficient": 0.10,  # Diversification bonus weight (10x stronger for meaningful impact)
         
         # STATE-OF-THE-ART FIX #3: Position Size Constraints
-        "max_single_position": 20.00,  # Maximum allocation to any single asset (20%)
+        "max_single_position": 95.00,  # Effectively uncapped — soft constraints handle concentration
         
         # Alternative: Curriculum schedule for max single position
         # Start strict, relax as agent learns 
@@ -915,7 +915,7 @@ PHASE2_CONFIG = {
         "dual_head_eval_deterministic_rho": 0.90,
         "dual_head_eval_stochastic_rho": 0.60,
         "dual_head_projection_use_constraints": False,
-        "dual_head_projection_max_single_position": 0.20,
+        "dual_head_projection_max_single_position": 0.95,
         "dual_head_projection_min_cash_position": 0.05,
 
         # Dirichlet alpha activation (controls action concentration)
@@ -989,7 +989,7 @@ PHASE2_CONFIG = {
         "entropy_coefficient": 0.10,  # Diversification bonus weight (10x stronger for meaningful impact)
         
         # STATE-OF-THE-ART FIX #3: Position Size Constraints
-        "max_single_position": 20.00,  # Maximum allocation to any single asset (20%)
+        "max_single_position": 95.00,  # Effectively uncapped — soft constraints handle concentration
         "min_cash_position": 0.05,    # Minimum cash buffer (5%)
 
         # STATE-OF-THE-ART FIX #4: Curriculum Learning

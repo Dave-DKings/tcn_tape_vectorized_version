@@ -1151,7 +1151,7 @@ def create_experiment6_result_stub(
         "dual_head_eval_deterministic_rho": 0.90,
         "dual_head_eval_stochastic_rho": 0.60,
         "dual_head_projection_use_constraints": False,
-        "dual_head_projection_max_single_position": 0.20,
+        "dual_head_projection_max_single_position": 0.95,
         "dual_head_projection_min_cash_position": 0.05,
         "max_total_timesteps": max_total_timesteps,
     }
