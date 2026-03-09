@@ -442,8 +442,8 @@ PHASE1_CONFIG = {
             # Apply penalty as soon as drawdown crosses trigger boundary (target + tolerance).
             "penalty_reference": "trigger_boundary",
             # Avoid cooling lambda too aggressively below trigger.
-            "cooling_rate": 0.35,
-            "lambda_carry_decay": 0.7,
+            "cooling_rate": 0.10,
+            "lambda_carry_decay": 0.9,
         }
     },
     #================================================
@@ -832,8 +832,8 @@ PHASE2_CONFIG = {
             "lambda_max": 5.0,
             "tolerance": -0.015,
             "penalty_reference": "trigger_boundary",
-            "cooling_rate": 0.35,
-            "lambda_carry_decay": 0.7,
+            "cooling_rate": 0.10,
+            "lambda_carry_decay": 0.9,
         },
         "drawdown_constraint_overrides": {
             "sequential": {
@@ -843,8 +843,8 @@ PHASE2_CONFIG = {
                 "lambda_max": 5.0,
                 "tolerance": -0.015,
                 "penalty_reference": "trigger_boundary",
-                "cooling_rate": 0.35,
-                "lambda_carry_decay": 0.7,
+                "cooling_rate": 0.10,
+                "lambda_carry_decay": 0.9,
             }
         }
     },

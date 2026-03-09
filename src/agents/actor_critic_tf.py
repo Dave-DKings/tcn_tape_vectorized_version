@@ -1384,12 +1384,16 @@ class TCNFusionActor(DirichletActor):
                 )
                 self.regime_dropout = layers.Dropout(float(max(0.0, regime_conditioning_dropout)))
 
-        # Per-asset FiLM: condition on asset identity for per-asset differentiation
+        # Market-relative FiLM: condition on each asset's relative strength vs peers
+        # Conditioning signal = (asset_tcn_output - market_mean) + identity_embed
+        # This changes with market state, enabling adaptive rotation.
         self.asset_film_layer = None
-        if self.asset_identity_enabled and self.per_asset_alpha_head_enabled:
+        if self.per_asset_alpha_head_enabled:
+            # conditioning_dim = embed_dim (relative signal, optionally + identity)
+            cond_dim = self.fusion_embed_dim
             self.asset_film_layer = FiLMLayer(
                 feature_dim=self.fusion_embed_dim,
-                conditioning_dim=self.fusion_embed_dim,
+                conditioning_dim=cond_dim,
                 hidden_dim=32,
                 dropout=0.05,
                 name=f"{name}_asset_film",
@@ -1615,13 +1619,19 @@ class TCNFusionActor(DirichletActor):
                     if self.regime_dropout is not None:
                         fused = self.regime_dropout(fused, training=training)
 
-        # --- Per-asset FiLM: condition on asset identity for differentiation ---
-        if self.asset_film_layer is not None and self.asset_identity_embed is not None:
+        # --- Market-relative FiLM: condition on relative strength vs peers ---
+        if self.asset_film_layer is not None:
             batch_size = tf.shape(x_assets)[0]
-            identity = tf.tile(self.asset_identity_embed[tf.newaxis, :, :], [batch_size, 1, 1])
+            # Relative signal: how each asset compares to the market average
+            market_mean = tf.reduce_mean(x_assets, axis=1, keepdims=True)  # (batch, 1, embed)
+            relative = x_assets - market_mean  # (batch, num_assets, embed) — changes with market
+            # Add identity embedding if available (knows WHO + HOW it's doing)
+            if self.asset_identity_embed is not None:
+                identity = tf.tile(self.asset_identity_embed[tf.newaxis, :, :], [batch_size, 1, 1])
+                relative = relative + identity
             x_flat = tf.reshape(x_assets, (-1, self.fusion_embed_dim))
-            id_flat = tf.reshape(identity, (-1, self.fusion_embed_dim))
-            x_flat = self.asset_film_layer(x_flat, id_flat, training=training)
+            cond_flat = tf.reshape(relative, (-1, self.fusion_embed_dim))
+            x_flat = self.asset_film_layer(x_flat, cond_flat, training=training)
             x_assets = tf.reshape(x_flat, (batch_size, self.num_assets, self.fusion_embed_dim))
 
         # --- Change 3: Per-asset alpha head OR legacy pooled head ---
