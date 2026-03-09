@@ -1891,7 +1891,7 @@ class PPOAgentTF:
             'alpha_max': 0.0,
             'alpha_mean': 0.0,
             'alpha_std': 0.0,  # Track alpha diversity for TCN learning
-            'alpha_per_asset': np.zeros(self.action_dim, dtype=np.float64),  # Per-asset alpha means
+            'alpha_per_asset': np.zeros(self.num_assets, dtype=np.float64),  # Per-asset alpha means
             # NEW: PPO ratio statistics
             'ratio_mean': 0.0,
             'ratio_std': 0.0,
