@@ -66,6 +66,7 @@ from src.reward_utils import (
     calculate_episode_metrics,
     calculate_tape_score,
     calculate_sharpe_ratio_dsr,  # New: For DSR daily reward
+    calculate_cvar,
     step_level_risk_filter  # Keep for reference, but will be replaced by DSR
 )
 
@@ -368,7 +369,43 @@ class PortfolioEnvTAPE(gym.Env):
         self.dd_regime_low_mult = float(dd_regime_cfg.get('low_mult', 0.9))
         self.dd_regime_mid_mult = float(dd_regime_cfg.get('mid_mult', 1.0))
         self.dd_regime_high_mult = float(dd_regime_cfg.get('high_mult', 1.3))
-        
+
+        # DSR regime scaling (separate from drawdown regime scaling)
+        dsr_regime_cfg = env_params.get('dsr_regime_scaling', {}) if isinstance(env_params.get('dsr_regime_scaling', {}), dict) else {}
+        self.dsr_regime_scaling_enabled = bool(dsr_regime_cfg.get('enabled', False))
+        self.dsr_regime_vol_window = int(dsr_regime_cfg.get('vol_window', 21))
+        self.dsr_regime_low_vol_threshold = float(dsr_regime_cfg.get('low_vol_threshold', 0.12))
+        self.dsr_regime_high_vol_threshold = float(dsr_regime_cfg.get('high_vol_threshold', 0.25))
+        self.dsr_regime_low_pos_mult = float(dsr_regime_cfg.get('low_pos_mult', 1.0))
+        self.dsr_regime_low_neg_mult = float(dsr_regime_cfg.get('low_neg_mult', 0.3))
+        self.dsr_regime_mid_pos_mult = float(dsr_regime_cfg.get('mid_pos_mult', 1.0))
+        self.dsr_regime_mid_neg_mult = float(dsr_regime_cfg.get('mid_neg_mult', 1.0))
+        self.dsr_regime_high_pos_mult = float(dsr_regime_cfg.get('high_pos_mult', 1.5))
+        self.dsr_regime_high_neg_mult = float(dsr_regime_cfg.get('high_neg_mult', 1.5))
+
+        # Outperformance bonus (asymmetric: reward beating equal-weight, don't punish underperformance)
+        self.outperformance_bonus_enabled = bool(env_params.get('outperformance_bonus_enabled', False))
+        self.outperformance_bonus_scalar = float(env_params.get('outperformance_bonus_scalar', 5.0))
+        self._last_equal_weight_return = 0.0
+        self._last_outperformance_bonus = 0.0
+
+        # SPY outperformance bonus (asymmetric: reward beating S&P 500)
+        self.spy_outperformance_bonus_enabled = bool(env_params.get('spy_outperformance_bonus_enabled', False))
+        self.spy_outperformance_bonus_scalar = float(env_params.get('spy_outperformance_bonus_scalar', 3.0))
+        self._last_spy_return = 0.0
+        self._last_spy_outperformance_bonus = 0.0
+
+        # Episode-level regime-CVaR (replaces step-level CVaR aux loss)
+        self.episode_cvar_enabled = bool(env_params.get('episode_cvar_enabled', False))
+        self.episode_cvar_alpha = float(env_params.get('episode_cvar_alpha', 0.05))
+        self.episode_cvar_scalar = float(env_params.get('episode_cvar_scalar', 500.0))
+        self.episode_cvar_min_history = int(max(1, env_params.get('episode_cvar_min_history', 40)))
+        self.episode_cvar_low_vol_boundary = float(env_params.get('episode_cvar_low_vol_boundary', 0.12))
+        self.episode_cvar_high_vol_boundary = float(env_params.get('episode_cvar_high_vol_boundary', 0.25))
+        self.episode_cvar_low_vol_threshold = float(env_params.get('episode_cvar_low_vol_threshold', -0.02))
+        self.episode_cvar_mid_vol_threshold = float(env_params.get('episode_cvar_mid_vol_threshold', -0.015))
+        self.episode_cvar_high_vol_threshold = float(env_params.get('episode_cvar_high_vol_threshold', -0.01))
+
         # Dirichlet concentration parameter (only used if action_normalization='dirichlet')
         self.dirichlet_alpha_scale = config.get('DIRICHLET_ALPHA_SCALE', 1.0)
         
@@ -595,6 +632,54 @@ class PortfolioEnvTAPE(gym.Env):
         
         self.return_matrix = np.array(return_matrix, dtype=np.float32)
         logger.info(f"Return matrix built: shape {self.return_matrix.shape}")
+
+        # Build SPY benchmark return array (for outperformance bonus)
+        self.spy_return_array = self._build_spy_returns(self.dates)
+
+    def _build_spy_returns(self, dates) -> np.ndarray:
+        """
+        Build daily SPY returns aligned to environment dates.
+        Downloads SPY close prices via yfinance if spy_outperformance is enabled.
+        Returns zero array if disabled or data unavailable.
+        """
+        env_params = self.config.get("environment_params", {})
+        if not env_params.get("spy_outperformance_bonus_enabled", False):
+            return np.zeros(len(dates), dtype=np.float32)
+
+        try:
+            import yfinance as yf
+            date_series = pd.to_datetime(dates)
+            start = date_series.min() - pd.Timedelta(days=5)  # buffer for first return
+            end = date_series.max() + pd.Timedelta(days=1)
+            spy = yf.download("SPY", start=start.strftime("%Y-%m-%d"),
+                              end=end.strftime("%Y-%m-%d"), progress=False)
+            if spy.empty:
+                logger.warning("SPY download returned empty DataFrame; using zeros")
+                return np.zeros(len(dates), dtype=np.float32)
+
+            # Handle multi-level columns from yfinance
+            if isinstance(spy.columns, pd.MultiIndex):
+                spy.columns = spy.columns.get_level_values(0)
+
+            spy = spy[["Close"]].copy()
+            spy.index = pd.to_datetime(spy.index).tz_localize(None)
+            spy["spy_return"] = spy["Close"].pct_change().clip(-0.5, 0.5)
+
+            # Align to environment dates
+            spy_returns = np.zeros(len(dates), dtype=np.float32)
+            spy_lookup = spy["spy_return"].to_dict()
+            for i, d in enumerate(dates):
+                dt = pd.Timestamp(d)
+                if dt in spy_lookup and not pd.isna(spy_lookup[dt]):
+                    spy_returns[i] = float(spy_lookup[dt])
+
+            n_matched = int(np.count_nonzero(spy_returns))
+            logger.info(f"SPY returns built: {n_matched}/{len(dates)} dates matched")
+            return spy_returns
+
+        except Exception as e:
+            logger.warning(f"Failed to build SPY returns: {e}; using zeros")
+            return np.zeros(len(dates), dtype=np.float32)
 
     def _resolve_feature_phase(self) -> str:
         """
@@ -1129,7 +1214,15 @@ class PortfolioEnvTAPE(gym.Env):
                 # Scale differential Sharpe to meaningful reward magnitude
                 dsr_component = differential_sharpe * self.dsr_scalar
                 dsr_component = np.nan_to_num(dsr_component, nan=0.0, posinf=10.0, neginf=-10.0)
-            
+
+            # Regime-conditional DSR scaling (asymmetric: separate multipliers for reward vs penalty)
+            if self.dsr_regime_scaling_enabled:
+                pos_mult, neg_mult = self._get_dsr_regime_multiplier()
+                if dsr_component >= 0:
+                    dsr_component *= pos_mult
+                else:
+                    dsr_component *= neg_mult
+
             # ═══════════════════════════════════════════════════════════
             # COMPONENT 3: Turnover Soft Ceiling (One-Sided Penalty)
             # ═══════════════════════════════════════════════════════════
@@ -1153,6 +1246,24 @@ class PortfolioEnvTAPE(gym.Env):
             # ═══════════════════════════════════════════════════════════
             # Combine: Base + DSR Guidance + Turnover Proximity Reward
             final_step_reward = base_reward + dsr_component + turnover_reward
+
+            # Outperformance bonus: asymmetric reward for beating equal-weight
+            outperformance_bonus = 0.0
+            if self.outperformance_bonus_enabled:
+                outperformance = portfolio_return - self._last_equal_weight_return
+                if outperformance > 0:
+                    outperformance_bonus = outperformance * self.outperformance_bonus_scalar * 100.0
+                final_step_reward += outperformance_bonus
+            self._last_outperformance_bonus = outperformance_bonus
+
+            # SPY outperformance bonus: asymmetric reward for beating S&P 500
+            spy_outperformance_bonus = 0.0
+            if self.spy_outperformance_bonus_enabled:
+                spy_outperformance = portfolio_return - self._last_spy_return
+                if spy_outperformance > 0:
+                    spy_outperformance_bonus = spy_outperformance * self.spy_outperformance_bonus_scalar * 100.0
+                final_step_reward += spy_outperformance_bonus
+            self._last_spy_outperformance_bonus = spy_outperformance_bonus
 
             # Optional: small rolling potential-delta shaping for denser learning signal.
             intra_step_delta_reward = 0.0
@@ -1292,8 +1403,15 @@ class PortfolioEnvTAPE(gym.Env):
             tape_score_final = None
             tape_bonus_final = None
             tape_bonus_raw_final = None
+            tape_bonus_core_final = None
             tape_gate_a_triggered = False
             tape_neutral_band_applied = False
+            episode_cvar_bonus = 0.0
+            episode_cvar_regime = "n/a"
+            episode_cvar_value = 0.0
+            episode_cvar_threshold = 0.0
+            episode_cvar_vol_ann = 0.0
+            episode_cvar_passed = None
             if self.reward_system == 'tape':
                 # Calculate episode-level metrics for TAPE scoring
                 episode_metrics = calculate_episode_metrics(
@@ -1331,6 +1449,38 @@ class PortfolioEnvTAPE(gym.Env):
                         terminal_bonus = 0.0
                         tape_neutral_band_applied = True
 
+                tape_bonus_core_final = float(terminal_bonus)
+
+                # Episode-level regime-CVaR: additive terminal penalty/bonus
+                if self.episode_cvar_enabled:
+                    if len(self.episode_return_history) >= self.episode_cvar_min_history:
+                        ep_returns = np.array(self.episode_return_history, dtype=np.float64)
+                        # Compute episode CVaR (average of worst alpha-fraction returns)
+                        episode_cvar_value = float(calculate_cvar(ep_returns, alpha=self.episode_cvar_alpha))
+                        # Determine episode regime from realized vol using dedicated boundaries
+                        episode_cvar_vol_ann = float(np.std(ep_returns) * np.sqrt(252.0))
+                        if episode_cvar_vol_ann >= self.episode_cvar_high_vol_boundary:
+                            episode_cvar_regime = "high"
+                            episode_cvar_threshold = self.episode_cvar_high_vol_threshold
+                        elif episode_cvar_vol_ann <= self.episode_cvar_low_vol_boundary:
+                            episode_cvar_regime = "low"
+                            episode_cvar_threshold = self.episode_cvar_low_vol_threshold
+                        else:
+                            episode_cvar_regime = "mid"
+                            episode_cvar_threshold = self.episode_cvar_mid_vol_threshold
+
+                        # Positive if realized tail risk is better than the regime budget.
+                        episode_cvar_bonus = (
+                            episode_cvar_value - episode_cvar_threshold
+                        ) * self.episode_cvar_scalar
+                        episode_cvar_passed = bool(episode_cvar_value >= episode_cvar_threshold)
+                        terminal_bonus += episode_cvar_bonus
+                    else:
+                        logger.info(
+                            "   Episode CVaR skipped: "
+                            f"history={len(self.episode_return_history)} < min_history={self.episode_cvar_min_history}"
+                        )
+
                 gate_sharpe = float(episode_metrics.get('sharpe_ratio', 0.0))
                 gate_mdd_abs = float(
                     episode_metrics.get(
@@ -1347,29 +1497,35 @@ class PortfolioEnvTAPE(gym.Env):
                         terminal_bonus = -abs(float(terminal_bonus))
                         tape_gate_a_triggered = True
 
-                unclipped_bonus = float(terminal_bonus)
+                tape_bonus_raw_final = float(terminal_bonus)
                 if self.tape_terminal_clip is not None:
                     terminal_bonus = float(np.clip(
                         terminal_bonus,
                         -self.tape_terminal_clip,
                         self.tape_terminal_clip
                     ))
-                    if terminal_bonus != unclipped_bonus:
+                    if terminal_bonus != tape_bonus_raw_final:
                         logger.info(
-                            f"   Terminal bonus clipped from {unclipped_bonus:.2f} "
+                            f"   Terminal bonus clipped from {tape_bonus_raw_final:.2f} "
                             f"to {terminal_bonus:.2f} (clip ±{self.tape_terminal_clip})"
                         )
-                
+
                 # Set terminal reward (no step reward on final step, only bonus)
                 reward = terminal_bonus
                 tape_bonus_final = float(terminal_bonus)
-                tape_bonus_raw_final = float(unclipped_bonus)
-                
+
                 logger.info(f"🎯 TAPE Terminal Bonus")
                 logger.info(
                     f"   Mode={self.tape_terminal_bonus_mode}, baseline={self.tape_terminal_baseline:.2f}, "
-                    f"TAPE Score={tape_score:.4f}, bonus={terminal_bonus:.2f}"
+                    f"TAPE Score={tape_score:.4f}, core={tape_bonus_core_final:.2f}, final={terminal_bonus:.2f}"
                 )
+                if self.episode_cvar_enabled and episode_cvar_passed is not None:
+                    logger.info(
+                        f"   Episode CVaR: regime={episode_cvar_regime}, "
+                        f"vol={episode_cvar_vol_ann:.3f}, CVaR={episode_cvar_value:.5f}, "
+                        f"threshold={episode_cvar_threshold:.5f}, passed={episode_cvar_passed}, "
+                        f"bonus={episode_cvar_bonus:.2f}"
+                    )
                 if tape_neutral_band_applied:
                     logger.info(
                         "   Neutral band applied: "
@@ -1447,6 +1603,7 @@ class PortfolioEnvTAPE(gym.Env):
                 'tape_score': tape_score_final,  # TAPE score 0-1 (or None if simple system)
                 'tape_bonus': tape_bonus_final,
                 'tape_bonus_raw': tape_bonus_raw_final,
+                'tape_bonus_core': tape_bonus_core_final,
                 'tape_terminal_bonus_mode': self.tape_terminal_bonus_mode if self.reward_system == 'tape' else None,
                 'tape_terminal_baseline': float(self.tape_terminal_baseline) if self.reward_system == 'tape' else None,
                 'tape_terminal_neutral_band_enabled': bool(self.tape_terminal_neutral_band_enabled) if self.reward_system == 'tape' else None,
@@ -1455,6 +1612,12 @@ class PortfolioEnvTAPE(gym.Env):
                 'tape_gate_a_triggered': bool(tape_gate_a_triggered),
                 'tape_gate_a_sharpe': float(gate_sharpe) if gate_sharpe is not None else None,
                 'tape_gate_a_max_drawdown_abs': float(gate_mdd_abs) if gate_mdd_abs is not None else None,
+                'episode_cvar_bonus': float(episode_cvar_bonus),
+                'episode_cvar_value': float(episode_cvar_value),
+                'episode_cvar_regime': str(episode_cvar_regime),
+                'episode_cvar_threshold': float(episode_cvar_threshold),
+                'episode_cvar_vol_ann': float(episode_cvar_vol_ann),
+                'episode_cvar_passed': episode_cvar_passed,
                 'intra_step_tape_potential': self.last_intra_step_tape_potential,
                 'intra_step_tape_delta_reward': self.last_intra_step_tape_delta_reward,
                 'termination_reason': 'episode_limit' if limit_hit else 'data_exhausted',
@@ -1610,7 +1773,16 @@ class PortfolioEnvTAPE(gym.Env):
             # TAPE Portfolio Return Formula:
             # portfolio_return = sum(asset_returns * weights)
             portfolio_return = np.sum(all_returns * weights)
-            
+
+            # Equal-weight benchmark return for outperformance bonus
+            self._last_equal_weight_return = float(np.mean(asset_simple_returns))
+
+            # SPY benchmark return for outperformance bonus
+            if self.spy_outperformance_bonus_enabled and self.day < len(self.spy_return_array):
+                self._last_spy_return = float(self.spy_return_array[self.day])
+            else:
+                self._last_spy_return = 0.0
+
             # [HOT] CRITICAL: Check for NaN/Inf in portfolio return
             if np.isnan(portfolio_return) or np.isinf(portfolio_return):
                 logger.error(f"[WARN]  NaN/Inf in portfolio_return! Day: {self.day}")
@@ -1633,7 +1805,9 @@ class PortfolioEnvTAPE(gym.Env):
             # No more data - shouldn't reach here due to termination check
             portfolio_return = 0.0
             new_portfolio_value = self.portfolio_value
-        
+            self._last_equal_weight_return = 0.0
+            self._last_spy_return = 0.0
+
         # ═══════════════════════════════════════════════════════════════
         # STEP 6: APPLY TRANSACTION COSTS
         # ═══════════════════════════════════════════════════════════════
@@ -1792,9 +1966,22 @@ class PortfolioEnvTAPE(gym.Env):
             'drawdown_trigger_boundary': self.drawdown_trigger_boundary if self.drawdown_constraint_enabled else None,
             'drawdown_lambda_peak': self.drawdown_lambda_peak if self.drawdown_constraint_enabled else 0.0,
             'drawdown_regime_multiplier': drawdown_regime_multiplier,
+            'dsr_regime_pos_mult': self._get_dsr_regime_multiplier()[0] if self.dsr_regime_scaling_enabled else 1.0,
+            'dsr_regime_neg_mult': self._get_dsr_regime_multiplier()[1] if self.dsr_regime_scaling_enabled else 1.0,
+            'outperformance_bonus': self._last_outperformance_bonus,
+            'equal_weight_return': self._last_equal_weight_return,
+            'spy_outperformance_bonus': self._last_spy_outperformance_bonus,
+            'spy_return': self._last_spy_return,
+            'episode_cvar_bonus': 0.0,
+            'episode_cvar_value': 0.0,
+            'episode_cvar_regime': "n/a",
+            'episode_cvar_threshold': 0.0,
+            'episode_cvar_vol_ann': 0.0,
+            'episode_cvar_passed': None,
             'tape_score': None,
             'tape_bonus': None,
             'tape_bonus_raw': None,
+            'tape_bonus_core': None,
             'intra_step_tape_potential': self.last_intra_step_tape_potential,
             'intra_step_tape_delta_reward': self.last_intra_step_tape_delta_reward,
             'concentration_hhi': concentration_hhi,
@@ -1882,6 +2069,32 @@ class PortfolioEnvTAPE(gym.Env):
         if realized_vol_ann <= self.dd_regime_low_vol_threshold:
             return self.dd_regime_low_mult
         return self.dd_regime_mid_mult
+
+    def _get_dsr_regime_multiplier(self):
+        """
+        Compute asymmetric regime-aware multipliers for DSR component.
+        Returns (pos_mult, neg_mult) tuple:
+          - pos_mult scales DSR when Sharpe is improving (reward)
+          - neg_mult scales DSR when Sharpe is worsening (penalty)
+        Low vol  -> keep full reward, reduce penalty → encourage rotation
+        High vol -> amplify both → stay defensive
+        """
+        if not self.dsr_regime_scaling_enabled:
+            return (1.0, 1.0)
+
+        returns = np.array(self.return_history[1:], dtype=np.float64)
+        if returns.size == 0:
+            return (self.dsr_regime_mid_pos_mult, self.dsr_regime_mid_neg_mult)
+
+        window = max(1, min(self.dsr_regime_vol_window, returns.size))
+        recent = returns[-window:]
+        realized_vol_ann = float(np.std(recent) * np.sqrt(252.0))
+
+        if realized_vol_ann >= self.dsr_regime_high_vol_threshold:
+            return (self.dsr_regime_high_pos_mult, self.dsr_regime_high_neg_mult)
+        if realized_vol_ann <= self.dsr_regime_low_vol_threshold:
+            return (self.dsr_regime_low_pos_mult, self.dsr_regime_low_neg_mult)
+        return (self.dsr_regime_mid_pos_mult, self.dsr_regime_mid_neg_mult)
 
     def _project_weights_to_constraints(
         self,

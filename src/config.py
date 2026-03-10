@@ -34,7 +34,7 @@ TRAIN_TEST_SPLIT_DATE_COVID_STRESS = "2019-12-31"  # Train: <= 2019-12-31
 TRAIN_TEST_SPLIT_DATE = TRAIN_TEST_SPLIT_DATE_BENCHMARK
 
 # --- ASSET CONFIGURATION ---
-ASSET_TICKERS = ["MSFT", "GOOGL", "JPM", "JNJ", "XOM", "PG", "NEE", "LIN", "CAT", "UNH"] 
+ASSET_TICKERS = ["MSFT", "NVDA", "AMZN", "JPM", "CAT", "XOM", "JNJ", "PG", "GLD", "NEE"]
 NUM_ASSETS = len(ASSET_TICKERS)
 CASH_ASSET_NAME = "CASH"
 
@@ -406,6 +406,16 @@ PHASE1_CONFIG = {
         "tape_terminal_gate_a_enabled": True,
         "tape_terminal_gate_a_sharpe_threshold": 0.0,
         "tape_terminal_gate_a_max_drawdown": 0.25,
+        # Episode-level regime-CVaR: penalize bad tail risk at episode end (replaces step-level CVaR aux)
+        "episode_cvar_enabled": True,
+        "episode_cvar_alpha": 0.05,            # CVaR tail fraction (5% worst returns)
+        "episode_cvar_scalar": 500.0,          # Multiplier for CVaR penalty/bonus
+        "episode_cvar_min_history": 40,        # Skip noisy CVaR estimates on very short episodes
+        "episode_cvar_low_vol_boundary": 0.12, # Annualized vol boundary for low-vol episodes
+        "episode_cvar_high_vol_boundary": 0.25,# Annualized vol boundary for high-vol episodes
+        "episode_cvar_low_vol_threshold": -0.012,  # Calm markets should still keep daily tail losses tight
+        "episode_cvar_mid_vol_threshold": -0.017,  # Moderate tail budget in mixed regimes
+        "episode_cvar_high_vol_threshold": -0.024, # Allow wider tails when realized vol is structurally high
         "target_turnover": 0.60,  # Relax early ceiling; tighten via curriculum as policy stabilizes
         "turnover_penalty_scalar": 2.0,
         "turnover_target_band": 0.20,
@@ -430,6 +440,22 @@ PHASE1_CONFIG = {
             "mid_mult": 1.00,
             "high_mult": 1.35,
         },
+        "dsr_regime_scaling": {
+            "enabled": True,
+            "vol_window": 21,
+            "low_vol_threshold": 0.12,
+            "high_vol_threshold": 0.25,
+            "low_pos_mult": 1.0,   # Low vol: keep full reward for good picks
+            "low_neg_mult": 0.3,   # Low vol: reduce penalty → encourage rotation
+            "mid_pos_mult": 1.0,
+            "mid_neg_mult": 1.0,
+            "high_pos_mult": 1.5,  # High vol: amplify reward for safety
+            "high_neg_mult": 1.5,  # High vol: amplify penalty for risk
+        },
+        "outperformance_bonus_enabled": True,
+        "outperformance_bonus_scalar": 5.0,
+        "spy_outperformance_bonus_enabled": True,
+        "spy_outperformance_bonus_scalar": 3.0,
         "drawdown_constraint": {
             "enabled": True,
             "target": 0.18,
@@ -564,9 +590,9 @@ PHASE1_CONFIG = {
             "risk_aux_cash_return": 0.0,
             "risk_aux_sharpe_coef": 0.0,
             "risk_aux_mvo_coef": 0.0,
-            "risk_aux_cvar_coef": 0.01,
+            "risk_aux_cvar_coef": 0.0,       # DISABLED: step-level CVaR suppresses conviction
             "risk_aux_cvar_alpha": 0.05,
-            "risk_aux_cvar_adaptive_enabled": True,
+            "risk_aux_cvar_adaptive_enabled": False,  # DISABLED: replaced by episode-level regime-CVaR
             "risk_aux_cvar_target": 0.015,
             "risk_aux_cvar_adapt_lr": 0.05,
             "risk_aux_cvar_min_coef": 0.0,
@@ -799,6 +825,16 @@ PHASE2_CONFIG = {
         "tape_terminal_gate_a_enabled": True,
         "tape_terminal_gate_a_sharpe_threshold": 0.0,
         "tape_terminal_gate_a_max_drawdown": 0.25,
+        # Episode-level regime-CVaR: penalize bad tail risk at episode end (replaces step-level CVaR aux)
+        "episode_cvar_enabled": True,
+        "episode_cvar_alpha": 0.05,
+        "episode_cvar_scalar": 500.0,
+        "episode_cvar_min_history": 40,
+        "episode_cvar_low_vol_boundary": 0.12,
+        "episode_cvar_high_vol_boundary": 0.25,
+        "episode_cvar_low_vol_threshold": -0.012,
+        "episode_cvar_mid_vol_threshold": -0.017,
+        "episode_cvar_high_vol_threshold": -0.024,
         "turnover_penalty_scalar": 2.0,
         "turnover_target_band": 0.20,
         "dsr_scalar": 2.0,  # Further reduce PBRS noise while policy is unstable
@@ -822,6 +858,22 @@ PHASE2_CONFIG = {
             "mid_mult": 1.00,
             "high_mult": 1.35,
         },
+        "dsr_regime_scaling": {
+            "enabled": True,
+            "vol_window": 21,
+            "low_vol_threshold": 0.12,
+            "high_vol_threshold": 0.25,
+            "low_pos_mult": 1.0,   # Low vol: keep full reward for good picks
+            "low_neg_mult": 0.3,   # Low vol: reduce penalty → encourage rotation
+            "mid_pos_mult": 1.0,
+            "mid_neg_mult": 1.0,
+            "high_pos_mult": 1.5,  # High vol: amplify reward for safety
+            "high_neg_mult": 1.5,  # High vol: amplify penalty for risk
+        },
+        "outperformance_bonus_enabled": True,
+        "outperformance_bonus_scalar": 5.0,
+        "spy_outperformance_bonus_enabled": True,
+        "spy_outperformance_bonus_scalar": 3.0,
         "drawdown_constraint": {
             "enabled": True,
             "target": 0.18,
@@ -955,9 +1007,9 @@ PHASE2_CONFIG = {
             "risk_aux_cash_return": 0.0,
             "risk_aux_sharpe_coef": 0.0,
             "risk_aux_mvo_coef": 0.0,
-            "risk_aux_cvar_coef": 0.01,
+            "risk_aux_cvar_coef": 0.0,       # DISABLED: step-level CVaR suppresses conviction
             "risk_aux_cvar_alpha": 0.05,
-            "risk_aux_cvar_adaptive_enabled": True,
+            "risk_aux_cvar_adaptive_enabled": False,  # DISABLED: replaced by episode-level regime-CVaR
             "risk_aux_cvar_target": 0.015,
             "risk_aux_cvar_adapt_lr": 0.05,
             "risk_aux_cvar_min_coef": 0.0,
