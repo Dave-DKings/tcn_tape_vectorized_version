@@ -1234,10 +1234,19 @@ RUN5_OVERRIDES = {
 }
 
 
+_DEEP_UPDATE_REPLACE_KEYS = {
+    # Curricula are canonical schedules; merging old thresholds into new ones causes drift.
+    "turnover_penalty_curriculum",
+    "action_execution_beta_curriculum",
+}
+
+
 def _deep_update_config(target: dict, updates: dict) -> dict:
     """Recursively merge config updates into target."""
     for key, value in updates.items():
-        if isinstance(value, dict) and isinstance(target.get(key), dict):
+        if key in _DEEP_UPDATE_REPLACE_KEYS:
+            target[key] = copy.deepcopy(value)
+        elif isinstance(value, dict) and isinstance(target.get(key), dict):
             _deep_update_config(target[key], value)
         else:
             target[key] = copy.deepcopy(value)
@@ -1269,7 +1278,8 @@ RUN9_ALPHA_OVERRIDES = {
         "tcn_kernel_size": 5,
         "tcn_dilations": [1, 2, 4, 8, 16],
         "tcn_dropout": 0.15,
-        "fusion_cross_asset_mixer_enabled": True,
+        # Keep the base self-attention block, but disable the extra mixer stack.
+        "fusion_cross_asset_mixer_enabled": False,
         "fusion_cross_asset_mixer_layers": 1,
         "fusion_cross_asset_mixer_expansion": 2.0,
         "fusion_cross_asset_mixer_dropout": 0.10,
@@ -1284,7 +1294,8 @@ RUN9_ALPHA_OVERRIDES = {
         "distributional_critic_enabled": True,
         "distributional_num_quantiles": 17,
         "dirichlet_alpha_activation": "exp_tanh",
-        "dirichlet_logit_temperature": 1.0,
+        # Match the initial schedule value so the startup banner reflects the live setting.
+        "dirichlet_logit_temperature": 1.2,
         "dirichlet_alpha_cap": 12.0,
         "dirichlet_exp_tanh_scale": 3.5,
         "dirichlet_epsilon": {"max": 0.2, "min": 0.02},
@@ -1298,10 +1309,10 @@ RUN9_ALPHA_OVERRIDES = {
             "value_clip": 0.3,
             "actor_lr": 3e-5,
             "critic_lr": 1.5e-4,
-            "entropy_coef": 0.005,
+            "entropy_coef": 0.003,
             "alpha_diversity_coef": 0.01,
-            "alpha_dispersion_coef": 0.015,
-            "alpha_dispersion_target_std": 0.05,
+            "alpha_dispersion_coef": 0.03,
+            "alpha_dispersion_target_std": 0.07,
             "use_risk_aux_loss": True,
             "risk_aux_return_feature_index": 0,
             "risk_aux_cash_return": 0.0,
@@ -1379,14 +1390,14 @@ RUN9_ALPHA_OVERRIDES = {
             {"threshold": 350_000, "gae_lambda": 0.97},
         ],
         "ppo_entropy_coef_schedule": [
-            {"threshold": 0, "entropy_coef": 0.010},
-            {"threshold": 100_000, "entropy_coef": 0.005},
-            {"threshold": 250_000, "entropy_coef": 0.002},
+            {"threshold": 0, "entropy_coef": 0.003},
+            {"threshold": 100_000, "entropy_coef": 0.002},
+            {"threshold": 250_000, "entropy_coef": 0.0015},
             {"threshold": 400_000, "entropy_coef": 0.001},
         ],
         "dirichlet_temperature_schedule": [
-            {"threshold": 0, "temperature": 1.5},
-            {"threshold": 150_000, "temperature": 1.2},
+            {"threshold": 0, "temperature": 1.2},
+            {"threshold": 150_000, "temperature": 1.1},
             {"threshold": 300_000, "temperature": 1.0},
         ],
         "ra_kl_enabled": False,
@@ -1482,12 +1493,23 @@ def assert_run9_alpha_config(config: dict) -> None:
     assert float(ppo.get("risk_aux_cvar_coef", 0.0)) == 0.0, "step-level CVaR aux must stay off"
     assert not bool(env.get("episode_cvar_enabled", False)), "episode_cvar_enabled must stay off"
     assert bool(ppo.get("lagrangian_cvar_enabled", False)), "lagrangian_cvar_enabled must stay on"
+    assert not bool(agent.get("fusion_cross_asset_mixer_enabled", True)), (
+        "fusion_cross_asset_mixer_enabled must stay off for the canonical alpha run"
+    )
     assert bool(training.get("deterministic_validation_checkpointing_enabled", False)), (
         "deterministic validation must stay enabled"
     )
     assert not bool(training.get("high_watermark_checkpoint_enabled", True)), (
         "legacy high-watermark checkpoints must stay off"
     )
+    assert float(ppo.get("entropy_coef", 1.0)) <= 0.003, "base entropy must stay in the low-entropy regime"
+    assert float(ppo.get("alpha_dispersion_coef", 0.0)) >= 0.03, "alpha_dispersion_coef drifted below the calibrated floor"
+    expected_turnover = copy.deepcopy(RUN9_ALPHA_OVERRIDES["training_params"]["turnover_penalty_curriculum"])
+    actual_turnover = {
+        int(threshold): float(value)
+        for threshold, value in dict(training.get("turnover_penalty_curriculum", {})).items()
+    }
+    assert actual_turnover == expected_turnover, "turnover_penalty_curriculum drifted from the canonical Run9 schedule"
 
 
 def build_run9_alpha_config(
