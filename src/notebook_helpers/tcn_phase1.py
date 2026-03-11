@@ -834,6 +834,8 @@ TRAINING_FIELDNAMES: List[str] = [
     "episode_cvar_regime",
     "episode_cvar_threshold",
     "episode_cvar_passed",
+    "lagrangian_cvar_lambda",
+    "lagrangian_cvar_penalty",
     "outperformance_bonus",
     "equal_weight_return",
     "spy_outperformance_bonus",
@@ -2518,6 +2520,62 @@ def run_experiment6_tape(
     print("   [BRAIN] Credit Assignment: step reward is computed at each environment step")
     print("   [RCPT] Episode-End Handling: terminal TAPE bonus is added at episode completion only")
     print("   [OK] Retroactive episode-wide reward rescaling: disabled in notebook helper path")
+
+    # === SOTA-FIX feature init logging ===
+    _dsr_regime_cfg = env_params.get("dsr_regime_scaling", {})
+    if _dsr_regime_cfg.get("enabled", False):
+        print(
+            f"   🌊 DSR Regime Scaling: ENABLED | "
+            f"low_mult={_dsr_regime_cfg.get('low_mult', 0.3)} (vol<{_dsr_regime_cfg.get('low_vol_threshold', 0.12)}) | "
+            f"mid_mult={_dsr_regime_cfg.get('mid_mult', 1.0)} | "
+            f"high_mult={_dsr_regime_cfg.get('high_mult', 1.5)} (vol>{_dsr_regime_cfg.get('high_vol_threshold', 0.25)})"
+        )
+    else:
+        print("   🌊 DSR Regime Scaling: disabled")
+
+    if env_params.get("outperformance_bonus_enabled", False):
+        print(
+            f"   📈 Outperformance Bonus (1/N): ENABLED | scalar={env_params.get('outperformance_bonus_scalar', 5.0)}"
+        )
+    if env_params.get("spy_outperformance_bonus_enabled", False):
+        print(
+            f"   📈 Outperformance Bonus (SPY): ENABLED | scalar={env_params.get('spy_outperformance_bonus_scalar', 3.0)}"
+        )
+
+    if env_params.get("episode_cvar_enabled", False):
+        print(
+            f"   📊 Episode CVaR: ENABLED | scalar={env_params.get('episode_cvar_scalar', 100.0)} | "
+            f"alpha={env_params.get('episode_cvar_alpha', 0.05)} | min_history={env_params.get('episode_cvar_min_history', 40)}"
+        )
+
+    _conc_scalar = env_params.get("concentration_penalty_scalar", 0.0)
+    _top_wt_scalar = env_params.get("top_weight_penalty_scalar", 0.0)
+    if _conc_scalar > 0 or _top_wt_scalar > 0:
+        print(
+            f"   🎯 Concentration Penalty: HHI scalar={_conc_scalar} (target={env_params.get('concentration_target_hhi', 0.14)}) | "
+            f"top-weight scalar={_top_wt_scalar} (target={env_params.get('target_top_weight', 0.22)})"
+        )
+
+    _ppo_cfg = config.get("agent_params", {}).get("ppo_params", {})
+    if _ppo_cfg.get("lagrangian_cvar_enabled", False):
+        print(
+            f"   🔐 Lagrangian CVaR: ENABLED | threshold={_ppo_cfg.get('lagrangian_cvar_threshold', -0.017)} | "
+            f"lr={_ppo_cfg.get('lagrangian_cvar_lr', 0.01)} | lambda_max={_ppo_cfg.get('lagrangian_cvar_lambda_max', 2.0)}"
+        )
+    else:
+        print("   🔐 Lagrangian CVaR: disabled")
+
+    if _ppo_cfg.get("aux_return_pred_enabled", False):
+        print(f"   🧪 Aux Per-Asset Return Head: ENABLED | coef={_ppo_cfg.get('aux_return_pred_coef', 0.1)}")
+
+    _alpha_cap = config.get("agent_params", {}).get("dirichlet_alpha_cap", None)
+    if _alpha_cap is not None:
+        print(f"   🔒 Dirichlet Alpha Cap: {_alpha_cap}")
+
+    if _ppo_cfg.get("distributional_critic_enabled", False):
+        print(
+            f"   📉 Distributional Critic: ENABLED | quantiles={_ppo_cfg.get('distributional_num_quantiles', 17)}"
+        )
 
     use_episode_length_curriculum = bool(training_params.get("use_episode_length_curriculum", False))
     episode_length_curriculum_smooth_enabled = bool(
@@ -5100,6 +5158,13 @@ def run_experiment6_tape(
                 episode_cvar_val = 0.0
             metrics_for_update = None
 
+            # SOTA-FIX: Lagrangian CVaR constraint — dense per-update adaptive pressure
+            lagrangian_cvar_penalty_val = 0.0
+            lagrangian_cvar_lambda_val = 0.0
+            if hasattr(agent, 'lagrangian_cvar_enabled') and agent.lagrangian_cvar_enabled:
+                lagrangian_cvar_penalty_val = float(agent.update_lagrangian_cvar(episode_cvar_val))
+                lagrangian_cvar_lambda_val = float(agent.lagrangian_cvar_lambda)
+
             actor_loss_val = to_scalar(actor_loss_value)
             critic_loss_val = to_scalar(critic_loss_value)
             critic_loss_scaled_val = to_scalar(critic_loss_scaled_value)
@@ -5295,6 +5360,25 @@ def run_experiment6_tape(
                         f"passed={'✅' if _ep_cvar_passed else '❌'} | bonus={_ep_cvar_bonus:.2f}"
                     )
 
+                # Outperformance bonus visibility (1/N + SPY)
+                _outperf_1n = to_scalar(episode_terminal_info.get("outperformance_bonus", 0.0))
+                _eq_wt_ret = to_scalar(episode_terminal_info.get("equal_weight_return", 0.0))
+                _outperf_spy = to_scalar(episode_terminal_info.get("spy_outperformance_bonus", 0.0))
+                _spy_ret = to_scalar(episode_terminal_info.get("spy_return", 0.0))
+                if abs(_outperf_1n) > 1e-8 or abs(_outperf_spy) > 1e-8:
+                    print(
+                        f"   📈 Outperformance: 1/N bonus={_outperf_1n:.3f} (EW ret={_eq_wt_ret:.5f}) | "
+                        f"SPY bonus={_outperf_spy:.3f} (SPY ret={_spy_ret:.5f})"
+                    )
+
+            # Lagrangian CVaR visibility
+            if lagrangian_cvar_lambda_val > 1e-8 or abs(lagrangian_cvar_penalty_val) > 1e-8:
+                print(
+                    f"   🔐 Lagrangian CVaR: λ={lagrangian_cvar_lambda_val:.4f} | "
+                    f"penalty={lagrangian_cvar_penalty_val:.4f} | "
+                    f"rolling_cvar={episode_cvar_val:.5f}"
+                )
+
             training_row = {
                 "update": update_count,
                 "timestep": step,
@@ -5414,6 +5498,8 @@ def run_experiment6_tape(
                     "episode_cvar_passed": episode_terminal_info.get(
                         "episode_cvar_passed", None
                     ) if episode_terminal_info is not None else None,
+                    "lagrangian_cvar_lambda": lagrangian_cvar_lambda_val,
+                    "lagrangian_cvar_penalty": lagrangian_cvar_penalty_val,
                     "outperformance_bonus": to_scalar(
                         episode_terminal_info.get("outperformance_bonus", 0.0)
                     ) if episode_terminal_info is not None else 0.0,
