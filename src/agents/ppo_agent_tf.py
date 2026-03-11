@@ -1976,7 +1976,9 @@ class PPOAgentTF:
             'alpha_max': 0.0,
             'alpha_mean': 0.0,
             'alpha_std': 0.0,  # Track alpha diversity for TCN learning
-            'alpha_per_asset': np.zeros(self.num_assets, dtype=np.float64),  # Per-asset alpha means
+            # Track risky-asset alpha means only; cash is handled separately in actions
+            # and would break ticker-aligned diagnostics if included here.
+            'alpha_per_asset': np.zeros(self.num_assets, dtype=np.float64),
             # NEW: PPO ratio statistics
             'ratio_mean': 0.0,
             'ratio_std': 0.0,
@@ -2102,7 +2104,8 @@ class PPOAgentTF:
                 stats['alpha_max'] += float(np.max(alpha_batch))
                 stats['alpha_mean'] += float(np.mean(alpha_batch))
                 stats['alpha_std'] += float(np.std(alpha_batch))  # Track alpha diversity
-                stats['alpha_per_asset'] += np.mean(alpha_batch, axis=0).astype(np.float64)  # Per-asset means
+                risky_alpha_batch = alpha_batch[..., :self.num_assets]
+                stats['alpha_per_asset'] += np.mean(risky_alpha_batch, axis=0).astype(np.float64)
                 stats['ratio_mean'] += float(ratio_mean)
                 stats['ratio_std'] += float(ratio_std)
                 stats['approx_kl'] += float(approx_kl)
