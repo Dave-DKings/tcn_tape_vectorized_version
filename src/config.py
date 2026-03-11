@@ -78,7 +78,9 @@ ACTUARIAL_PARAMS = {
     "enabled": True,
     "severity_buckets": [0.05, 0.10, 0.15, 0.20, 0.25, 0.30],
     "development_horizons": [10, 20, 30, 60, 90, 120],
-    "min_events_for_credibility": 5
+    "min_events_for_credibility": 2,       # Reduced from 5 — censored events increase sample size
+    "min_drawdown_depth": 0.03,            # 3% materiality gate — filters microstructure noise
+    "recovery_retracement": 0.50,          # 50% Fibonacci retracement closes an event (partial recovery)
 }
 
 FUNDAMENTAL_FEATURES_CONFIG = {

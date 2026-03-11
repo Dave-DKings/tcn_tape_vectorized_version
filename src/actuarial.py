@@ -56,8 +56,15 @@ class DrawdownReserveEstimator:
             self.params.update(nested_params)
         self.buckets = self.params.get('severity_buckets', [0.05, 0.10, 0.15, 0.20])
         self.horizons = self.params.get('development_horizons', [10, 20, 30, 60, 90, 120])
-        self.min_events = self.params.get('min_events_for_credibility', 5)
+        self.min_events = self.params.get('min_events_for_credibility', 2)
         self.log_optional_dependency_status = bool(self.params.get('log_optional_dependency_status', False))
+
+        # Drawdown event detection parameters
+        # min_drawdown_depth: Only drawdowns deeper than this fraction count as events (filters noise)
+        self.min_drawdown_depth = float(self.params.get('min_drawdown_depth', 0.03))  # 3%
+        # recovery_retracement: Fraction of peak-to-trough recovered to "close" an event
+        # 0.5 = 50% Fibonacci retracement (industry standard partial recovery)
+        self.recovery_retracement = float(self.params.get('recovery_retracement', 0.50))
 
         # Optional dependency handling: keep fallback behavior, avoid warning noise by default.
         if (not LIFELINES_AVAILABLE) and self.log_optional_dependency_status:
@@ -136,38 +143,86 @@ class DrawdownReserveEstimator:
         }
 
     def _extract_drawdown_events(self, prices: pd.Series) -> List[Dict]:
-        """Identify discrete drawdown episodes from price history."""
+        """
+        Identify discrete drawdown episodes from price history.
+
+        State-of-the-art methodology:
+        1. Materiality gate: Only drawdowns exceeding `min_drawdown_depth` (default 3%)
+           are counted as events. Filters market microstructure noise.
+        2. Partial recovery closing: An event is closed when price recovers
+           `recovery_retracement` (default 50%) of the peak-to-trough distance,
+           rather than requiring full recovery to the previous peak.
+        3. Right-censored observations: If a drawdown is still ongoing at the end
+           of the observation window, it is included as a right-censored event
+           (observed=False) for proper Kaplan-Meier fitting.
+        """
         events = []
         peak = prices.iloc[0]
-        peak_date = prices.index[0]
         in_drawdown = False
         start_date = None
-        
+        min_price = peak
+        materialized = False  # True once depth exceeds min_drawdown_depth
+
         for date, price in prices.items():
-            if price >= peak:
-                if in_drawdown:
-                    # Drawdown ended
-                    duration = (date - start_date).days
-                    max_depth = (peak - min_price) / peak
-                    events.append({
-                        'start_date': start_date,
-                        'end_date': date,
-                        'duration': duration,
-                        'max_depth': max_depth,
-                        'peak': peak
-                    })
-                    in_drawdown = False
-                
-                peak = price
-                peak_date = date
-            else:
-                if not in_drawdown:
-                    in_drawdown = True
-                    start_date = date
-                    min_price = price
+            if not in_drawdown:
+                # Check for new peak
+                if price >= peak:
+                    peak = price
                 else:
-                    min_price = min(min_price, price)
-                    
+                    # Price dipped below peak — start tracking
+                    depth = (peak - price) / peak
+                    if depth >= self.min_drawdown_depth:
+                        # Materiality threshold exceeded — start a drawdown event
+                        in_drawdown = True
+                        materialized = True
+                        start_date = date
+                        min_price = price
+            else:
+                # We are inside a drawdown event
+                min_price = min(min_price, price)
+                max_depth = (peak - min_price) / peak
+
+                # Check for recovery: partial retracement of peak-to-trough
+                trough_distance = peak - min_price
+                if trough_distance > 0:
+                    recovery_fraction = (price - min_price) / trough_distance
+                else:
+                    recovery_fraction = 1.0
+
+                # Close event on partial recovery OR full recovery to peak
+                if recovery_fraction >= self.recovery_retracement or price >= peak:
+                    duration = (date - start_date).days
+                    if duration > 0 and max_depth >= self.min_drawdown_depth:
+                        events.append({
+                            'start_date': start_date,
+                            'end_date': date,
+                            'duration': duration,
+                            'max_depth': max_depth,
+                            'peak': peak,
+                            'observed': True,  # Fully observed (recovered)
+                        })
+                    in_drawdown = False
+                    materialized = False
+                    # Update peak if price exceeded it
+                    if price >= peak:
+                        peak = price
+                    min_price = price
+
+        # Right-censored observation: drawdown still ongoing at end of history
+        if in_drawdown and materialized:
+            last_date = prices.index[-1]
+            max_depth = (peak - min_price) / peak
+            duration = (last_date - start_date).days
+            if duration > 0 and max_depth >= self.min_drawdown_depth:
+                events.append({
+                    'start_date': start_date,
+                    'end_date': last_date,
+                    'duration': duration,
+                    'max_depth': max_depth,
+                    'peak': peak,
+                    'observed': False,  # Right-censored (still in drawdown)
+                })
+
         return events
 
     def _fit_severity_cdf(self, max_drawdowns: List[float]) -> Any:
@@ -200,28 +255,51 @@ class DrawdownReserveEstimator:
         return {}
 
     def _fit_survival_models(self, events: List[Dict]) -> Dict:
-        """Fit Kaplan-Meier curves for each severity bucket."""
+        """
+        Fit Kaplan-Meier curves for each severity bucket.
+
+        Properly handles right-censored observations: ongoing drawdowns
+        contribute to the survival estimate ("lasted at least this long")
+        without biasing the recovery time estimate downward.
+        """
         models = {}
-        
-        # Group events by bucket
-        events_by_bucket = defaultdict(list)
+
+        # Group events by bucket, preserving censoring status
+        events_by_bucket = defaultdict(lambda: {'durations': [], 'observed': []})
         for e in events:
             b = self._get_bucket(e['max_depth'])
-            events_by_bucket[b].append(e['duration'])
-            
-        for bucket, durations in events_by_bucket.items():
+            events_by_bucket[b]['durations'].append(e['duration'])
+            events_by_bucket[b]['observed'].append(e.get('observed', True))
+
+        for bucket, data in events_by_bucket.items():
+            durations = data['durations']
+            observed = data['observed']
             if len(durations) < self.min_events:
                 continue
-                
+
             if LIFELINES_AVAILABLE:
                 kmf = KaplanMeierFitter()
-                # All historical events are "observed" (uncensored) for this simple fit
-                kmf.fit(durations, event_observed=[1]*len(durations))
+                # Pass censoring information: observed=True means event completed,
+                # observed=False means right-censored (still in drawdown)
+                kmf.fit(
+                    durations,
+                    event_observed=observed,
+                    label=f"bucket_{bucket:.0%}"
+                )
                 models[bucket] = kmf
             else:
-                # Fallback: Store raw durations to compute simple stats
-                models[bucket] = np.array(durations)
-                
+                # Fallback: store durations + censoring for simple stats
+                models[bucket] = {
+                    'durations': np.array(durations),
+                    'observed': np.array(observed, dtype=bool),
+                }
+
+        n_observed = sum(1 for e in events if e.get('observed', True))
+        n_censored = sum(1 for e in events if not e.get('observed', True))
+        logger.info(
+            f"  Survival models: {len(models)} buckets fitted | "
+            f"{n_observed} observed + {n_censored} censored events"
+        )
         return models
 
     def _predict_recovery_survival(self, bucket: float, days_elapsed: int) -> Dict:
@@ -247,9 +325,18 @@ class DrawdownReserveEstimator:
             expected_days = max(0, median_survival - days_elapsed)
             
         else:
-            # Simple fallback logic
-            durations = model
-            remaining = durations[durations > days_elapsed]
+            # Simple fallback logic (no lifelines)
+            if isinstance(model, dict):
+                durations = model['durations']
+                observed_mask = model.get('observed', np.ones(len(durations), dtype=bool))
+            else:
+                durations = np.asarray(model)
+                observed_mask = np.ones(len(durations), dtype=bool)
+            # Use only observed (completed) events for simple stats
+            completed = durations[observed_mask]
+            if len(completed) == 0:
+                completed = durations  # Fall back to all if no observed events
+            remaining = completed[completed > days_elapsed]
             if len(remaining) == 0:
                 expected_days = 30.0
                 prob_30d = 0.1
