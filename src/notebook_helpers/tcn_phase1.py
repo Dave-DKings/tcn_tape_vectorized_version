@@ -3201,6 +3201,17 @@ def run_experiment6_tape(
             risk_free_rate=0.02,
             trading_days_per_year=252,
         )
+        start_day = int(getattr(env, "episode_start_day", 0))
+        end_day = int(getattr(env, "day", start_day))
+        spy_returns = np.array([], dtype=np.float32)
+        if hasattr(env, "spy_return_array"):
+            spy_start = max(0, start_day + 1)
+            spy_end = max(spy_start, min(end_day + 1, len(env.spy_return_array)))
+            if spy_end > spy_start:
+                spy_returns = np.asarray(env.spy_return_array[spy_start:spy_end], dtype=np.float32)
+        spy_total_return = float(np.prod(1.0 + spy_returns) - 1.0) if spy_returns.size > 0 else 0.0
+        metrics["spy_total_return"] = spy_total_return
+        metrics["spy_outperformance_return"] = float(metrics.get("total_return", 0.0) - spy_total_return)
         metrics["return_skew"] = metrics.get("skewness", metrics.get("return_skew", 0.0))
         return metrics
 
@@ -3545,6 +3556,12 @@ def run_experiment6_tape(
     deterministic_validation_stochastic_sanity_max_sharpe_std_cfg = float(
         max(training_params.get("deterministic_validation_stochastic_sanity_max_sharpe_std", 1.5), 0.0)
     )
+    deterministic_validation_require_spy_outperformance_cfg = bool(
+        training_params.get("deterministic_validation_require_spy_outperformance", False)
+    )
+    deterministic_validation_min_spy_outperformance_cfg = float(
+        training_params.get("deterministic_validation_min_spy_outperformance", 0.0)
+    )
 
     # Legacy routes disabled by default; deterministic validation is now primary selector.
     high_watermark_checkpoint_enabled_cfg = bool(training_params.get("high_watermark_checkpoint_enabled", False))
@@ -3864,6 +3881,8 @@ def run_experiment6_tape(
         val_sharpe = float(to_scalar(val_metrics.get("sharpe_ratio", np.nan)) or np.nan)
         val_mdd = float(to_scalar(val_metrics.get("max_drawdown_abs", np.nan)) or np.nan)
         val_ret = float(to_scalar(val_metrics.get("total_return", np.nan)) or np.nan)
+        val_spy_ret = float(to_scalar(val_metrics.get("spy_total_return", np.nan)) or np.nan)
+        val_spy_outperf = float(to_scalar(val_metrics.get("spy_outperformance_return", np.nan)) or np.nan)
         val_alpha_spread = float(to_scalar(val_metrics.get("validation_alpha_spread", np.nan)) or np.nan)
         val_alpha_std = float(to_scalar(val_metrics.get("validation_alpha_std", np.nan)) or np.nan)
         val_alpha_argmax_uniques = int(to_scalar(val_metrics.get("validation_alpha_argmax_uniques", 0)) or 0)
@@ -3889,6 +3908,12 @@ def run_experiment6_tape(
                 f"score={val_selection_score:.3f} | "
                 f"details={', '.join(horizon_lines)}"
             )
+        if np.isfinite(val_spy_ret) or np.isfinite(val_spy_outperf):
+            print(
+                "         SPY relative: "
+                f"spy_return={val_spy_ret*100.0:+.2f}% | "
+                f"outperformance={val_spy_outperf*100.0:+.2f}%"
+            )
         if np.isfinite(val_alpha_spread):
             print(
                 "         Alpha diagnostics: "
@@ -3904,6 +3929,19 @@ def run_experiment6_tape(
         if not np.isfinite(val_sharpe) or not np.isfinite(val_selection_score):
             return
         if val_sharpe < deterministic_validation_sharpe_min_cfg:
+            return
+        if (
+            deterministic_validation_require_spy_outperformance_cfg
+            and (
+                not np.isfinite(val_spy_outperf)
+                or val_spy_outperf <= deterministic_validation_min_spy_outperformance_cfg
+            )
+        ):
+            print(
+                "         [WARN] SPY gate rejected checkpoint "
+                f"(outperformance={val_spy_outperf*100.0:+.2f}%, "
+                f"required>{deterministic_validation_min_spy_outperformance_cfg*100.0:.2f}%)."
+            )
             return
         if val_selection_score <= (deterministic_validation_best_score + deterministic_validation_sharpe_min_delta_cfg):
             return
@@ -3944,6 +3982,10 @@ def run_experiment6_tape(
                 "step": int(step) if "step" in locals() else None,
                 "sharpe": float(val_sharpe),
                 "validation_return": float(val_ret) if np.isfinite(val_ret) else None,
+                "validation_spy_total_return": float(val_spy_ret) if np.isfinite(val_spy_ret) else None,
+                "validation_spy_outperformance_return": (
+                    float(val_spy_outperf) if np.isfinite(val_spy_outperf) else None
+                ),
                 "validation_max_drawdown_abs": float(val_mdd) if np.isfinite(val_mdd) else None,
                 "validation_alpha_spread": float(val_alpha_spread) if np.isfinite(val_alpha_spread) else None,
                 "validation_alpha_std": float(val_alpha_std) if np.isfinite(val_alpha_std) else None,
@@ -4053,6 +4095,12 @@ def run_experiment6_tape(
             )
         else:
             print("      ↳ Stochastic sanity gate: disabled")
+        if deterministic_validation_require_spy_outperformance_cfg:
+            print(
+                "      ↳ SPY outperformance gate: "
+                f"enabled (required>{deterministic_validation_min_spy_outperformance_cfg*100.0:.2f}% "
+                "over the same validation horizon)"
+            )
     else:
         print("   🏆 Deterministic-validation checkpoints: disabled")
     if deterministic_validation_checkpointing_only_cfg:

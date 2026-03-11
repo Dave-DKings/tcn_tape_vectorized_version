@@ -1311,7 +1311,7 @@ RUN9_ALPHA_OVERRIDES = {
             "critic_lr": 1.5e-4,
             "entropy_coef": 0.003,
             "alpha_diversity_coef": 0.01,
-            "alpha_dispersion_coef": 0.03,
+            "alpha_dispersion_coef": 0.05,
             "alpha_dispersion_target_std": 0.07,
             "use_risk_aux_loss": True,
             "risk_aux_return_feature_index": 0,
@@ -1325,7 +1325,7 @@ RUN9_ALPHA_OVERRIDES = {
             "risk_aux_mvo_long_only": True,
             "risk_aux_mvo_risky_budget": 0.95,
             "aux_return_pred_enabled": True,
-            "aux_return_pred_coef": 0.10,
+            "aux_return_pred_coef": 0.20,
             "lagrangian_cvar_enabled": True,
             "lagrangian_cvar_threshold": -0.025,
             "lagrangian_cvar_lr": 0.004,
@@ -1460,6 +1460,8 @@ RUN9_ALPHA_OVERRIDES = {
         "deterministic_validation_stochastic_sanity_episode_length_limit": 252,
         "deterministic_validation_stochastic_sanity_min_mean_sharpe": 0.0,
         "deterministic_validation_stochastic_sanity_max_sharpe_std": 1.5,
+        "deterministic_validation_require_spy_outperformance": True,
+        "deterministic_validation_min_spy_outperformance": 0.0,
         "high_watermark_checkpoint_enabled": False,
         "step_sharpe_checkpoint_enabled": False,
         "periodic_checkpoint_every_steps": 0,
@@ -1502,8 +1504,12 @@ def assert_run9_alpha_config(config: dict) -> None:
     assert not bool(training.get("high_watermark_checkpoint_enabled", True)), (
         "legacy high-watermark checkpoints must stay off"
     )
+    assert bool(training.get("deterministic_validation_require_spy_outperformance", False)), (
+        "deterministic validation must require SPY outperformance"
+    )
     assert float(ppo.get("entropy_coef", 1.0)) <= 0.003, "base entropy must stay in the low-entropy regime"
-    assert float(ppo.get("alpha_dispersion_coef", 0.0)) >= 0.03, "alpha_dispersion_coef drifted below the calibrated floor"
+    assert float(ppo.get("alpha_dispersion_coef", 0.0)) >= 0.05, "alpha_dispersion_coef drifted below the calibrated floor"
+    assert float(ppo.get("aux_return_pred_coef", 0.0)) >= 0.20, "aux_return_pred_coef drifted below the calibrated floor"
     expected_turnover = copy.deepcopy(RUN9_ALPHA_OVERRIDES["training_params"]["turnover_penalty_curriculum"])
     actual_turnover = {
         int(threshold): float(value)
