@@ -1176,6 +1176,7 @@ class TCNFusionActor(DirichletActor):
         adaptive_temperature_min: float = 0.8,
         adaptive_temperature_max: float = 2.5,
         dual_head_enabled: Optional[bool] = None,
+        aux_return_enabled: bool = False,
         exp_tanh_scale: float = 2.5,
     ):
         if tcn_filters is None:
@@ -1465,18 +1466,17 @@ class TCNFusionActor(DirichletActor):
                 name=f"{name}_output",
             )
 
-        # SOTA-FIX Phase 3: Auxiliary per-asset return prediction head (UNREAL-style)
-        # Forces the backbone to learn asset-discriminative features by predicting
-        # next-step per-asset returns. Gradient flows back through the shared TCN
-        # encoder, giving it direct per-asset supervised signal.
-        # Reference: Jaderberg et al. (2017) — Reinforcement Learning with
-        # Unsupervised Auxiliary Tasks (UNREAL)
-        self._aux_return_enabled = True  # controlled by config at PPO agent level
-        self.aux_return_head = tf.keras.Sequential([
-            layers.Dense(64, activation='relu', name=f'{name}_aux_ret_h1'),
-            layers.Dropout(0.05),
-            layers.Dense(1, activation=None, name=f'{name}_aux_ret_out'),
-        ], name=f'{name}_aux_return_predictor')
+        # Optional per-asset return prediction head. Keep it config-gated so
+        # callers that expect the legacy tensor actor output are unaffected when
+        # the auxiliary loss is disabled.
+        self._aux_return_enabled = bool(aux_return_enabled)
+        self.aux_return_head = None
+        if self._aux_return_enabled:
+            self.aux_return_head = tf.keras.Sequential([
+                layers.Dense(64, activation='relu', name=f'{name}_aux_ret_h1'),
+                layers.Dropout(0.05),
+                layers.Dense(1, activation=None, name=f'{name}_aux_ret_out'),
+            ], name=f'{name}_aux_return_predictor')
 
     def _align_feature_dim(self, x: tf.Tensor) -> tf.Tensor:
         """Pad/slice dynamic feature width so local/context split stays valid."""
@@ -2497,6 +2497,10 @@ def create_actor_critic(architecture: str,
         ),
     }
     dual_head_enabled_cfg = bool(config.get("dual_head_enabled", _DEFAULT_DUAL_HEAD_ENABLED))
+    ppo_params_cfg = config.get("ppo_params", {}) if isinstance(config.get("ppo_params", {}), dict) else {}
+    aux_return_enabled_cfg = bool(
+        config.get("aux_return_pred_enabled", ppo_params_cfg.get("aux_return_pred_enabled", False))
+    )
     if arch_upper == 'TCN':
         if config.get('use_fusion', False):
             resolved_num_assets = int(config.get('num_assets', max(1, num_actions - 1)))
@@ -2525,6 +2529,7 @@ def create_actor_critic(architecture: str,
                 fusion_context_cross_attention_dropout=config.get('fusion_context_cross_attention_dropout', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_DROPOUT),
                 fusion_per_asset_alpha_head=config.get('fusion_per_asset_alpha_head', _DEFAULT_FUSION_PER_ASSET_ALPHA_HEAD),
                 dual_head_enabled=dual_head_enabled_cfg,
+                aux_return_enabled=aux_return_enabled_cfg,
                 **recurrent_kwargs,
                 **regime_kwargs,
                 **epsilon_kwargs,
@@ -2631,6 +2636,7 @@ def create_actor_critic(architecture: str,
             fusion_context_cross_attention_dropout=config.get('fusion_context_cross_attention_dropout', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_DROPOUT),
             fusion_per_asset_alpha_head=config.get('fusion_per_asset_alpha_head', _DEFAULT_FUSION_PER_ASSET_ALPHA_HEAD),
             dual_head_enabled=dual_head_enabled_cfg,
+            aux_return_enabled=aux_return_enabled_cfg,
             exp_tanh_scale=float(config.get('dirichlet_exp_tanh_scale', 2.5)),
             **recurrent_kwargs,
             **regime_kwargs,

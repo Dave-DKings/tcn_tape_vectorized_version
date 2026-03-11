@@ -19,6 +19,18 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _extract_alpha_output(agent, actor_output):
+    """Return the alpha tensor from legacy or structured actor outputs."""
+    if hasattr(agent, "_split_actor_outputs"):
+        alpha, _, _ = agent._split_actor_outputs(actor_output)
+        return alpha
+    if isinstance(actor_output, dict):
+        return actor_output.get("alpha", actor_output.get("dirichlet_alpha", actor_output))
+    if isinstance(actor_output, (tuple, list)) and len(actor_output) > 0:
+        return actor_output[0]
+    return actor_output
+
+
 def diagnose_alpha_distribution(agent, state, verbose=True):
     """
     Check if TCN is learning to discriminate between assets.
@@ -39,7 +51,7 @@ def diagnose_alpha_distribution(agent, state, verbose=True):
         state_tensor = tf.constant([state], dtype=tf.float32)
     
     # Get alpha parameters
-    alpha = agent.actor(state_tensor, training=False)[0].numpy()
+    alpha = _extract_alpha_output(agent, agent.actor(state_tensor, training=False)).numpy()
     
     # Calculate statistics
     stats = {

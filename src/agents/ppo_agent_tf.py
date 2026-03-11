@@ -1716,6 +1716,7 @@ class PPOAgentTF:
             and self.aux_return_pred_coef > 0.0
             and aux_return_preds is not None
         ):
+            actual_returns = None
             # Extract actual per-asset returns from state features (index 0 per asset)
             if isinstance(states, dict):
                 # Structured state: asset tensor is (batch, timesteps, num_assets, features)
@@ -1723,17 +1724,12 @@ class PPOAgentTF:
                 if hasattr(asset_tensor, 'shape') and asset_tensor.shape.rank == 4:
                     # Last timestep, feature index 0 = return proxy
                     actual_returns = asset_tensor[:, -1, :, self.risk_aux_return_feature_index]
-                else:
-                    actual_returns = tf.zeros_like(aux_return_preds)
-            else:
-                # Flat state: extract returns from structured layout
-                actual_returns = tf.zeros_like(aux_return_preds)
-
-            # Clip target to prevent outlier gradients
-            actual_returns = tf.clip_by_value(actual_returns, -0.1, 0.1)
-            aux_return_loss = tf.constant(self.aux_return_pred_coef, dtype=tf.float32) * tf.reduce_mean(
-                tf.square(aux_return_preds - actual_returns)
-            )
+            if actual_returns is not None:
+                # Clip target to prevent outlier gradients
+                actual_returns = tf.clip_by_value(actual_returns, -0.1, 0.1)
+                aux_return_loss = tf.constant(self.aux_return_pred_coef, dtype=tf.float32) * tf.reduce_mean(
+                    tf.square(aux_return_preds - actual_returns)
+                )
 
         total_loss = policy_loss + entropy_loss + risk_aux_total + consistency_loss + diversity_loss + aux_return_loss
         

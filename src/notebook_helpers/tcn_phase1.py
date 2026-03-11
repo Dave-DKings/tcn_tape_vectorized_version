@@ -30,7 +30,7 @@ from src.config import PROFILE_BALANCED_GROWTH, is_sequential_architecture
 from src.csv_logger import CSVLogger
 from src.data_utils import DataProcessor
 from src.environment_tape_rl import PortfolioEnvTAPE
-from src.reward_utils import calculate_episode_metrics
+from src.reward_utils import calculate_cvar, calculate_episode_metrics
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -3625,7 +3625,7 @@ def run_experiment6_tape(
                             alpha_state_input, _ = agent.prepare_state_input(obs_eval)
                         actor_eval_out = agent.actor(alpha_state_input, training=False)
                         if hasattr(agent, "_split_actor_outputs"):
-                            alpha_eval, _ = agent._split_actor_outputs(actor_eval_out)
+                            alpha_eval, _, _ = agent._split_actor_outputs(actor_eval_out)
                         elif isinstance(actor_eval_out, dict):
                             alpha_eval = actor_eval_out.get("alpha", actor_eval_out)
                         elif isinstance(actor_eval_out, (tuple, list)) and len(actor_eval_out) > 0:
@@ -4515,9 +4515,29 @@ def run_experiment6_tape(
     ra_kl_last_error_ratio = 0.0
     ra_kl_last_adjust_factor = 1.0
 
+    def apply_lagrangian_cvar_penalty(active_env: Any, reward_value: float) -> Tuple[float, float, float]:
+        """Apply dense CVaR penalty to the collected reward before it enters GAE."""
+        if not getattr(agent, "lagrangian_cvar_enabled", False):
+            return float(reward_value), 0.0, 0.0
+
+        return_history = getattr(active_env, "episode_return_history", None)
+        if not return_history:
+            return float(reward_value), 0.0, 0.0
+
+        min_history = int(max(1, getattr(active_env, "episode_cvar_min_history", 1)))
+        if len(return_history) < min_history:
+            return float(reward_value), 0.0, 0.0
+
+        alpha = float(getattr(active_env, "episode_cvar_alpha", 0.05))
+        rolling_cvar = float(calculate_cvar(np.asarray(return_history, dtype=np.float64), alpha=alpha))
+        penalty = float(agent.update_lagrangian_cvar(rolling_cvar))
+        return float(reward_value + penalty), penalty, rolling_cvar
+
     while step < max_total_timesteps:
         update_count += 1
         episode_terminal_info = None
+        lagrangian_cvar_penalties_this_update: List[float] = []
+        lagrangian_cvar_values_this_update: List[float] = []
 
         active_timestep_rollout = determine_timesteps_per_update(step)
         active_batch_size_ppo = determine_batch_size_ppo(step, active_timestep_rollout)
@@ -4598,6 +4618,13 @@ def run_experiment6_tape(
 
                     prev_portfolio_value = float(getattr(active_env, "portfolio_value", np.nan))
                     next_obs, reward, done, truncated, info = active_env.step(action)
+                    reward, lagrangian_penalty_step, lagrangian_rolling_cvar_step = apply_lagrangian_cvar_penalty(
+                        active_env,
+                        reward,
+                    )
+                    if abs(lagrangian_penalty_step) > 0.0 or abs(lagrangian_rolling_cvar_step) > 0.0:
+                        lagrangian_cvar_penalties_this_update.append(float(lagrangian_penalty_step))
+                        lagrangian_cvar_values_this_update.append(float(lagrangian_rolling_cvar_step))
                     train_obs[env_idx] = next_obs
                     train_infos[env_idx] = info
                     if env_idx == 0:
@@ -4793,6 +4820,13 @@ def run_experiment6_tape(
             action, log_prob, value = agent.get_action_and_value(obs, deterministic=False)
             prev_portfolio_value = float(getattr(env_train, "portfolio_value", np.nan))
             next_obs, reward, done, truncated, info = env_train.step(action)
+            reward, lagrangian_penalty_step, lagrangian_rolling_cvar_step = apply_lagrangian_cvar_penalty(
+                env_train,
+                reward,
+            )
+            if abs(lagrangian_penalty_step) > 0.0 or abs(lagrangian_rolling_cvar_step) > 0.0:
+                lagrangian_cvar_penalties_this_update.append(float(lagrangian_penalty_step))
+                lagrangian_cvar_values_this_update.append(float(lagrangian_rolling_cvar_step))
 
             agent.store_transition(obs, action, log_prob, reward, value, done)
             obs = next_obs
@@ -5158,12 +5192,15 @@ def run_experiment6_tape(
                 episode_cvar_val = 0.0
             metrics_for_update = None
 
-            # SOTA-FIX: Lagrangian CVaR constraint — dense per-update adaptive pressure
+            # Lagrangian CVaR diagnostics now reflect rollout-time reward shaping.
             lagrangian_cvar_penalty_val = 0.0
             lagrangian_cvar_lambda_val = 0.0
             if hasattr(agent, 'lagrangian_cvar_enabled') and agent.lagrangian_cvar_enabled:
-                lagrangian_cvar_penalty_val = float(agent.update_lagrangian_cvar(episode_cvar_val))
                 lagrangian_cvar_lambda_val = float(agent.lagrangian_cvar_lambda)
+                if lagrangian_cvar_penalties_this_update:
+                    lagrangian_cvar_penalty_val = float(np.mean(lagrangian_cvar_penalties_this_update))
+                    if lagrangian_cvar_values_this_update:
+                        episode_cvar_val = float(lagrangian_cvar_values_this_update[-1])
 
             actor_loss_val = to_scalar(actor_loss_value)
             critic_loss_val = to_scalar(critic_loss_value)
@@ -6325,7 +6362,7 @@ def evaluate_experiment6_checkpoint(
         actor_raw = agent_eval.actor(state_input, training=False)
         projection_logits = None
         if hasattr(agent_eval, "_split_actor_outputs"):
-            alpha, projection_logits = agent_eval._split_actor_outputs(actor_raw)
+            alpha, projection_logits, _ = agent_eval._split_actor_outputs(actor_raw)
         elif isinstance(actor_raw, dict):
             alpha = tf.cast(actor_raw.get("alpha", actor_raw), tf.float32)
             projection_logits = actor_raw.get("projection_logits")

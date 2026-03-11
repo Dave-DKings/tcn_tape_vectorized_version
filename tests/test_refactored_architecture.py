@@ -24,6 +24,12 @@ from src.config import (
 )
 from src.agents.actor_critic_tf import create_actor_critic
 
+
+def _extract_alpha(actor_output):
+    if isinstance(actor_output, dict):
+        return actor_output.get("alpha", actor_output.get("dirichlet_alpha"))
+    return actor_output
+
 print("=" * 80)
 print("REFACTORED ARCHITECTURE SYSTEM - VALIDATION TEST")
 print("=" * 80)
@@ -159,7 +165,7 @@ for arch_name, arch_config in test_configs.items():
             test_input = tf.random.normal((4, input_dim))
         
         # Forward pass
-        alpha = actor(test_input, training=False)
+        alpha = _extract_alpha(actor(test_input, training=False))
         value = critic(test_input, training=False)
         
         assert alpha.shape == (4, num_actions), f"{arch_name} actor shape mismatch"

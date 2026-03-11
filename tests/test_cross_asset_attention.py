@@ -35,6 +35,12 @@ BATCH = 4
 TIMESTEPS = 10
 EMBED_DIM = 128
 
+
+def _extract_alpha(actor_output):
+    if isinstance(actor_output, dict):
+        return actor_output.get("alpha", actor_output.get("dirichlet_alpha"))
+    return actor_output
+
 # =============================================================
 # Test 1: ContextCrossAttentionBlock standalone
 # =============================================================
@@ -82,13 +88,13 @@ asset_tensor = tf.random.normal((BATCH, TIMESTEPS, NUM_ASSETS, PER_ASSET_DIM))
 context_tensor = tf.random.normal((BATCH, TIMESTEPS, GLOBAL_DIM))
 state_dict = {"asset": asset_tensor, "context": context_tensor}
 
-alpha_out = actor(state_dict, training=True)
+alpha_out = _extract_alpha(actor(state_dict, training=True))
 print(f"  Dict input → alpha shape: {alpha_out.shape} (expected: ({BATCH}, {NUM_ACTIONS}))")
 assert alpha_out.shape == (BATCH, NUM_ACTIONS), f"Actor output shape mismatch: {alpha_out.shape}"
 
 # Test with flat tensor input (backward compat)
 flat_state = tf.random.normal((BATCH, TIMESTEPS, INPUT_DIM))
-alpha_flat = actor(flat_state, training=True)
+alpha_flat = _extract_alpha(actor(flat_state, training=True))
 print(f"  Flat input → alpha shape: {alpha_flat.shape} (expected: ({BATCH}, {NUM_ACTIONS}))")
 assert alpha_flat.shape == (BATCH, NUM_ACTIONS), f"Actor flat output shape mismatch: {alpha_flat.shape}"
 
@@ -150,7 +156,7 @@ print("  ✅ TCNFusionCritic v2 works")
 # =============================================================
 print("\n--- Test 4: Gradient Flow Verification ---")
 with tf.GradientTape() as tape:
-    alpha = actor(state_dict, training=True)
+    alpha = _extract_alpha(actor(state_dict, training=True))
     loss = tf.reduce_mean(alpha)
 grads = tape.gradient(loss, actor.trainable_variables)
 

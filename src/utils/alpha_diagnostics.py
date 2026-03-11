@@ -7,6 +7,17 @@ during training and evaluation.
 import tensorflow as tf
 import numpy as np
 
+def _extract_alpha_output(agent, actor_output):
+    """Return the alpha tensor from legacy or structured actor outputs."""
+    if hasattr(agent, "_split_actor_outputs"):
+        alpha, _, _ = agent._split_actor_outputs(actor_output)
+        return alpha
+    if isinstance(actor_output, dict):
+        return actor_output.get("alpha", actor_output.get("dirichlet_alpha", actor_output))
+    if isinstance(actor_output, (tuple, list)) and len(actor_output) > 0:
+        return actor_output[0]
+    return actor_output
+
 def diagnose_alpha_distribution(agent, state, num_samples=1):
     """
     Check if TCN is learning to discriminate between assets.
@@ -31,7 +42,7 @@ def diagnose_alpha_distribution(agent, state, num_samples=1):
         state_tensor = tf.constant([state], dtype=tf.float32)
     
     # Get alpha parameters
-    alpha = agent.actor(state_tensor, training=False)[0].numpy()
+    alpha = _extract_alpha_output(agent, agent.actor(state_tensor, training=False)).numpy()
     
     print(f"\n{'='*80}")
     print(f"📊 ALPHA DISTRIBUTION DIAGNOSTICS")
@@ -89,7 +100,7 @@ if update_num % 10 == 0:
     else:
         state_tensor = tf.constant([sample_state], dtype=tf.float32)
     
-    sample_alpha = agent.actor(state_tensor, training=False)[0].numpy()
+    sample_alpha = _extract_alpha_output(agent, agent.actor(state_tensor, training=False)).numpy()
     
     logger.info(
         f"Update {update_num} - Alpha stats: "
@@ -117,7 +128,7 @@ def analyze_episode_alphas(env, agent, num_steps=None):
         else:
             state_tensor = tf.constant([state], dtype=tf.float32)
         
-        alpha = agent.actor(state_tensor, training=False)[0].numpy()
+        alpha = _extract_alpha_output(agent, agent.actor(state_tensor, training=False)).numpy()
         alpha_history.append(alpha)
         
         # Get action (weights)
