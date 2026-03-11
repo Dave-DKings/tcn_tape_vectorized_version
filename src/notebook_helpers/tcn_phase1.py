@@ -2228,6 +2228,24 @@ def run_experiment6_tape(
         fallback_value=base_ppo_gae_lambda,
     )
 
+    # SOTA-FIX: Entropy coefficient annealing schedule
+    base_entropy_coef = float(ppo_params_root.get("entropy_coef", 0.01))
+    entropy_coef_schedule = _parse_float_schedule(
+        training_params.get("ppo_entropy_coef_schedule", []),
+        value_key="entropy_coef",
+        fallback_value=base_entropy_coef,
+    )
+
+    # SOTA-FIX: Dirichlet temperature annealing schedule
+    base_temperature = float(
+        config.get("agent_params", {}).get("dirichlet_logit_temperature", 1.0)
+    )
+    temperature_schedule = _parse_float_schedule(
+        training_params.get("dirichlet_temperature_schedule", []),
+        value_key="temperature",
+        fallback_value=base_temperature,
+    )
+
     def determine_ppo_gamma(current_step: int) -> float:
         active_gamma = float(gamma_schedule[0]["gamma"])
         for entry in gamma_schedule:
@@ -2245,6 +2263,26 @@ def run_experiment6_tape(
             else:
                 break
         return active_lambda
+
+    def determine_entropy_coef(current_step: int) -> float:
+        """Resolve current entropy coefficient from annealing schedule."""
+        active = float(entropy_coef_schedule[0]["entropy_coef"])
+        for entry in entropy_coef_schedule:
+            if current_step >= int(entry["threshold"]):
+                active = float(entry["entropy_coef"])
+            else:
+                break
+        return active
+
+    def determine_temperature(current_step: int) -> float:
+        """Resolve current Dirichlet temperature from annealing schedule."""
+        active = float(temperature_schedule[0]["temperature"])
+        for entry in temperature_schedule:
+            if current_step >= int(entry["threshold"]):
+                active = float(entry["temperature"])
+            else:
+                break
+        return active
 
     arch_upper = architecture.upper()
     use_attention_flag = bool(config.get("agent_params", {}).get("use_attention", False))
@@ -2973,6 +3011,14 @@ def run_experiment6_tape(
     )
     print(f"   [DOWN] PPO gamma schedule: {gamma_schedule_pretty}")
     print(f"   [DOWN] PPO GAE-λ schedule: {gae_schedule_pretty}")
+    entropy_schedule_pretty = " => ".join(
+        f"{entry['entropy_coef']:.4f}@{entry['threshold']:,}" for entry in entropy_coef_schedule
+    )
+    temp_schedule_pretty = " => ".join(
+        f"{entry['temperature']:.4f}@{entry['threshold']:,}" for entry in temperature_schedule
+    )
+    print(f"   🎯 Entropy coef schedule: {entropy_schedule_pretty}")
+    print(f"   🌡️ Temperature schedule: {temp_schedule_pretty}")
     if len(timestep_update_schedule) > 1:
         rollout_schedule_pretty = " => ".join(
             f"{entry['timesteps_per_update']}@{entry['threshold']:,}"
@@ -4397,8 +4443,13 @@ def run_experiment6_tape(
     current_episode_limit = episode_horizon_start if episode_horizon_start is not None else env_train.total_days
     current_ppo_gamma = float(determine_ppo_gamma(0))
     current_ppo_gae_lambda = float(determine_ppo_gae_lambda(0))
+    current_entropy_coef = float(determine_entropy_coef(0))
+    current_temperature = float(determine_temperature(0))
     agent.gamma = current_ppo_gamma
     agent.gae_lambda = current_ppo_gae_lambda
+    agent.entropy_coef = current_entropy_coef
+    if hasattr(agent.actor, 'set_temperature'):
+        agent.actor.set_temperature(current_temperature)
     current_timestep_rollout = determine_timesteps_per_update(0)
     current_batch_size_ppo = determine_batch_size_ppo(0, current_timestep_rollout)
     update_count = 0
@@ -4433,6 +4484,23 @@ def run_experiment6_tape(
             agent.gae_lambda = current_ppo_gae_lambda
             print(f"\n[DOWN] PPO GAE-λ UPDATE at {step:,} steps:")
             print(f"   gae_lambda: {current_ppo_gae_lambda:.4f}")
+
+        # SOTA-FIX: Entropy coefficient schedule
+        active_entropy_coef = float(determine_entropy_coef(step))
+        if not np.isclose(active_entropy_coef, current_entropy_coef):
+            current_entropy_coef = active_entropy_coef
+            agent.entropy_coef = current_entropy_coef
+            print(f"\n🎯 ENTROPY COEF UPDATE at {step:,} steps:")
+            print(f"   entropy_coef: {current_entropy_coef:.4f}")
+
+        # SOTA-FIX: Dirichlet temperature schedule
+        active_temperature = float(determine_temperature(step))
+        if not np.isclose(active_temperature, current_temperature):
+            current_temperature = active_temperature
+            if hasattr(agent.actor, 'set_temperature'):
+                agent.actor.set_temperature(current_temperature)
+            print(f"\n🌡️ TEMPERATURE UPDATE at {step:,} steps:")
+            print(f"   temperature: {current_temperature:.4f}")
 
         steps_this_update = min(active_timestep_rollout, max_total_timesteps - step)
         precomputed_gae_data: Optional[Tuple[np.ndarray, np.ndarray]] = None

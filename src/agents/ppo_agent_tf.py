@@ -186,6 +186,21 @@ class PPOAgentTF:
         # PERF-FIX #4b: Alpha diversity HHI auxiliary loss coefficient
         self.alpha_diversity_coef = float(ppo_params.get('alpha_diversity_coef', 0.0))
 
+        # SOTA-FIX Phase 3: Auxiliary per-asset return prediction loss coefficient
+        # Forces the backbone to learn asset-discriminative features via supervised signal.
+        # Reference: Jaderberg et al. (2017) — UNREAL
+        self.aux_return_pred_coef = float(ppo_params.get('aux_return_pred_coef', 0.1))
+        self.aux_return_pred_enabled = bool(ppo_params.get('aux_return_pred_enabled', True))
+
+        # SOTA-FIX Phase 3: Lagrangian CVaR constraint
+        # Dense step-level constraint that replaces sparse terminal CVaR bonus.
+        # Reference: Tessler et al. (2019) — Reward Constrained Policy Optimization
+        self.lagrangian_cvar_enabled = bool(ppo_params.get('lagrangian_cvar_enabled', True))
+        self.lagrangian_cvar_threshold = float(ppo_params.get('lagrangian_cvar_threshold', -0.017))
+        self.lagrangian_cvar_lr = float(ppo_params.get('lagrangian_cvar_lr', 0.01))
+        self.lagrangian_cvar_lambda_max = float(ppo_params.get('lagrangian_cvar_lambda_max', 2.0))
+        self._lagrangian_cvar_lambda = 0.0  # adaptive multiplier, starts at 0
+
         # Optional risk-aware actor auxiliary losses (disabled by default).
         # These are additive regularizers intended to improve risk-adjusted robustness.
         self.use_risk_aux_loss = bool(ppo_params.get('use_risk_aux_loss', False))
@@ -892,13 +907,56 @@ class PPOAgentTF:
         new_coef = float(np.clip(new_coef, self.risk_aux_cvar_min_coef, self.risk_aux_cvar_max_coef))
         self.risk_aux_cvar_coef = new_coef
 
+    def update_lagrangian_cvar(self, rolling_cvar: float) -> float:
+        """Update the Lagrangian CVaR multiplier and return the current penalty.
+
+        The multiplier λ automatically increases when the portfolio's rolling CVaR
+        violates the threshold, and decreases when it's satisfied. This provides
+        continuous, adaptive pressure toward tail-risk compliance without distorting
+        the reward magnitude.
+
+        Reference: Tessler et al. (2019) — Reward Constrained Policy Optimization (RCPO)
+
+        Args:
+            rolling_cvar: Current rolling CVaR estimate (negative = bad tail risk)
+
+        Returns:
+            cvar_penalty: Dense penalty to add to step rewards (negative when violating)
+        """
+        if not self.lagrangian_cvar_enabled:
+            return 0.0
+
+        rolling_cvar = float(rolling_cvar)
+        if not np.isfinite(rolling_cvar):
+            return 0.0
+
+        # Positive violation = CVaR worse than threshold
+        violation = self.lagrangian_cvar_threshold - rolling_cvar
+        # Update λ: increase when violating, decrease when satisfying
+        self._lagrangian_cvar_lambda = float(np.clip(
+            self._lagrangian_cvar_lambda + self.lagrangian_cvar_lr * violation,
+            0.0, self.lagrangian_cvar_lambda_max
+        ))
+
+        # Return penalty (only when violating)
+        if rolling_cvar < self.lagrangian_cvar_threshold:
+            return self._lagrangian_cvar_lambda * (rolling_cvar - self.lagrangian_cvar_threshold)
+        return 0.0
+
+    @property
+    def lagrangian_cvar_lambda(self) -> float:
+        """Current Lagrangian CVaR multiplier (diagnostic)."""
+        return self._lagrangian_cvar_lambda
+
     def _split_actor_outputs(self, actor_output):
-        """Return (alpha, projection_logits or None) from backward-compatible actor output."""
+        """Return (alpha, projection_logits or None, aux_return_preds or None) from actor output."""
         projection_logits = None
+        aux_return_preds = None
         alpha = actor_output
         if isinstance(actor_output, dict):
             alpha = actor_output.get("alpha", actor_output.get("dirichlet_alpha", None))
             projection_logits = actor_output.get("projection_logits", actor_output.get("softmax_logits", None))
+            aux_return_preds = actor_output.get("aux_return_preds", None)
         elif isinstance(actor_output, (tuple, list)) and len(actor_output) > 0:
             alpha = actor_output[0]
             if len(actor_output) > 1:
@@ -911,7 +969,9 @@ class PPOAgentTF:
         alpha = tf.maximum(alpha, tf.constant(1e-6, dtype=alpha.dtype))
         if projection_logits is not None:
             projection_logits = _to_tensor_with_cast(projection_logits, tf.float32)
-        return alpha, projection_logits
+        if aux_return_preds is not None:
+            aux_return_preds = _to_tensor_with_cast(aux_return_preds, tf.float32)
+        return alpha, projection_logits, aux_return_preds
 
     def _normalize_simplex(self, weights: tf.Tensor) -> tf.Tensor:
         """Enforce strictly-positive simplex weights."""
@@ -1048,7 +1108,7 @@ class PPOAgentTF:
         
         # Get actor outputs (alpha + optional softmax/projection logits)
         actor_output = self.actor(state_input, training=False)
-        alpha, projection_logits = self._split_actor_outputs(actor_output)
+        alpha, projection_logits, _ = self._split_actor_outputs(actor_output)
         
         # Create Dirichlet distribution
         dirichlet = tfd.Dirichlet(alpha)
@@ -1178,7 +1238,7 @@ class PPOAgentTF:
             states_for_storage = [np.asarray(state, dtype=np.float32) for state in states_list]
 
         actor_output = self.actor(prepared_state, training=False)
-        alpha, projection_logits = self._split_actor_outputs(actor_output)
+        alpha, projection_logits, _ = self._split_actor_outputs(actor_output)
         dirichlet = tfd.Dirichlet(alpha)
 
         if stochastic:
@@ -1585,7 +1645,7 @@ class PPOAgentTF:
         """
         # Get current policy distribution
         actor_output = self.actor(states, training=True)
-        alpha, projection_logits = self._split_actor_outputs(actor_output)
+        alpha, projection_logits, aux_return_preds = self._split_actor_outputs(actor_output)
         
         dirichlet = tfd.Dirichlet(alpha)
         
@@ -1636,17 +1696,46 @@ class PPOAgentTF:
                 tf.constant(self.dual_head_consistency_coef, dtype=tf.float32)
                 * tf.reduce_mean(tf.square(dirichlet_mean - projection_weights))
             )
-        # PERF-FIX #4b: Alpha diversity HHI auxiliary loss
-        # Encourages the Dirichlet to produce concentrated (non-uniform) allocations
-        # by maximizing the Herfindahl-Hirschman Index (HHI) of alpha-implied weights.
+        # SOTA-FIX: Alpha diversity HHI auxiliary loss (anti-concentration)
+        # Penalizes concentrated allocations by adding HHI as a cost.
+        # HHI = 1/N for equal weight (minimum), 1.0 for single-stock (maximum).
+        # For 11 assets: uniform HHI = 0.091, max = 1.0.
         diversity_loss = tf.constant(0.0, dtype=tf.float32)
         if self.alpha_diversity_coef > 0.0:
             alpha_weights = alpha / tf.reduce_sum(alpha, axis=-1, keepdims=True)
             hhi = tf.reduce_sum(tf.square(alpha_weights), axis=-1)  # (batch,)
-            # Negative sign: we WANT high HHI (concentrated), so loss = -coef * mean(HHI)
-            diversity_loss = tf.constant(-self.alpha_diversity_coef, dtype=tf.float32) * tf.reduce_mean(hhi)
+            # Positive sign: PENALIZE high HHI (concentrated), loss = +coef * mean(HHI)
+            diversity_loss = tf.constant(self.alpha_diversity_coef, dtype=tf.float32) * tf.reduce_mean(hhi)
 
-        total_loss = policy_loss + entropy_loss + risk_aux_total + consistency_loss + diversity_loss
+        # --- SOTA-FIX Phase 3: Auxiliary per-asset return prediction loss ---
+        # MSE between predicted per-asset returns and actual per-asset returns
+        # extracted from the state features (first feature per asset = return proxy).
+        aux_return_loss = tf.constant(0.0, dtype=tf.float32)
+        if (
+            self.aux_return_pred_enabled
+            and self.aux_return_pred_coef > 0.0
+            and aux_return_preds is not None
+        ):
+            # Extract actual per-asset returns from state features (index 0 per asset)
+            if isinstance(states, dict):
+                # Structured state: asset tensor is (batch, timesteps, num_assets, features)
+                asset_tensor = states.get("asset", states)
+                if hasattr(asset_tensor, 'shape') and asset_tensor.shape.rank == 4:
+                    # Last timestep, feature index 0 = return proxy
+                    actual_returns = asset_tensor[:, -1, :, self.risk_aux_return_feature_index]
+                else:
+                    actual_returns = tf.zeros_like(aux_return_preds)
+            else:
+                # Flat state: extract returns from structured layout
+                actual_returns = tf.zeros_like(aux_return_preds)
+
+            # Clip target to prevent outlier gradients
+            actual_returns = tf.clip_by_value(actual_returns, -0.1, 0.1)
+            aux_return_loss = tf.constant(self.aux_return_pred_coef, dtype=tf.float32) * tf.reduce_mean(
+                tf.square(aux_return_preds - actual_returns)
+            )
+
+        total_loss = policy_loss + entropy_loss + risk_aux_total + consistency_loss + diversity_loss + aux_return_loss
         
         approx_kl = tf.reduce_mean(log_probs_old - log_probs_new)
         clip_mask = tf.cast(tf.abs(ratio_unclipped - 1.0) > self.policy_clip, tf.float32)
@@ -1992,7 +2081,7 @@ class PPOAgentTF:
                 self.critic_optimizer.apply_gradients(zip(critic_grads, self.critic.trainable_variables))
                 
                 # Get alpha statistics from current batch
-                alpha_batch, _ = self._split_actor_outputs(self.actor(batch_states, training=False))
+                alpha_batch, _, _ = self._split_actor_outputs(self.actor(batch_states, training=False))
                 alpha_batch = alpha_batch.numpy()
                 
                 # Accumulate statistics

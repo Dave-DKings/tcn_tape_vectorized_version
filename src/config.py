@@ -535,7 +535,7 @@ PHASE1_CONFIG = {
         # Optional state augmentation for regime summary features.
         "state_augmentation_enabled": True,
         # Optional distributional critic head.
-        "distributional_critic_enabled": False,      # PERF-FIX #8: disabled — simpler critic learns faster
+        "distributional_critic_enabled": True,       # SOTA-FIX: quantile regression critic learns full return distribution (CVaR baked in)
         "distributional_num_quantiles": 17,
         # Dual-head policy (Dirichlet + softmax/projection).
         "dual_head_enabled": False,
@@ -562,7 +562,7 @@ PHASE1_CONFIG = {
         "dirichlet_adaptive_temperature_slope": 0.0,
         "dirichlet_adaptive_temperature_min": 0.8,
         "dirichlet_adaptive_temperature_max": 2.5,
-        "dirichlet_alpha_cap": 50.0,                 # PERF-FIX #4a: tighter cap (was 100.0)
+        "dirichlet_alpha_cap": 12.0,                 # SOTA-FIX: structural bound on concentration (was 50.0). Still allows 12:1 conviction vs equal-weight.
 
         # Dirichlet exploration (epsilon annealing)
         "dirichlet_epsilon": {
@@ -584,7 +584,7 @@ PHASE1_CONFIG = {
             "max_grad_norm": 0.5, "value_clip": 0.3, "target_kl": 0.0,  # disabled: exp_tanh has naturally larger KL
             "kl_stop_multiplier": 2.0, "minibatches_before_kl_stop": 2,
             # PERF-FIX #4b: Alpha diversity HHI auxiliary loss coefficient
-            "alpha_diversity_coef": 0.01,
+            "alpha_diversity_coef": 0.01,             # SOTA-FIX: HHI anti-concentration penalty (sign corrected)
             # Optional risk-aware actor auxiliaries.
             "use_risk_aux_loss": True,
             # Per-asset feature index used as one-step return proxy in structured state tensor.
@@ -592,10 +592,10 @@ PHASE1_CONFIG = {
             "risk_aux_cash_return": 0.0,
             "risk_aux_sharpe_coef": 0.0,
             "risk_aux_mvo_coef": 0.0,
-            "risk_aux_cvar_coef": 0.0,       # DISABLED: step-level CVaR suppresses conviction
+            "risk_aux_cvar_coef": 0.05,      # SOTA-FIX: activated — gives actor gradient about tail risk
             "risk_aux_cvar_alpha": 0.05,
-            "risk_aux_cvar_adaptive_enabled": False,  # DISABLED: replaced by episode-level regime-CVaR
-            "risk_aux_cvar_target": 0.015,
+            "risk_aux_cvar_adaptive_enabled": True,   # SOTA-FIX: adaptive Lagrangian-style CVaR coefficient
+            "risk_aux_cvar_target": 0.02,
             "risk_aux_cvar_adapt_lr": 0.05,
             "risk_aux_cvar_min_coef": 0.0,
             "risk_aux_cvar_max_coef": 0.08,
@@ -605,6 +605,14 @@ PHASE1_CONFIG = {
             "distributional_huber_kappa": 1.0,
             "distributional_mean_loss_coef": 0.1,
             "dual_head_consistency_coef": 0.0,
+            # SOTA-FIX Phase 3: Auxiliary per-asset return prediction (UNREAL-style)
+            "aux_return_pred_enabled": True,           # Forces backbone asset-discriminative learning
+            "aux_return_pred_coef": 0.10,              # MSE loss weight for aux return prediction
+            # SOTA-FIX Phase 3: Lagrangian CVaR constraint (RCPO)
+            "lagrangian_cvar_enabled": True,            # Dense step-level tail-risk constraint
+            "lagrangian_cvar_threshold": -0.017,        # CVaR floor (mid-regime calibrated)
+            "lagrangian_cvar_lr": 0.01,                 # Multiplier adaptation speed
+            "lagrangian_cvar_lambda_max": 2.0,          # Maximum Lagrangian multiplier
             "popart_enabled": True,
             "popart_min_std": 1e-3,
             "multi_horizon_reward_enabled": True,
@@ -669,6 +677,23 @@ PHASE1_CONFIG = {
             {"threshold": 0,        "gae_lambda": 0.92},
             {"threshold": 150_000,  "gae_lambda": 0.95},
             {"threshold": 350_000,  "gae_lambda": 0.97},
+        ],
+        # SOTA-FIX: Entropy coefficient annealing (SAC-inspired exploration)
+        # High early entropy forces Dirichlet to spread probability across assets,
+        # preventing alpha collapse. Anneals to let the agent exploit learned diversity.
+        "ppo_entropy_coef_schedule": [
+            {"threshold": 0,        "entropy_coef": 0.010},
+            {"threshold": 100_000,  "entropy_coef": 0.005},
+            {"threshold": 250_000,  "entropy_coef": 0.002},
+            {"threshold": 400_000,  "entropy_coef": 0.001},
+        ],
+        # SOTA-FIX: Dirichlet temperature annealing
+        # Temperature > 1 flattens the Dirichlet distribution, forcing diverse
+        # portfolio sampling early. Combined with entropy schedule, powerful anti-collapse.
+        "dirichlet_temperature_schedule": [
+            {"threshold": 0,        "temperature": 1.5},
+            {"threshold": 150_000,  "temperature": 1.2},
+            {"threshold": 300_000,  "temperature": 1.0},
         ],
         # PERF-FIX #2: Actor LR schedule (gentle decay)
         "actor_lr_schedule": [

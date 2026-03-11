@@ -651,6 +651,23 @@ class DirichletActor(Model):
         """Return epsilon to its starting value."""
         self._dirichlet_epsilon.assign(self._epsilon_max_value)
 
+    def set_temperature(self, temperature: float) -> None:
+        """Update the Dirichlet logit temperature at runtime (for schedule-driven annealing).
+
+        Args:
+            temperature: New temperature value. Values > 1 flatten the Dirichlet
+                (encouraging diversity), values < 1 sharpen it (encouraging conviction).
+        """
+        self._logit_temperature = float(max(temperature, 1e-6))
+
+    def set_alpha_cap(self, alpha_cap: float) -> None:
+        """Update the Dirichlet alpha cap at runtime.
+
+        Args:
+            alpha_cap: New alpha cap value. Set to None to disable capping.
+        """
+        self._alpha_cap = float(alpha_cap) if alpha_cap is not None else None
+
     def _compute_alpha(self, logits: tf.Tensor) -> tf.Tensor:
         """
         Apply the selected activation to produce Dirichlet concentration parameters.
@@ -717,20 +734,26 @@ class DirichletActor(Model):
         *,
         logits_for_alpha: tf.Tensor,
         projection_logits: Optional[tf.Tensor] = None,
+        aux_return_preds: Optional[tf.Tensor] = None,
     ):
         """Return backward-compatible actor outputs.
 
-        Single-head mode returns alpha tensor (legacy behavior).
+        Single-head mode returns alpha tensor (legacy behavior) UNLESS aux predictions
+        are available, in which case a dict is returned.
         Dual-head mode returns dict with dirichlet alpha + softmax/projection logits.
         """
         alpha = self._compute_alpha(logits_for_alpha)
-        if not self._dual_head_enabled:
-            return alpha
-        proj_logits = logits_for_alpha if projection_logits is None else projection_logits
-        return {
-            "alpha": alpha,
-            "projection_logits": proj_logits,
-        }
+        # If aux predictions exist OR dual-head is enabled, return structured dict
+        if self._dual_head_enabled or aux_return_preds is not None:
+            proj_logits = logits_for_alpha if projection_logits is None else projection_logits
+            result = {
+                "alpha": alpha,
+                "projection_logits": proj_logits if self._dual_head_enabled else None,
+            }
+            if aux_return_preds is not None:
+                result["aux_return_preds"] = aux_return_preds
+            return result
+        return alpha
 
 
 class TCNActor(DirichletActor):
@@ -1442,6 +1465,19 @@ class TCNFusionActor(DirichletActor):
                 name=f"{name}_output",
             )
 
+        # SOTA-FIX Phase 3: Auxiliary per-asset return prediction head (UNREAL-style)
+        # Forces the backbone to learn asset-discriminative features by predicting
+        # next-step per-asset returns. Gradient flows back through the shared TCN
+        # encoder, giving it direct per-asset supervised signal.
+        # Reference: Jaderberg et al. (2017) — Reinforcement Learning with
+        # Unsupervised Auxiliary Tasks (UNREAL)
+        self._aux_return_enabled = True  # controlled by config at PPO agent level
+        self.aux_return_head = tf.keras.Sequential([
+            layers.Dense(64, activation='relu', name=f'{name}_aux_ret_h1'),
+            layers.Dropout(0.05),
+            layers.Dense(1, activation=None, name=f'{name}_aux_ret_out'),
+        ], name=f'{name}_aux_return_predictor')
+
     def _align_feature_dim(self, x: tf.Tensor) -> tf.Tensor:
         """Pad/slice dynamic feature width so local/context split stays valid."""
         current_dim = tf.shape(x)[-1]
@@ -1634,6 +1670,15 @@ class TCNFusionActor(DirichletActor):
             x_flat = self.asset_film_layer(x_flat, cond_flat, training=training)
             x_assets = tf.reshape(x_flat, (batch_size, self.num_assets, self.fusion_embed_dim))
 
+        # --- SOTA-FIX Phase 3: Auxiliary per-asset return prediction ---
+        # Branch off backbone features BEFORE the alpha head transforms them.
+        # x_assets is (batch, num_assets, embed_dim) after cross-asset attention.
+        aux_preds = None
+        if self._aux_return_enabled and hasattr(self, 'aux_return_head'):
+            # Predict per-asset returns: (batch, num_assets, embed) -> (batch, num_assets, 1) -> (batch, num_assets)
+            aux_preds = self.aux_return_head(tf.stop_gradient(x_assets) if not training else x_assets, training=training)
+            aux_preds = tf.squeeze(aux_preds, axis=-1)  # (batch, num_assets)
+
         # --- Change 3: Per-asset alpha head OR legacy pooled head ---
         if self.per_asset_alpha_head_enabled and self.per_asset_logit_head is not None:
             # x_assets is (batch, num_assets, embed_dim)
@@ -1659,7 +1704,10 @@ class TCNFusionActor(DirichletActor):
                 alpha_features = fused
             logits = self.output_layer(alpha_features, training=training)
 
-        return self._format_actor_output(logits_for_alpha=logits)
+        return self._format_actor_output(
+            logits_for_alpha=logits,
+            aux_return_preds=aux_preds,
+        )
 
 
 # ============================================================================
