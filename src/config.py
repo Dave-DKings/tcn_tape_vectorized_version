@@ -408,8 +408,8 @@ PHASE1_CONFIG = {
         "tape_terminal_gate_a_enabled": True,
         "tape_terminal_gate_a_sharpe_threshold": 0.0,
         "tape_terminal_gate_a_max_drawdown": 0.25,
-        # Episode-level regime-CVaR: penalize bad tail risk at episode end (replaces step-level CVaR aux)
-        "episode_cvar_enabled": True,
+        # Episode-level regime-CVaR: DISABLED — Lagrangian CVaR provides dense per-step tail pressure
+        "episode_cvar_enabled": False,
         "episode_cvar_alpha": 0.05,            # CVaR tail fraction (5% worst returns)
         "episode_cvar_scalar": 100.0,  # Reduced from 500          # Multiplier for CVaR penalty/bonus
         "episode_cvar_min_history": 40,        # Skip noisy CVaR estimates on very short episodes
@@ -592,9 +592,9 @@ PHASE1_CONFIG = {
             "risk_aux_cash_return": 0.0,
             "risk_aux_sharpe_coef": 0.0,
             "risk_aux_mvo_coef": 0.0,
-            "risk_aux_cvar_coef": 0.05,      # SOTA-FIX: activated — gives actor gradient about tail risk
+            "risk_aux_cvar_coef": 0.0,       # DISABLED: distributional critic (17q) provides tail awareness
             "risk_aux_cvar_alpha": 0.05,
-            "risk_aux_cvar_adaptive_enabled": True,   # SOTA-FIX: adaptive Lagrangian-style CVaR coefficient
+            "risk_aux_cvar_adaptive_enabled": False,  # DISABLED: not needed with distributional critic
             "risk_aux_cvar_target": 0.02,
             "risk_aux_cvar_adapt_lr": 0.05,
             "risk_aux_cvar_min_coef": 0.0,
@@ -852,8 +852,8 @@ PHASE2_CONFIG = {
         "tape_terminal_gate_a_enabled": True,
         "tape_terminal_gate_a_sharpe_threshold": 0.0,
         "tape_terminal_gate_a_max_drawdown": 0.25,
-        # Episode-level regime-CVaR: penalize bad tail risk at episode end (replaces step-level CVaR aux)
-        "episode_cvar_enabled": True,
+        # Episode-level regime-CVaR: DISABLED — Lagrangian CVaR provides dense per-step tail pressure
+        "episode_cvar_enabled": False,
         "episode_cvar_alpha": 0.05,
         "episode_cvar_scalar": 100.0,  # Reduced from 500
         "episode_cvar_min_history": 40,
@@ -1036,7 +1036,7 @@ PHASE2_CONFIG = {
             "risk_aux_mvo_coef": 0.0,
             "risk_aux_cvar_coef": 0.0,       # DISABLED: step-level CVaR suppresses conviction
             "risk_aux_cvar_alpha": 0.05,
-            "risk_aux_cvar_adaptive_enabled": False,  # DISABLED: replaced by episode-level regime-CVaR
+            "risk_aux_cvar_adaptive_enabled": False,  # DISABLED: distributional critic + Lagrangian CVaR replace step-level aux
             "risk_aux_cvar_target": 0.015,
             "risk_aux_cvar_adapt_lr": 0.05,
             "risk_aux_cvar_min_coef": 0.0,
