@@ -855,6 +855,8 @@ TRAINING_FIELDNAMES: List[str] = [
     "risk_aux_cvar_proxy",
     "risk_aux_cvar_loss",
     "risk_aux_cvar_coef",
+    "alpha_diversity_loss",
+    "alpha_dispersion_loss",
     "mean_advantage",
     "mean_reward_raw",
     "mean_reward_shaped",
@@ -2560,10 +2562,25 @@ def run_experiment6_tape(
     if _ppo_cfg.get("lagrangian_cvar_enabled", False):
         print(
             f"   🔐 Lagrangian CVaR: ENABLED | threshold={_ppo_cfg.get('lagrangian_cvar_threshold', -0.017)} | "
-            f"lr={_ppo_cfg.get('lagrangian_cvar_lr', 0.01)} | lambda_max={_ppo_cfg.get('lagrangian_cvar_lambda_max', 2.0)}"
+            f"lr={_ppo_cfg.get('lagrangian_cvar_lr', 0.01)} | "
+            f"lambda_max={_ppo_cfg.get('lagrangian_cvar_lambda_max', 2.0)} | "
+            f"penalty_scale={_ppo_cfg.get('lagrangian_cvar_penalty_scale', 1.0)}"
         )
     else:
         print("   🔐 Lagrangian CVaR: disabled")
+
+    if _ppo_cfg.get("cvar_advantage_weight", 0.0) > 0.0:
+        print(
+            f"   Tail-Aware Advantage: ENABLED | weight={_ppo_cfg.get('cvar_advantage_weight', 0.0)} | "
+            f"bottom_k={_ppo_cfg.get('cvar_advantage_k', 4)}"
+        )
+
+    if _ppo_cfg.get("alpha_diversity_coef", 0.0) > 0.0 or _ppo_cfg.get("alpha_dispersion_coef", 0.0) > 0.0:
+        print(
+            f"   Alpha Regularization: hhi_coef={_ppo_cfg.get('alpha_diversity_coef', 0.0)} | "
+            f"dispersion_coef={_ppo_cfg.get('alpha_dispersion_coef', 0.0)} | "
+            f"target_std={_ppo_cfg.get('alpha_dispersion_target_std', 0.05)}"
+        )
 
     if _ppo_cfg.get("aux_return_pred_enabled", False):
         print(f"   🧪 Aux Per-Asset Return Head: ENABLED | coef={_ppo_cfg.get('aux_return_pred_coef', 0.1)}")
@@ -5090,6 +5107,8 @@ def run_experiment6_tape(
         risk_aux_cvar_proxy_value = update_metrics.get("risk_aux_cvar_proxy", 0.0)
         risk_aux_cvar_loss_value = update_metrics.get("risk_aux_cvar_loss", 0.0)
         risk_aux_cvar_coef_value = update_metrics.get("risk_aux_cvar_coef", 0.0)
+        alpha_diversity_loss_value = update_metrics.get("alpha_diversity_loss", 0.0)
+        alpha_dispersion_loss_value = update_metrics.get("alpha_dispersion_loss", 0.0)
         mean_reward_raw_value = update_metrics.get("mean_reward_raw", 0.0)
         mean_reward_shaped_value = update_metrics.get("mean_reward_shaped", 0.0)
         multi_horizon_reward_bonus_mean_value = update_metrics.get("multi_horizon_reward_bonus_mean", 0.0)
@@ -5212,6 +5231,8 @@ def run_experiment6_tape(
             risk_aux_cvar_proxy_val = to_scalar(risk_aux_cvar_proxy_value)
             risk_aux_cvar_loss_val = to_scalar(risk_aux_cvar_loss_value)
             risk_aux_cvar_coef_val = to_scalar(risk_aux_cvar_coef_value)
+            alpha_diversity_loss_val = to_scalar(alpha_diversity_loss_value)
+            alpha_dispersion_loss_val = to_scalar(alpha_dispersion_loss_value)
             mean_reward_raw_val = to_scalar(mean_reward_raw_value)
             mean_reward_shaped_val = to_scalar(mean_reward_shaped_value)
             multi_horizon_reward_bonus_mean_val = to_scalar(multi_horizon_reward_bonus_mean_value)
@@ -5293,7 +5314,9 @@ def run_experiment6_tape(
                 f"mvo_loss={risk_aux_mvo_loss_val:.4f} | "
                 f"cvar_proxy={risk_aux_cvar_proxy_val:.4f} | "
                 f"cvar_loss={risk_aux_cvar_loss_val:.4f} | "
-                f"cvar_coef={risk_aux_cvar_coef_val:.4f}"
+                f"cvar_coef={risk_aux_cvar_coef_val:.4f} | "
+                f"hhi_loss={alpha_diversity_loss_val:.4f} | "
+                f"dispersion_loss={alpha_dispersion_loss_val:.4f}"
             )
             print(
                 f"   ⚙️ Optimizer: actor_lr={agent.get_actor_lr():.6f} | "
@@ -5444,6 +5467,8 @@ def run_experiment6_tape(
                 "risk_aux_cvar_proxy": risk_aux_cvar_proxy_val,
                 "risk_aux_cvar_loss": risk_aux_cvar_loss_val,
                 "risk_aux_cvar_coef": risk_aux_cvar_coef_val,
+                "alpha_diversity_loss": alpha_diversity_loss_val,
+                "alpha_dispersion_loss": alpha_dispersion_loss_val,
                 "mean_advantage": mean_advantage_val,
                 "mean_reward_raw": mean_reward_raw_val,
                 "mean_reward_shaped": mean_reward_shaped_val,

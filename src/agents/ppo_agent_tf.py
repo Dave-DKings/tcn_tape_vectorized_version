@@ -185,6 +185,9 @@ class PPOAgentTF:
         self.minibatches_before_kl_stop = int(ppo_params.get('minibatches_before_kl_stop', 2))
         # PERF-FIX #4b: Alpha diversity HHI auxiliary loss coefficient
         self.alpha_diversity_coef = float(ppo_params.get('alpha_diversity_coef', 0.0))
+        # Run9: penalize near-uniform allocations when cross-asset discrimination collapses.
+        self.alpha_dispersion_coef = float(max(ppo_params.get('alpha_dispersion_coef', 0.0), 0.0))
+        self.alpha_dispersion_target_std = float(max(ppo_params.get('alpha_dispersion_target_std', 0.05), 0.0))
 
         # SOTA-FIX Phase 3: Auxiliary per-asset return prediction loss coefficient
         # Forces the backbone to learn asset-discriminative features via supervised signal.
@@ -199,6 +202,9 @@ class PPOAgentTF:
         self.lagrangian_cvar_threshold = float(ppo_params.get('lagrangian_cvar_threshold', -0.017))
         self.lagrangian_cvar_lr = float(ppo_params.get('lagrangian_cvar_lr', 0.01))
         self.lagrangian_cvar_lambda_max = float(ppo_params.get('lagrangian_cvar_lambda_max', 2.0))
+        self.lagrangian_cvar_penalty_scale = float(
+            max(ppo_params.get('lagrangian_cvar_penalty_scale', 1.0), 0.0)
+        )
         self._lagrangian_cvar_lambda = 0.0  # adaptive multiplier, starts at 0
 
         # Optional risk-aware actor auxiliary losses (disabled by default).
@@ -235,6 +241,9 @@ class PPOAgentTF:
         self.distributional_num_quantiles = int(max(2, config.get('distributional_num_quantiles', 17)))
         self.distributional_huber_kappa = float(max(ppo_params.get('distributional_huber_kappa', 1.0), 1e-3))
         self.distributional_mean_loss_coef = float(max(ppo_params.get('distributional_mean_loss_coef', 0.1), 0.0))
+        # Run9: blend lower-tail critic estimates into the scalar value used for GAE.
+        self.cvar_advantage_weight = float(np.clip(ppo_params.get('cvar_advantage_weight', 0.0), 0.0, 1.0))
+        self.cvar_advantage_k = int(max(1, ppo_params.get('cvar_advantage_k', 4)))
         self.popart_enabled = bool(ppo_params.get('popart_enabled', False))
         self.popart_min_std = float(max(ppo_params.get('popart_min_std', 1e-3), 1e-6))
         self.multi_horizon_reward_enabled = bool(ppo_params.get('multi_horizon_reward_enabled', False))
@@ -762,7 +771,13 @@ class PPOAgentTF:
         if values.shape.rank >= 2:
             last_dim = values.shape[-1]
             if self.distributional_critic_enabled or (last_dim is not None and int(last_dim) > 1):
-                return tf.reduce_mean(values, axis=-1)
+                mean_val = tf.reduce_mean(values, axis=-1)
+                if self.distributional_critic_enabled and self.cvar_advantage_weight > 0.0:
+                    sorted_q = tf.sort(values, axis=-1)
+                    cvar_val = tf.reduce_mean(sorted_q[..., :self.cvar_advantage_k], axis=-1)
+                    blend_weight = tf.constant(self.cvar_advantage_weight, dtype=tf.float32)
+                    return (1.0 - blend_weight) * mean_val + blend_weight * cvar_val
+                return mean_val
         if values.shape.rank >= 2:
             return tf.squeeze(values, axis=-1)
         return tf.squeeze(values, axis=-1)
@@ -940,7 +955,8 @@ class PPOAgentTF:
 
         # Return penalty (only when violating)
         if rolling_cvar < self.lagrangian_cvar_threshold:
-            return self._lagrangian_cvar_lambda * (rolling_cvar - self.lagrangian_cvar_threshold)
+            penalty = self._lagrangian_cvar_lambda * (rolling_cvar - self.lagrangian_cvar_threshold)
+            return self.lagrangian_cvar_penalty_scale * penalty
         return 0.0
 
     @property
@@ -1706,6 +1722,18 @@ class PPOAgentTF:
             hhi = tf.reduce_sum(tf.square(alpha_weights), axis=-1)  # (batch,)
             # Positive sign: PENALIZE high HHI (concentrated), loss = +coef * mean(HHI)
             diversity_loss = tf.constant(self.alpha_diversity_coef, dtype=tf.float32) * tf.reduce_mean(hhi)
+        dispersion_loss = tf.constant(0.0, dtype=tf.float32)
+        if self.alpha_dispersion_coef > 0.0:
+            alpha_weights_disp = alpha / tf.reduce_sum(alpha, axis=-1, keepdims=True)
+            alloc_std = tf.math.reduce_std(alpha_weights_disp, axis=-1)
+            shortfall = tf.maximum(
+                tf.constant(self.alpha_dispersion_target_std, dtype=tf.float32) - alloc_std,
+                0.0,
+            )
+            dispersion_loss = (
+                tf.constant(self.alpha_dispersion_coef, dtype=tf.float32)
+                * tf.reduce_mean(shortfall)
+            )
 
         # --- SOTA-FIX Phase 3: Auxiliary per-asset return prediction loss ---
         # MSE between predicted per-asset returns and actual per-asset returns
@@ -1731,7 +1759,15 @@ class PPOAgentTF:
                     tf.square(aux_return_preds - actual_returns)
                 )
 
-        total_loss = policy_loss + entropy_loss + risk_aux_total + consistency_loss + diversity_loss + aux_return_loss
+        total_loss = (
+            policy_loss
+            + entropy_loss
+            + risk_aux_total
+            + consistency_loss
+            + diversity_loss
+            + dispersion_loss
+            + aux_return_loss
+        )
         
         approx_kl = tf.reduce_mean(log_probs_old - log_probs_new)
         clip_mask = tf.cast(tf.abs(ratio_unclipped - 1.0) > self.policy_clip, tf.float32)
@@ -1752,6 +1788,8 @@ class PPOAgentTF:
             mvo_aux_loss,
             cvar_aux_proxy,
             cvar_aux_loss,
+            diversity_loss,
+            dispersion_loss,
         )
     
     @tf.function(reduce_retracing=True)
@@ -1953,6 +1991,8 @@ class PPOAgentTF:
             'risk_aux_cvar_proxy': 0.0,
             'risk_aux_cvar_loss': 0.0,
             'risk_aux_cvar_coef': float(self.risk_aux_cvar_coef),
+            'alpha_diversity_loss': 0.0,
+            'alpha_dispersion_loss': 0.0,
             'policy_loss': 0.0,
             'entropy_loss': 0.0,
             'entropy': 0.0,
@@ -2043,6 +2083,8 @@ class PPOAgentTF:
                         mvo_aux_loss,
                         cvar_aux_proxy,
                         cvar_aux_loss,
+                        diversity_loss,
+                        dispersion_loss,
                     ) = self._actor_loss(
                         batch_states, batch_actions, batch_log_probs_old, batch_advantages
                     )
@@ -2092,6 +2134,8 @@ class PPOAgentTF:
                 stats['risk_aux_mvo_loss'] += float(mvo_aux_loss)
                 stats['risk_aux_cvar_proxy'] += float(cvar_aux_proxy)
                 stats['risk_aux_cvar_loss'] += float(cvar_aux_loss)
+                stats['alpha_diversity_loss'] += float(diversity_loss)
+                stats['alpha_dispersion_loss'] += float(dispersion_loss)
                 if self.risk_aux_cvar_adaptive_enabled:
                     self._update_adaptive_cvar_coef(float(cvar_aux_proxy))
                 stats['risk_aux_cvar_coef'] = float(self.risk_aux_cvar_coef)
@@ -2149,6 +2193,7 @@ class PPOAgentTF:
             for key in ['actor_loss', 'critic_loss', 'critic_loss_scaled',
                        'risk_aux_total', 'risk_aux_sharpe_proxy', 'risk_aux_sharpe_loss', 'risk_aux_mvo_loss',
                        'risk_aux_cvar_proxy', 'risk_aux_cvar_loss',
+                       'alpha_diversity_loss', 'alpha_dispersion_loss',
                        'policy_loss', 'entropy_loss', 'entropy',
                        'actor_grad_norm', 'critic_grad_norm', 'alpha_min', 'alpha_max', 'alpha_mean', 'alpha_std',
                        'ratio_mean', 'ratio_std', 'approx_kl', 'clip_fraction', 'value_clip_fraction']:

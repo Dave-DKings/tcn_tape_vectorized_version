@@ -585,6 +585,8 @@ PHASE1_CONFIG = {
             "kl_stop_multiplier": 2.0, "minibatches_before_kl_stop": 2,
             # PERF-FIX #4b: Alpha diversity HHI auxiliary loss coefficient
             "alpha_diversity_coef": 0.01,             # SOTA-FIX: HHI anti-concentration penalty (sign corrected)
+            "alpha_dispersion_coef": 0.0,            # Run9: penalize near-uniform allocations (disabled by default)
+            "alpha_dispersion_target_std": 0.05,
             # Optional risk-aware actor auxiliaries.
             "use_risk_aux_loss": True,
             # Per-asset feature index used as one-step return proxy in structured state tensor.
@@ -613,6 +615,9 @@ PHASE1_CONFIG = {
             "lagrangian_cvar_threshold": -0.017,        # CVaR floor (mid-regime calibrated)
             "lagrangian_cvar_lr": 0.01,                 # Multiplier adaptation speed
             "lagrangian_cvar_lambda_max": 2.0,          # Maximum Lagrangian multiplier
+            "lagrangian_cvar_penalty_scale": 1.0,       # Run9: scale dense CVaR penalty before reward normalization
+            "cvar_advantage_weight": 0.0,               # Run9: blend lower-tail critic estimate into GAE baseline
+            "cvar_advantage_k": 4,
             "popart_enabled": True,
             "popart_min_std": 1e-3,
             "multi_horizon_reward_enabled": True,
@@ -1030,6 +1035,8 @@ PHASE2_CONFIG = {
             "kl_stop_multiplier": 1.2, "minibatches_before_kl_stop": 1,
             # Optional risk-aware actor auxiliaries.
             "use_risk_aux_loss": True,
+            "alpha_dispersion_coef": 0.0,
+            "alpha_dispersion_target_std": 0.05,
             "risk_aux_return_feature_index": 0,
             "risk_aux_cash_return": 0.0,
             "risk_aux_sharpe_coef": 0.0,
@@ -1046,6 +1053,9 @@ PHASE2_CONFIG = {
             "risk_aux_mvo_risky_budget": 0.95,
             "distributional_huber_kappa": 1.0,
             "distributional_mean_loss_coef": 0.1,
+            "lagrangian_cvar_penalty_scale": 1.0,
+            "cvar_advantage_weight": 0.0,
+            "cvar_advantage_k": 4,
             "dual_head_consistency_coef": 0.0,
             "popart_enabled": True,
             "popart_min_std": 1e-3,
@@ -1222,6 +1232,278 @@ RUN5_OVERRIDES = {
     "drawdown_constraint_target": 0.20,
     "drawdown_constraint_tolerance": -0.01,
 }
+
+
+def _deep_update_config(target: dict, updates: dict) -> dict:
+    """Recursively merge config updates into target."""
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_update_config(target[key], value)
+        else:
+            target[key] = copy.deepcopy(value)
+    return target
+
+
+def enforce_feature_audit_plan(config: dict) -> dict:
+    """Ensure the active feature allowlist remains the canonical notebook view."""
+    feature_params = config.setdefault("feature_params", {})
+    feature_selection = feature_params.setdefault("feature_selection", {})
+    feature_selection["enforce_allowlist"] = True
+    feature_selection["allowlist_apply_to_phase2"] = False
+    allowlist = list(dict.fromkeys(feature_selection.get("active_features_allowlist", []) or []))
+    feature_selection["active_features_allowlist"] = allowlist
+    return config
+
+
+RUN9_ALPHA_OVERRIDES = {
+    "TRAIN_TEST_SPLIT_DATE": TRAIN_TEST_SPLIT_DATE_COVID_STRESS,
+    "feature_params": {
+        "fundamental_features": {"enabled": False},
+        "actuarial_params": {"enabled": True},
+    },
+    "agent_params": {
+        "actor_critic_type": "TCN_FUSION",
+        "use_attention": False,
+        "use_fusion": True,
+        "tcn_filters": [64, 96, 128, 128, 128],
+        "tcn_kernel_size": 5,
+        "tcn_dilations": [1, 2, 4, 8, 16],
+        "tcn_dropout": 0.15,
+        "fusion_cross_asset_mixer_enabled": True,
+        "fusion_cross_asset_mixer_layers": 1,
+        "fusion_cross_asset_mixer_expansion": 2.0,
+        "fusion_cross_asset_mixer_dropout": 0.10,
+        "fusion_asset_identity_enabled": True,
+        "fusion_context_cross_attention_enabled": False,
+        "fusion_per_asset_alpha_head": True,
+        "fusion_alpha_head_hidden_dims": [128, 64],
+        "fusion_alpha_head_dropout": 0.05,
+        "recurrent_memory_enabled": False,
+        "regime_conditioning_enabled": False,
+        "state_augmentation_enabled": False,
+        "distributional_critic_enabled": True,
+        "distributional_num_quantiles": 17,
+        "dirichlet_alpha_activation": "exp_tanh",
+        "dirichlet_logit_temperature": 1.0,
+        "dirichlet_alpha_cap": 12.0,
+        "dirichlet_exp_tanh_scale": 3.5,
+        "dirichlet_epsilon": {"max": 0.2, "min": 0.02},
+        "ppo_params": {
+            "num_ppo_epochs": 3,
+            "policy_clip": 0.15,
+            "target_kl": 0.0,
+            "kl_stop_multiplier": 2.0,
+            "minibatches_before_kl_stop": 2,
+            "max_grad_norm": 0.50,
+            "value_clip": 0.3,
+            "actor_lr": 3e-5,
+            "critic_lr": 1.5e-4,
+            "entropy_coef": 0.005,
+            "alpha_diversity_coef": 0.01,
+            "alpha_dispersion_coef": 0.015,
+            "alpha_dispersion_target_std": 0.05,
+            "use_risk_aux_loss": True,
+            "risk_aux_return_feature_index": 0,
+            "risk_aux_cash_return": 0.0,
+            "risk_aux_sharpe_coef": 0.0,
+            "risk_aux_mvo_coef": 0.0,
+            "risk_aux_cvar_coef": 0.0,
+            "risk_aux_cvar_alpha": 0.05,
+            "risk_aux_cvar_adaptive_enabled": False,
+            "risk_aux_mvo_cov_ridge": 1e-3,
+            "risk_aux_mvo_long_only": True,
+            "risk_aux_mvo_risky_budget": 0.95,
+            "aux_return_pred_enabled": True,
+            "aux_return_pred_coef": 0.10,
+            "lagrangian_cvar_enabled": True,
+            "lagrangian_cvar_threshold": -0.025,
+            "lagrangian_cvar_lr": 0.004,
+            "lagrangian_cvar_lambda_max": 5.0,
+            "lagrangian_cvar_penalty_scale": 5.0,
+            "cvar_advantage_weight": 0.10,
+            "cvar_advantage_k": 4,
+            "popart_enabled": True,
+            "popart_min_std": 1e-3,
+            "multi_horizon_reward_enabled": False,
+            "multi_horizon_reward_coef": 0.0,
+        },
+    },
+    "environment_params": {
+        "target_turnover": 0.35,
+        "turnover_penalty_scalar": 0.05,
+        "transaction_cost_pct": 0.001,
+        "concentration_penalty_scalar": 0.0,
+        "top_weight_penalty_scalar": 0.0,
+        "action_realization_penalty_scalar": 0.5,
+        "target_top_weight": 0.30,
+        "penalty_budget_ratio": 1.0,
+        "outperformance_bonus_enabled": False,
+        "spy_outperformance_bonus_enabled": True,
+        "spy_outperformance_bonus_scalar": 3.0,
+        "episode_cvar_enabled": False,
+        "drawdown_constraint": {
+            "target": 0.15,
+            "tolerance": -0.01,
+            "penalty_coef": 2.5,
+            "lambda_init": 0.10,
+            "lambda_carry_decay": 0.4,
+        },
+    },
+    "training_params": {
+        "max_total_timesteps": 500_000,
+        "timesteps_per_ppo_update": 1008,
+        "num_parallel_envs": 4,
+        "timesteps_per_ppo_update_schedule": [
+            {"threshold": 0, "timesteps_per_update": 1008},
+            {"threshold": 150_000, "timesteps_per_update": 1512},
+            {"threshold": 300_000, "timesteps_per_update": 2016},
+        ],
+        "batch_size_ppo_schedule": [
+            {"threshold": 0, "batch_size": 252},
+            {"threshold": 150_000, "batch_size": 336},
+            {"threshold": 300_000, "batch_size": 504},
+        ],
+        "actor_lr_schedule": [
+            {"threshold": 0, "lr": 3e-5},
+            {"threshold": 150_000, "lr": 2e-5},
+            {"threshold": 350_000, "lr": 1e-5},
+        ],
+        "ppo_gamma_schedule": [
+            {"threshold": 0, "gamma": 0.990},
+            {"threshold": 150_000, "gamma": 0.995},
+            {"threshold": 350_000, "gamma": 0.998},
+        ],
+        "ppo_gae_lambda_schedule": [
+            {"threshold": 0, "gae_lambda": 0.92},
+            {"threshold": 150_000, "gae_lambda": 0.95},
+            {"threshold": 350_000, "gae_lambda": 0.97},
+        ],
+        "ppo_entropy_coef_schedule": [
+            {"threshold": 0, "entropy_coef": 0.010},
+            {"threshold": 100_000, "entropy_coef": 0.005},
+            {"threshold": 250_000, "entropy_coef": 0.002},
+            {"threshold": 400_000, "entropy_coef": 0.001},
+        ],
+        "dirichlet_temperature_schedule": [
+            {"threshold": 0, "temperature": 1.5},
+            {"threshold": 150_000, "temperature": 1.2},
+            {"threshold": 300_000, "temperature": 1.0},
+        ],
+        "ra_kl_enabled": False,
+        "use_episode_length_curriculum": True,
+        "episode_length_curriculum_schedule": [
+            {"threshold": 0, "limit": 756},
+            {"threshold": 100_000, "limit": 1008},
+            {"threshold": 250_000, "limit": 1500},
+            {"threshold": 400_000, "limit": None},
+        ],
+        "episode_length_curriculum_smooth_enabled": True,
+        "episode_length_curriculum_overlap_steps": 10_000,
+        "action_execution_beta_schedule": [
+            {"threshold": 0, "beta": 0.65},
+            {"threshold": 100_000, "beta": 0.65},
+            {"threshold": 200_000, "beta": 0.65},
+            {"threshold": 350_000, "beta": 0.65},
+        ],
+        "action_execution_beta_curriculum": {
+            0: 0.65,
+            100_000: 0.65,
+            200_000: 0.65,
+            350_000: 0.65,
+        },
+        "evaluation_action_execution_beta": 0.65,
+        "turnover_penalty_curriculum": {
+            0: 0.25,
+            100_000: 0.50,
+            200_000: 0.75,
+            300_000: 0.90,
+            400_000: 1.00,
+        },
+        "evaluation_turnover_penalty_scalar": 1.00,
+        "log_step_diagnostics": True,
+        "update_log_interval": 1,
+        "alpha_diversity_log_interval": 2,
+        "alpha_diversity_warning_after_updates": 10,
+        "alpha_diversity_warning_std_threshold": 0.25,
+        "deterministic_validation_checkpointing_enabled": True,
+        "deterministic_validation_eval_every_episodes": 5,
+        "deterministic_validation_mode": "mean",
+        "deterministic_validation_episode_length_limit": None,
+        "deterministic_validation_episode_length_limit_curriculum": [
+            {"threshold": 0, "limit": 756},
+            {"threshold": 100_000, "limit": 1008},
+            {"threshold": 250_000, "limit": 1500},
+            {"threshold": 400_000, "limit": None},
+        ],
+        "deterministic_validation_sharpe_min": 0.50,
+        "deterministic_validation_sharpe_min_delta": 0.0,
+        "deterministic_validation_seed_offset": 10_000,
+        "deterministic_validation_log_alpha_stats": True,
+        "deterministic_validation_checkpointing_only": True,
+        "deterministic_validation_multi_horizon_enabled": True,
+        "deterministic_validation_multi_horizon_limits": [252, 504, 756, 1008],
+        "deterministic_validation_multi_horizon_weights": [0.35, 0.30, 0.20, 0.15],
+        "deterministic_validation_multi_horizon_dd_penalty_coef": 0.25,
+        "deterministic_validation_stochastic_sanity_enabled": True,
+        "deterministic_validation_stochastic_sanity_runs": 3,
+        "deterministic_validation_stochastic_sanity_episode_length_limit": 252,
+        "deterministic_validation_stochastic_sanity_min_mean_sharpe": 0.0,
+        "deterministic_validation_stochastic_sanity_max_sharpe_std": 1.5,
+        "high_watermark_checkpoint_enabled": False,
+        "step_sharpe_checkpoint_enabled": False,
+        "periodic_checkpoint_every_steps": 0,
+        "rare_checkpoint_params": {"enable": False},
+        "tape_checkpoint_threshold": 999.0,
+    },
+}
+
+
+def apply_run9_alpha_overrides(config: dict, overrides: dict = None) -> dict:
+    """Apply the canonical Run9 alpha-generation training recipe in-place."""
+    global TRAIN_TEST_SPLIT_DATE
+    resolved = copy.deepcopy(RUN9_ALPHA_OVERRIDES if overrides is None else overrides)
+    split_date = resolved.get("TRAIN_TEST_SPLIT_DATE")
+    if split_date:
+        TRAIN_TEST_SPLIT_DATE = split_date
+        config["TRAIN_TEST_SPLIT_DATE"] = split_date
+    _deep_update_config(config, resolved)
+    return config
+
+
+def assert_run9_alpha_config(config: dict) -> None:
+    """Raise if a config expected to match the Run9 alpha recipe drifted."""
+    agent = config.get("agent_params", {})
+    ppo = agent.get("ppo_params", {})
+    env = config.get("environment_params", {})
+    training = config.get("training_params", {})
+    assert not bool(agent.get("regime_conditioning_enabled", False)), "regime_conditioning_enabled drifted on"
+    assert bool(agent.get("distributional_critic_enabled", False)), "distributional_critic_enabled must stay on"
+    assert float(ppo.get("risk_aux_mvo_coef", 0.0)) == 0.0, "risk_aux_mvo_coef must stay off"
+    assert float(ppo.get("risk_aux_cvar_coef", 0.0)) == 0.0, "step-level CVaR aux must stay off"
+    assert not bool(env.get("episode_cvar_enabled", False)), "episode_cvar_enabled must stay off"
+    assert bool(ppo.get("lagrangian_cvar_enabled", False)), "lagrangian_cvar_enabled must stay on"
+    assert bool(training.get("deterministic_validation_checkpointing_enabled", False)), (
+        "deterministic validation must stay enabled"
+    )
+    assert not bool(training.get("high_watermark_checkpoint_enabled", True)), (
+        "legacy high-watermark checkpoints must stay off"
+    )
+
+
+def build_run9_alpha_config(
+    phase_name: str = "phase1",
+    *,
+    analysis_end_date: str | None = None,
+    overrides: dict | None = None,
+) -> dict:
+    """Return a deep-copied phase config with feature-audit + Run9 alpha overrides applied."""
+    config = copy.deepcopy(get_active_config(phase_name))
+    enforce_feature_audit_plan(config)
+    apply_run9_alpha_overrides(config, overrides=overrides)
+    if analysis_end_date is not None:
+        config["ANALYSIS_END_DATE"] = analysis_end_date
+    assert_run9_alpha_config(config)
+    return config
 
 
 def get_active_config(phase_name: str = None):
