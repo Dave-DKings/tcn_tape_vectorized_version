@@ -790,7 +790,7 @@ TRAINING_FIELDNAMES: List[str] = [
     "episode_calmar_ratio",
     "episode_omega_ratio",
     "episode_ulcer_index",
-    "episode_cvar_5pct",
+    "rolling_cvar_5pct",
     "profile_name",
     "turnover_scalar",
     "terminal_drawdown_lambda",
@@ -827,6 +827,22 @@ TRAINING_FIELDNAMES: List[str] = [
     "final_balance",
     "next_profile_name",
     "next_profile_reason",
+    "episode_length",
+    "termination_reason",
+    "episode_cvar_bonus",
+    "episode_cvar_value",
+    "episode_cvar_regime",
+    "episode_cvar_threshold",
+    "episode_cvar_passed",
+    "outperformance_bonus",
+    "equal_weight_return",
+    "spy_outperformance_bonus",
+    "spy_return",
+    "drawdown_regime_multiplier",
+    "mean_concentration_hhi",
+    "mean_top_weight",
+    "mean_action_realization_l1",
+    "tape_bonus_core",
     "actor_loss",
     "critic_loss",
     "critic_loss_scaled",
@@ -871,8 +887,6 @@ TRAINING_FIELDNAMES: List[str] = [
     "ratio_mean",
     "ratio_std",
     "drawdown_lambda_peak",
-    "episode_length",
-    "termination_reason",
 ]
 
 EVALUATION_EXTRA_FIELDNAMES: List[str] = [
@@ -993,7 +1007,7 @@ def _build_training_metrics_row(
             "episode_calmar_ratio": metrics.get("calmar_ratio", 0.0),
             "episode_omega_ratio": metrics.get("omega_ratio", 0.0),
             "episode_ulcer_index": metrics.get("ulcer_index", 0.0),
-            "episode_cvar_5pct": metrics.get("cvar_5pct", 0.0),
+            "rolling_cvar_5pct": metrics.get("cvar_5pct", 0.0),
             "profile_name": profile_name or "N/A",
             "turnover_scalar": turnover_scalar,
             "initial_balance": initial_balance,
@@ -5200,6 +5214,19 @@ def run_experiment6_tape(
                 else:
                     print(f"   🎚️ Terminal TAPE snapshot={tape_score_for_log:.4f}")
 
+                # Outperformance and episode CVaR visibility
+                _ep_cvar_bonus = to_scalar(episode_terminal_info.get("episode_cvar_bonus", 0.0))
+                _ep_cvar_regime = episode_terminal_info.get("episode_cvar_regime", "n/a")
+                _ep_cvar_value = to_scalar(episode_terminal_info.get("episode_cvar_value", 0.0))
+                _ep_cvar_threshold = to_scalar(episode_terminal_info.get("episode_cvar_threshold", 0.0))
+                _ep_cvar_passed = episode_terminal_info.get("episode_cvar_passed", None)
+                if _ep_cvar_passed is not None:
+                    print(
+                        f"   📊 Episode CVaR: regime={_ep_cvar_regime} | "
+                        f"CVaR={_ep_cvar_value:.5f} | threshold={_ep_cvar_threshold:.5f} | "
+                        f"passed={'✅' if _ep_cvar_passed else '❌'} | bonus={_ep_cvar_bonus:.2f}"
+                    )
+
             training_row = {
                 "update": update_count,
                 "timestep": step,
@@ -5217,7 +5244,7 @@ def run_experiment6_tape(
                 "episode_calmar_ratio": episode_calmar_val,
                 "episode_omega_ratio": episode_omega_val,
                 "episode_ulcer_index": episode_ulcer_val,
-                "episode_cvar_5pct": episode_cvar_val,
+                "rolling_cvar_5pct": episode_cvar_val,
                 "actor_loss": actor_loss_val,
                 "critic_loss": critic_loss_val,
                 "critic_loss_scaled": critic_loss_scaled_val,
@@ -5304,6 +5331,48 @@ def run_experiment6_tape(
                     "next_profile_reason": last_next_profile_reason,
                     "episode_length": last_episode_length_info,
                     "termination_reason": last_termination_reason,
+                    "episode_cvar_bonus": to_scalar(
+                        episode_terminal_info.get("episode_cvar_bonus", 0.0)
+                    ) if episode_terminal_info is not None else 0.0,
+                    "episode_cvar_value": to_scalar(
+                        episode_terminal_info.get("episode_cvar_value", 0.0)
+                    ) if episode_terminal_info is not None else 0.0,
+                    "episode_cvar_regime": str(
+                        episode_terminal_info.get("episode_cvar_regime", "n/a")
+                    ) if episode_terminal_info is not None else "n/a",
+                    "episode_cvar_threshold": to_scalar(
+                        episode_terminal_info.get("episode_cvar_threshold", 0.0)
+                    ) if episode_terminal_info is not None else 0.0,
+                    "episode_cvar_passed": episode_terminal_info.get(
+                        "episode_cvar_passed", None
+                    ) if episode_terminal_info is not None else None,
+                    "outperformance_bonus": to_scalar(
+                        episode_terminal_info.get("outperformance_bonus", 0.0)
+                    ) if episode_terminal_info is not None else 0.0,
+                    "equal_weight_return": to_scalar(
+                        episode_terminal_info.get("equal_weight_return", 0.0)
+                    ) if episode_terminal_info is not None else 0.0,
+                    "spy_outperformance_bonus": to_scalar(
+                        episode_terminal_info.get("spy_outperformance_bonus", 0.0)
+                    ) if episode_terminal_info is not None else 0.0,
+                    "spy_return": to_scalar(
+                        episode_terminal_info.get("spy_return", 0.0)
+                    ) if episode_terminal_info is not None else 0.0,
+                    "drawdown_regime_multiplier": to_scalar(
+                        episode_terminal_info.get("drawdown_regime_multiplier", 1.0)
+                    ) if episode_terminal_info is not None else 1.0,
+                    "mean_concentration_hhi": to_scalar(
+                        episode_terminal_info.get("mean_concentration_hhi", 0.0)
+                    ) if episode_terminal_info is not None else 0.0,
+                    "mean_top_weight": to_scalar(
+                        episode_terminal_info.get("mean_top_weight", 0.0)
+                    ) if episode_terminal_info is not None else 0.0,
+                    "mean_action_realization_l1": to_scalar(
+                        episode_terminal_info.get("mean_action_realization_l1", 0.0)
+                    ) if episode_terminal_info is not None else 0.0,
+                    "tape_bonus_core": to_scalar(
+                        episode_terminal_info.get("tape_bonus_core", 0.0)
+                    ) if episode_terminal_info is not None else 0.0,
                 }
             )
 

@@ -1252,7 +1252,7 @@ class PortfolioEnvTAPE(gym.Env):
             if self.outperformance_bonus_enabled:
                 outperformance = portfolio_return - self._last_equal_weight_return
                 if outperformance > 0:
-                    outperformance_bonus = outperformance * self.outperformance_bonus_scalar * 100.0
+                    outperformance_bonus = outperformance * self.outperformance_bonus_scalar
                 final_step_reward += outperformance_bonus
             self._last_outperformance_bonus = outperformance_bonus
 
@@ -1261,7 +1261,7 @@ class PortfolioEnvTAPE(gym.Env):
             if self.spy_outperformance_bonus_enabled:
                 spy_outperformance = portfolio_return - self._last_spy_return
                 if spy_outperformance > 0:
-                    spy_outperformance_bonus = spy_outperformance * self.spy_outperformance_bonus_scalar * 100.0
+                    spy_outperformance_bonus = spy_outperformance * self.spy_outperformance_bonus_scalar
                 final_step_reward += spy_outperformance_bonus
             self._last_spy_outperformance_bonus = spy_outperformance_bonus
 
@@ -1627,6 +1627,11 @@ class PortfolioEnvTAPE(gym.Env):
                 'mean_action_realization_l1': float(np.mean(self.action_realization_l1_history)) if self.action_realization_l1_history else 0.0,
                 'concentration_penalty_sum': float(self.concentration_penalty_sum),
                 'action_realization_penalty_sum': float(self.action_realization_penalty_sum),
+                'outperformance_bonus': float(getattr(self, '_last_outperformance_bonus', 0.0)),
+                'equal_weight_return': float(getattr(self, '_last_equal_weight_return', 0.0)),
+                'spy_outperformance_bonus': float(getattr(self, '_last_spy_outperformance_bonus', 0.0)),
+                'spy_return': float(getattr(self, '_last_spy_return', 0.0)),
+                'drawdown_regime_multiplier': float(self._get_drawdown_regime_multiplier()) if self.drawdown_constraint_enabled else 1.0,
             }
 
             if self.drawdown_constraint_enabled:

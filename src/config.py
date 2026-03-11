@@ -409,7 +409,7 @@ PHASE1_CONFIG = {
         # Episode-level regime-CVaR: penalize bad tail risk at episode end (replaces step-level CVaR aux)
         "episode_cvar_enabled": True,
         "episode_cvar_alpha": 0.05,            # CVaR tail fraction (5% worst returns)
-        "episode_cvar_scalar": 500.0,          # Multiplier for CVaR penalty/bonus
+        "episode_cvar_scalar": 100.0,  # Reduced from 500          # Multiplier for CVaR penalty/bonus
         "episode_cvar_min_history": 40,        # Skip noisy CVaR estimates on very short episodes
         "episode_cvar_low_vol_boundary": 0.12, # Annualized vol boundary for low-vol episodes
         "episode_cvar_high_vol_boundary": 0.25,# Annualized vol boundary for high-vol episodes
@@ -468,8 +468,8 @@ PHASE1_CONFIG = {
             # Apply penalty as soon as drawdown crosses trigger boundary (target + tolerance).
             "penalty_reference": "trigger_boundary",
             # Avoid cooling lambda too aggressively below trigger.
-            "cooling_rate": 0.10,
-            "lambda_carry_decay": 0.9,
+            "cooling_rate": 0.25,             # Faster cooldown (was 0.10)
+            "lambda_carry_decay": 0.75,         # Stronger decay (was 0.9)
         }
     },
     #================================================
@@ -545,7 +545,7 @@ PHASE1_CONFIG = {
         "dual_head_eval_deterministic_rho": 0.90,
         "dual_head_eval_stochastic_rho": 0.60,
         "dual_head_projection_use_constraints": False,
-        "dual_head_projection_max_single_position": 0.95,
+        "dual_head_projection_max_single_position": 0.25,
         "dual_head_projection_min_cash_position": 0.05,
 
         # Dirichlet alpha activation (controls action concentration)
@@ -616,7 +616,7 @@ PHASE1_CONFIG = {
         "max_total_timesteps": 500_000,  # PERF-FIX #5: extended from 150K for complex architecture
         "num_parallel_envs": 1,  # >1 enables vectorized rollout collection
         "timesteps_per_ppo_update": 504,  # Frequent updates (matched to episode length) — archive used ~252
-        "log_interval_episodes": 10,
+        "log_interval_episodes": 1,  # Log every episode
         "update_log_interval": 20,
         "alpha_diversity_log_interval": 10,
         "alpha_diversity_warning_after_updates": 500,
@@ -628,7 +628,7 @@ PHASE1_CONFIG = {
         "entropy_coefficient": 0.10,  # Diversification bonus weight (10x stronger for meaningful impact)
         
         # STATE-OF-THE-ART FIX #3: Position Size Constraints
-        "max_single_position": 95.00,  # Effectively uncapped — soft constraints handle concentration
+        "max_single_position": 25.00,  # Cap at 25% per asset — soft constraints handle concentration
         
         # Alternative: Curriculum schedule for max single position
         # Start strict, relax as agent learns 
@@ -828,7 +828,7 @@ PHASE2_CONFIG = {
         # Episode-level regime-CVaR: penalize bad tail risk at episode end (replaces step-level CVaR aux)
         "episode_cvar_enabled": True,
         "episode_cvar_alpha": 0.05,
-        "episode_cvar_scalar": 500.0,
+        "episode_cvar_scalar": 100.0,  # Reduced from 500
         "episode_cvar_min_history": 40,
         "episode_cvar_low_vol_boundary": 0.12,
         "episode_cvar_high_vol_boundary": 0.25,
@@ -884,8 +884,8 @@ PHASE2_CONFIG = {
             "lambda_max": 5.0,
             "tolerance": -0.015,
             "penalty_reference": "trigger_boundary",
-            "cooling_rate": 0.10,
-            "lambda_carry_decay": 0.9,
+            "cooling_rate": 0.25,             # Faster cooldown (was 0.10)
+            "lambda_carry_decay": 0.75,         # Stronger decay (was 0.9)
         },
         "drawdown_constraint_overrides": {
             "sequential": {
@@ -895,8 +895,8 @@ PHASE2_CONFIG = {
                 "lambda_max": 5.0,
                 "tolerance": -0.015,
                 "penalty_reference": "trigger_boundary",
-                "cooling_rate": 0.10,
-                "lambda_carry_decay": 0.9,
+                "cooling_rate": 0.25,             # Faster cooldown (was 0.10)
+                "lambda_carry_decay": 0.75,         # Stronger decay (was 0.9)
             }
         }
     },
@@ -967,7 +967,7 @@ PHASE2_CONFIG = {
         "dual_head_eval_deterministic_rho": 0.90,
         "dual_head_eval_stochastic_rho": 0.60,
         "dual_head_projection_use_constraints": False,
-        "dual_head_projection_max_single_position": 0.95,
+        "dual_head_projection_max_single_position": 0.25,
         "dual_head_projection_min_cash_position": 0.05,
 
         # Dirichlet alpha activation (controls action concentration)
@@ -1033,7 +1033,7 @@ PHASE2_CONFIG = {
         "max_total_timesteps": 100000,
         "num_parallel_envs": 1,  # >1 enables vectorized rollout collection
         "timesteps_per_ppo_update": 250,
-        "log_interval_episodes": 10,
+        "log_interval_episodes": 1,  # Log every episode
         "save_freq_episodes": 50,
         "max_episode_length": None,  # Use full dataset horizon
 
@@ -1041,7 +1041,7 @@ PHASE2_CONFIG = {
         "entropy_coefficient": 0.10,  # Diversification bonus weight (10x stronger for meaningful impact)
         
         # STATE-OF-THE-ART FIX #3: Position Size Constraints
-        "max_single_position": 95.00,  # Effectively uncapped — soft constraints handle concentration
+        "max_single_position": 25.00,  # Cap at 25% per asset — soft constraints handle concentration
         "min_cash_position": 0.05,    # Minimum cash buffer (5%)
 
         # STATE-OF-THE-ART FIX #4: Curriculum Learning
