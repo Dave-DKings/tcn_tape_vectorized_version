@@ -1438,7 +1438,7 @@ class TCNFusionActor(DirichletActor):
                 )
 
         if self.per_asset_alpha_head_enabled:
-            # Per-asset output: Dense(1) per asset embedding => squeeze
+            # Per-asset output: Dense(1) per risky asset embedding + explicit cash logit.
             self.per_asset_pre_norm = layers.LayerNormalization(
                 epsilon=1e-6, name=f"{name}_per_asset_pre_norm"
             )
@@ -1448,6 +1448,15 @@ class TCNFusionActor(DirichletActor):
                 bias_initializer=tf.keras.initializers.Constant(0.5),
                 name=f"{name}_per_asset_logit",
             )
+            self.cash_logit_head = None
+            if self.num_actions > self.num_assets:
+                self.cash_logit_head = layers.Dense(
+                    self.num_actions - self.num_assets,
+                    activation=None,
+                    kernel_initializer="orthogonal",
+                    bias_initializer=tf.keras.initializers.Constant(0.5),
+                    name=f"{name}_cash_logit",
+                )
             # Legacy output layer still exists for backward compat loading
             self.output_layer = layers.Dense(
                 self.num_actions, activation=None,
@@ -1458,6 +1467,7 @@ class TCNFusionActor(DirichletActor):
         else:
             self.per_asset_pre_norm = None
             self.per_asset_logit_head = None
+            self.cash_logit_head = None
             self.output_layer = layers.Dense(
                 self.num_actions,
                 activation=None,
@@ -1690,9 +1700,22 @@ class TCNFusionActor(DirichletActor):
                     x_assets = dropout_layer(x_assets, training=training)
             else:
                 x_assets = self.per_asset_pre_norm(x_assets)
-            # Per-asset logit: (batch, num_assets, embed_dim) => (batch, num_assets, 1) => (batch, num_assets)
-            logits = self.per_asset_logit_head(x_assets, training=training)
-            logits = tf.squeeze(logits, axis=-1)  # (batch, num_assets)
+            # Risky-asset logits: (batch, num_assets, embed_dim) => (batch, num_assets)
+            risky_logits = self.per_asset_logit_head(x_assets, training=training)
+            risky_logits = tf.squeeze(risky_logits, axis=-1)
+
+            if self.cash_logit_head is not None:
+                if self.use_richer_alpha_head and self.alpha_pre_norm is not None:
+                    cash_features = self.alpha_pre_norm(fused)
+                    for dense_layer, dropout_layer in self.alpha_head_blocks:
+                        cash_features = dense_layer(cash_features)
+                        cash_features = dropout_layer(cash_features, training=training)
+                else:
+                    cash_features = fused
+                cash_logits = self.cash_logit_head(cash_features, training=training)
+                logits = tf.concat([risky_logits, cash_logits], axis=-1)
+            else:
+                logits = risky_logits
         else:
             # Legacy path: single fused vector => Dense(num_actions)
             if self.use_richer_alpha_head and self.alpha_pre_norm is not None:
