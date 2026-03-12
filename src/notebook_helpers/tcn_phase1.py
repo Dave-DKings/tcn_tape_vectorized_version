@@ -888,6 +888,7 @@ TRAINING_FIELDNAMES: List[str] = [
     "alpha_min",
     "alpha_max",
     "alpha_mean",
+    "alpha_cap_hit_frac",
     "ratio_mean",
     "ratio_std",
     "drawdown_lambda_peak",
@@ -5180,6 +5181,7 @@ def run_experiment6_tape(
         alpha_max_value = update_metrics.get("alpha_max", 0.0)
         alpha_mean_value = update_metrics.get("alpha_mean", 0.0)
         alpha_std_value = update_metrics.get("alpha_std", 0.0)  # Track alpha diversity
+        alpha_cap_hit_frac_value = update_metrics.get("alpha_cap_hit_frac", 0.0)
         alpha_per_asset = update_metrics.get("alpha_per_asset", None)  # Per-asset alpha means
         ratio_mean_value = update_metrics.get("ratio_mean", 0.0)
         ratio_std_value = update_metrics.get("ratio_std", 0.0)
@@ -5305,6 +5307,9 @@ def run_experiment6_tape(
             alpha_max_val = to_scalar(alpha_max_value)
             alpha_mean_val = to_scalar(alpha_mean_value)
             alpha_std_val = to_scalar(alpha_std_value)  # For alpha diversity tracking
+            alpha_cap_hit_frac_val = to_scalar(alpha_cap_hit_frac_value)
+            if alpha_cap_hit_frac_val is None:
+                alpha_cap_hit_frac_val = 0.0
             ratio_mean_val = to_scalar(ratio_mean_value)
             ratio_std_val = to_scalar(ratio_std_value)
 
@@ -5388,7 +5393,8 @@ def run_experiment6_tape(
                 print(
                     f"   🔬 Alpha Diversity: mean={alpha_mean_val:.2f} | "
                     f"std={alpha_std_val:.2f} | "
-                    f"range=[{alpha_min_val:.2f}, {alpha_max_val:.2f}]"
+                    f"range=[{alpha_min_val:.2f}, {alpha_max_val:.2f}] | "
+                    f"cap_hit={alpha_cap_hit_frac_val*100.0:.1f}%"
                 )
                 # Per-asset alpha breakdown for rotation diagnostics
                 if alpha_per_asset is not None:
@@ -5554,6 +5560,7 @@ def run_experiment6_tape(
                     "alpha_min": alpha_min_val,
                     "alpha_max": alpha_max_val,
                     "alpha_mean": alpha_mean_val,
+                    "alpha_cap_hit_frac": alpha_cap_hit_frac_val,
                     "ratio_mean": ratio_mean_val,
                     "ratio_std": ratio_std_val,
                     "terminal_drawdown_lambda": terminal_drawdown_lambda,

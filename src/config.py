@@ -1296,7 +1296,7 @@ RUN9_ALPHA_OVERRIDES = {
         "dirichlet_alpha_activation": "exp_tanh",
         # Match the initial schedule value so the startup banner reflects the live setting.
         "dirichlet_logit_temperature": 1.2,
-        "dirichlet_alpha_cap": 12.0,
+        "dirichlet_alpha_cap": 16.0,
         "dirichlet_exp_tanh_scale": 3.5,
         "dirichlet_epsilon": {"max": 0.2, "min": 0.02},
         "ppo_params": {
@@ -1325,7 +1325,7 @@ RUN9_ALPHA_OVERRIDES = {
             "risk_aux_mvo_long_only": True,
             "risk_aux_mvo_risky_budget": 0.95,
             "aux_return_pred_enabled": True,
-            "aux_return_pred_coef": 0.20,
+            "aux_return_pred_coef": 0.25,
             "lagrangian_cvar_enabled": True,
             "lagrangian_cvar_threshold": -0.025,
             "lagrangian_cvar_lr": 0.004,
@@ -1341,7 +1341,7 @@ RUN9_ALPHA_OVERRIDES = {
     },
     "environment_params": {
         "target_turnover": 0.35,
-        "turnover_penalty_scalar": 0.05,
+        "turnover_penalty_scalar": 0.50,
         "transaction_cost_pct": 0.001,
         "concentration_penalty_scalar": 0.0,
         "top_weight_penalty_scalar": 0.0,
@@ -1397,8 +1397,8 @@ RUN9_ALPHA_OVERRIDES = {
         ],
         "dirichlet_temperature_schedule": [
             {"threshold": 0, "temperature": 1.2},
-            {"threshold": 150_000, "temperature": 1.1},
-            {"threshold": 300_000, "temperature": 1.0},
+            {"threshold": 150_000, "temperature": 1.0},
+            {"threshold": 300_000, "temperature": 0.9},
         ],
         "ra_kl_enabled": False,
         "use_episode_length_curriculum": True,
@@ -1411,23 +1411,23 @@ RUN9_ALPHA_OVERRIDES = {
         "episode_length_curriculum_smooth_enabled": True,
         "episode_length_curriculum_overlap_steps": 10_000,
         "action_execution_beta_schedule": [
-            {"threshold": 0, "beta": 0.65},
-            {"threshold": 100_000, "beta": 0.65},
-            {"threshold": 200_000, "beta": 0.65},
-            {"threshold": 350_000, "beta": 0.65},
+            {"threshold": 0, "beta": 0.35},
+            {"threshold": 100_000, "beta": 0.45},
+            {"threshold": 200_000, "beta": 0.55},
+            {"threshold": 350_000, "beta": 0.55},
         ],
         "action_execution_beta_curriculum": {
-            0: 0.65,
-            100_000: 0.65,
-            200_000: 0.65,
-            350_000: 0.65,
+            0: 0.35,
+            100_000: 0.45,
+            200_000: 0.55,
+            350_000: 0.55,
         },
-        "evaluation_action_execution_beta": 0.65,
+        "evaluation_action_execution_beta": 0.55,
         "turnover_penalty_curriculum": {
-            0: 0.25,
-            100_000: 0.50,
-            200_000: 0.75,
-            300_000: 0.90,
+            0: 0.50,
+            100_000: 0.75,
+            200_000: 0.90,
+            300_000: 1.00,
             400_000: 1.00,
         },
         "evaluation_turnover_penalty_scalar": 1.00,
@@ -1456,10 +1456,10 @@ RUN9_ALPHA_OVERRIDES = {
         "deterministic_validation_multi_horizon_weights": [0.35, 0.30, 0.20, 0.15],
         "deterministic_validation_multi_horizon_dd_penalty_coef": 0.25,
         "deterministic_validation_stochastic_sanity_enabled": True,
-        "deterministic_validation_stochastic_sanity_runs": 3,
+        "deterministic_validation_stochastic_sanity_runs": 5,
         "deterministic_validation_stochastic_sanity_episode_length_limit": 252,
-        "deterministic_validation_stochastic_sanity_min_mean_sharpe": 0.0,
-        "deterministic_validation_stochastic_sanity_max_sharpe_std": 1.5,
+        "deterministic_validation_stochastic_sanity_min_mean_sharpe": 0.2,
+        "deterministic_validation_stochastic_sanity_max_sharpe_std": 1.0,
         "deterministic_validation_require_spy_outperformance": True,
         "deterministic_validation_min_spy_outperformance": 0.0,
         "high_watermark_checkpoint_enabled": False,
@@ -1509,7 +1509,7 @@ def assert_run9_alpha_config(config: dict) -> None:
     )
     assert float(ppo.get("entropy_coef", 1.0)) <= 0.003, "base entropy must stay in the low-entropy regime"
     assert float(ppo.get("alpha_dispersion_coef", 0.0)) >= 0.05, "alpha_dispersion_coef drifted below the calibrated floor"
-    assert float(ppo.get("aux_return_pred_coef", 0.0)) >= 0.20, "aux_return_pred_coef drifted below the calibrated floor"
+    assert float(ppo.get("aux_return_pred_coef", 0.0)) >= 0.25, "aux_return_pred_coef drifted below the calibrated floor"
     expected_turnover = copy.deepcopy(RUN9_ALPHA_OVERRIDES["training_params"]["turnover_penalty_curriculum"])
     actual_turnover = {
         int(threshold): float(value)

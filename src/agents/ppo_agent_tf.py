@@ -2016,6 +2016,7 @@ class PPOAgentTF:
             'alpha_max': 0.0,
             'alpha_mean': 0.0,
             'alpha_std': 0.0,  # Track alpha diversity for TCN learning
+            'alpha_cap_hit_frac': 0.0,
             # Track risky-asset alpha means only; cash is handled separately in actions
             # and would break ticker-aligned diagnostics if included here.
             'alpha_per_asset': np.zeros(self.num_assets, dtype=np.float64),
@@ -2123,6 +2124,12 @@ class PPOAgentTF:
                 # Get alpha statistics from current batch
                 alpha_batch, _, _ = self._split_actor_outputs(self.actor(batch_states, training=False))
                 alpha_batch = alpha_batch.numpy()
+                alpha_cap = getattr(self.actor, "_alpha_cap", None)
+                if alpha_cap is not None and np.isfinite(alpha_cap):
+                    cap_tol = max(1e-6, 1e-3 * float(alpha_cap))
+                    alpha_cap_hit_frac_batch = float(np.mean(alpha_batch >= (float(alpha_cap) - cap_tol)))
+                else:
+                    alpha_cap_hit_frac_batch = 0.0
                 
                 # Accumulate statistics
                 stats['actor_loss'] += float(actor_loss)
@@ -2148,6 +2155,7 @@ class PPOAgentTF:
                 stats['alpha_max'] += float(np.max(alpha_batch))
                 stats['alpha_mean'] += float(np.mean(alpha_batch))
                 stats['alpha_std'] += float(np.std(alpha_batch))  # Track alpha diversity
+                stats['alpha_cap_hit_frac'] += alpha_cap_hit_frac_batch
                 risky_alpha_batch = alpha_batch[..., :self.num_assets]
                 stats['alpha_per_asset'] += np.mean(risky_alpha_batch, axis=0).astype(np.float64)
                 stats['ratio_mean'] += float(ratio_mean)
@@ -2196,6 +2204,7 @@ class PPOAgentTF:
                        'alpha_diversity_loss', 'alpha_dispersion_loss',
                        'policy_loss', 'entropy_loss', 'entropy',
                        'actor_grad_norm', 'critic_grad_norm', 'alpha_min', 'alpha_max', 'alpha_mean', 'alpha_std',
+                       'alpha_cap_hit_frac',
                        'ratio_mean', 'ratio_std', 'approx_kl', 'clip_fraction', 'value_clip_fraction']:
                 stats[key] /= num_updates
             stats['alpha_per_asset'] /= num_updates
