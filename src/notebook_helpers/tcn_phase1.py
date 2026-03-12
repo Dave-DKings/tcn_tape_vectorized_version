@@ -2892,11 +2892,40 @@ def run_experiment6_tape(
     agent_config["ppo_params"]["gae_lambda"] = float(initial_ppo_gae_lambda)
 
     print(f"\n🤖 Creating {arch_upper} agent with Dirichlet distribution for Exp {exp_idx}...")
-    agent = agent_cls(
-        state_dim=n_features,
-        num_assets=stock_dim,
-        config=agent_config,
-    )
+    def _create_agent_instance():
+        return agent_cls(
+            state_dim=n_features,
+            num_assets=stock_dim,
+            config=agent_config,
+        )
+
+    try:
+        agent = _create_agent_instance()
+    except Exception as exc:
+        is_cuda_invalid_handle = (
+            isinstance(exc, tf.errors.InternalError)
+            and "CUDA_ERROR_INVALID_HANDLE" in str(exc)
+        )
+        if not is_cuda_invalid_handle:
+            raise
+        print(
+            "   [WARN] CUDA context error during agent creation "
+            "(CUDA_ERROR_INVALID_HANDLE). Clearing TF session and retrying once..."
+        )
+        try:
+            tf.keras.backend.clear_session()
+            import gc as _gc
+
+            _gc.collect()
+        except Exception:
+            pass
+        try:
+            agent = _create_agent_instance()
+        except Exception as retry_exc:
+            raise RuntimeError(
+                "Agent initialization failed due to CUDA context error (CUDA_ERROR_INVALID_HANDLE). "
+                "Restart the runtime/kernel, rerun setup cells, and retry training."
+            ) from retry_exc
     print(f"[OK] Agent created: {agent.__class__.__name__}")
     print(f"   [RAND] Dirichlet Distribution: ENABLED")
 
