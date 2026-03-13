@@ -350,6 +350,7 @@ class PPOAgentTF:
         self.actor_optimizer = tf.keras.optimizers.Adam(learning_rate=actor_lr)
         self.critic_optimizer = tf.keras.optimizers.Adam(learning_rate=critic_lr)
         self._current_actor_lr = float(actor_lr)
+        self._current_critic_lr = float(critic_lr)
         
         # Memory for storing trajectory data
         self.memory = {
@@ -504,7 +505,16 @@ class PPOAgentTF:
         try:
             return float(tf.keras.backend.get_value(self.critic_optimizer.learning_rate))
         except Exception:
-            return float(self.critic_optimizer.learning_rate)
+            return float(self._current_critic_lr)
+
+    def set_critic_lr(self, new_lr: float) -> None:
+        """Update the critic optimizer learning rate in-place."""
+        new_lr = float(new_lr)
+        if hasattr(self.critic_optimizer.learning_rate, "assign"):
+            self.critic_optimizer.learning_rate.assign(new_lr)
+        else:
+            self.critic_optimizer.learning_rate = new_lr
+        self._current_critic_lr = new_lr
 
     def set_dirichlet_progress(self, progress: float) -> None:
         """Adjust the actor's Dirichlet epsilon according to normalized progress."""

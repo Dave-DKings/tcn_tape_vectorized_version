@@ -1,0 +1,35 @@
+{
+  "timestamp": "20260312_141907",
+  "train_end_date": "2019-12-31 00:00:00",
+  "test_start_date": "2020-01-02 00:00:00",
+  "split_check": {
+    "train_max_date": "2019-12-31 00:00:00",
+    "test_min_date": "2020-01-02 00:00:00",
+    "non_overlap_train_before_test": true
+  },
+  "normalization": {
+    "fit_scope": "train_only",
+    "scaler_count": 59,
+    "feature_count": 59,
+    "method_counts": {
+      "robust_winsor": 24,
+      "bounded": 15,
+      "standard": 19,
+      "skip": 1
+    },
+    "binary_flag_columns": [
+      "YieldCurve_Inverted_Flag"
+    ],
+    "binary_flag_columns_non_bounded": []
+  },
+  "artifact_paths": {
+    "raw_ohlcv": "c:\\Users\\Owner\\tcn_tape_vectorized_version_clean\\data_exports\\phase1_prep_20260312_141907_raw_ohlcv.csv",
+    "feature_engineered_full": "c:\\Users\\Owner\\tcn_tape_vectorized_version_clean\\data_exports\\phase1_prep_20260312_141907_feature_engineered_full.csv",
+    "feature_engineered_analysis_window": "c:\\Users\\Owner\\tcn_tape_vectorized_version_clean\\data_exports\\phase1_prep_20260312_141907_feature_engineered_analysis_window.csv",
+    "feature_engineered_normalized": "c:\\Users\\Owner\\tcn_tape_vectorized_version_clean\\data_exports\\phase1_prep_20260312_141907_feature_engineered_normalized.csv",
+    "train_normalized": "c:\\Users\\Owner\\tcn_tape_vectorized_version_clean\\data_exports\\phase1_prep_20260312_141907_train_normalized.csv",
+    "test_normalized": "c:\\Users\\Owner\\tcn_tape_vectorized_version_clean\\data_exports\\phase1_prep_20260312_141907_test_normalized.csv",
+    "scalers": "c:\\Users\\Owner\\tcn_tape_vectorized_version_clean\\data_exports\\phase1_prep_20260312_141907_scalers.joblib",
+    "audit_report": "c:\\Users\\Owner\\tcn_tape_vectorized_version_clean\\data_exports\\phase1_prep_20260312_141907_preparation_audit.json"
+  }
+}

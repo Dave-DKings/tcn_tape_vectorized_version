@@ -405,6 +405,7 @@ class Experiment6Result:
     training_duration: float
     turnover_curriculum: Dict[int, float]
     actor_lr_schedule: List[Dict[str, float]]
+    critic_lr_schedule: List[Dict[str, float]]
 
 
 def _get_results_root_for_architecture(
@@ -793,6 +794,13 @@ TRAINING_FIELDNAMES: List[str] = [
     "rolling_cvar_5pct",
     "profile_name",
     "turnover_scalar",
+    "training_early_stop_score",
+    "training_early_stop_ema_score",
+    "training_early_stop_best_ema_score",
+    "training_early_stop_no_improve_updates",
+    "training_early_stop_hard_dd_counter",
+    "training_early_stop_low_adv_counter",
+    "training_early_stop_trigger_reason",
     "terminal_drawdown_lambda",
     "terminal_drawdown_lambda_peak",
     "terminal_drawdown_avg_excess",
@@ -1079,6 +1087,7 @@ def create_experiment6_result_stub(
     agent_config: Optional[Dict[str, Any]] = None,
     turnover_curriculum: Optional[Dict[int, float]] = None,
     actor_lr_schedule: Optional[List[Dict[str, float]]] = None,
+    critic_lr_schedule: Optional[List[Dict[str, float]]] = None,
     base_agent_params: Optional[Dict[str, Any]] = None,
     max_total_timesteps: Optional[int] = None,
     **ignored_kwargs: Any,
@@ -1289,6 +1298,14 @@ def create_experiment6_result_stub(
         resolved_actor_lr_schedule.append({"threshold": threshold, "lr": lr_value})
     resolved_actor_lr_schedule = sorted(resolved_actor_lr_schedule, key=lambda item: item["threshold"])
 
+    resolved_critic_lr_schedule = []
+    critic_schedule_source = critic_lr_schedule or [{"threshold": 0, "lr": resolved_agent_config["ppo_params"].get("critic_lr", 0.001)}]
+    for entry in critic_schedule_source:
+        threshold = int(entry.get("threshold", 0))
+        lr_value = float(entry.get("lr", resolved_agent_config["ppo_params"].get("critic_lr", 0.001)))
+        resolved_critic_lr_schedule.append({"threshold": threshold, "lr": lr_value})
+    resolved_critic_lr_schedule = sorted(resolved_critic_lr_schedule, key=lambda item: item["threshold"])
+
     return Experiment6Result(
         exp_idx=exp_idx,
         exp_name=resolved_exp_name,
@@ -1312,6 +1329,7 @@ def create_experiment6_result_stub(
         training_duration=0.0,
         turnover_curriculum=resolved_turnover_curriculum,
         actor_lr_schedule=resolved_actor_lr_schedule,
+        critic_lr_schedule=resolved_critic_lr_schedule,
     )
 
 
@@ -1368,6 +1386,10 @@ def load_training_metadata_into_config(
         schedule = train_meta.get("actor_lr_schedule", [])
         if isinstance(schedule, list):
             training_params["actor_lr_schedule"] = copy.deepcopy(schedule)
+    if "critic_lr_schedule" in train_meta:
+        schedule = train_meta.get("critic_lr_schedule", [])
+        if isinstance(schedule, list):
+            training_params["critic_lr_schedule"] = copy.deepcopy(schedule)
     if "turnover_penalty_curriculum" in train_meta:
         raw_curr = train_meta.get("turnover_penalty_curriculum", {})
         if isinstance(raw_curr, dict):
@@ -2940,6 +2962,16 @@ def run_experiment6_tape(
         [{"threshold": int(entry.get("threshold", 0)), "lr": float(entry.get("lr", agent_config["ppo_params"].get("actor_lr", 0.001)))} for entry in actor_lr_schedule_cfg],
         key=lambda item: item["threshold"],
     )
+    critic_lr_schedule_cfg = training_params.get(
+        "critic_lr_schedule",
+        [
+            {"threshold": 0, "lr": agent_config["ppo_params"].get("critic_lr", 0.001)},
+        ],
+    )
+    critic_lr_schedule = sorted(
+        [{"threshold": int(entry.get("threshold", 0)), "lr": float(entry.get("lr", agent_config["ppo_params"].get("critic_lr", 0.001)))} for entry in critic_lr_schedule_cfg],
+        key=lambda item: item["threshold"],
+    )
     ppo_params_cfg = agent_config.get("ppo_params", {})
     num_ppo_epochs = int(
         training_params.get("num_ppo_epochs", ppo_params_cfg.get("num_ppo_epochs", 10))
@@ -3013,12 +3045,28 @@ def run_experiment6_tape(
                 break
         return updated_lr
 
+    def determine_critic_lr(current_step: int) -> float:
+        updated_lr = critic_lr_schedule[0]["lr"]
+        for entry in critic_lr_schedule:
+            if current_step >= entry["threshold"]:
+                updated_lr = entry["lr"]
+            else:
+                break
+        return updated_lr
+
     current_actor_lr = determine_actor_lr(0)
+    current_critic_lr = determine_critic_lr(0)
     agent.set_actor_lr(current_actor_lr)
+    if hasattr(agent, "set_critic_lr"):
+        agent.set_critic_lr(current_critic_lr)
     actor_schedule_pretty = " => ".join(
         f"{entry['lr']:.6f}@{entry['threshold']:,}" for entry in actor_lr_schedule
     )
+    critic_schedule_pretty = " => ".join(
+        f"{entry['lr']:.6f}@{entry['threshold']:,}" for entry in critic_lr_schedule
+    )
     print(f"   [TOOL] Actor LR schedule: {actor_schedule_pretty}")
+    print(f"   [TOOL] Critic LR schedule: {critic_schedule_pretty}")
     print(f"   State dim: {n_features}")
     print(f"   Action dim: {stock_dim}")
     print(f"   Actor LR (configured): {agent_config['ppo_params']['actor_lr']}")
@@ -3612,6 +3660,42 @@ def run_experiment6_tape(
         periodic_checkpoint_every_steps_cfg = 0
         tape_checkpoint_threshold_cfg = 999.0
 
+    training_early_stop_enabled_cfg = bool(training_params.get("training_early_stop_enabled", False))
+    training_early_stop_warmup_steps_cfg = int(
+        max(0, training_params.get("training_early_stop_warmup_steps", 100_000))
+    )
+    training_early_stop_ema_alpha_cfg = float(
+        np.clip(training_params.get("training_early_stop_ema_alpha", 0.10), 1e-6, 1.0)
+    )
+    training_early_stop_min_delta_cfg = float(max(0.0, training_params.get("training_early_stop_min_delta", 0.01)))
+    training_early_stop_patience_updates_cfg = int(
+        max(1, training_params.get("training_early_stop_patience_updates", 25))
+    )
+    training_early_stop_dd_soft_limit_pct_cfg = float(
+        max(1e-6, training_params.get("training_early_stop_dd_soft_limit_pct", 25.0))
+    )
+    training_early_stop_turnover_soft_limit_pct_cfg = float(
+        max(1e-6, training_params.get("training_early_stop_turnover_soft_limit_pct", 35.0))
+    )
+    training_early_stop_dd_penalty_weight_cfg = float(
+        max(0.0, training_params.get("training_early_stop_dd_penalty_weight", 0.60))
+    )
+    training_early_stop_turnover_penalty_weight_cfg = float(
+        max(0.0, training_params.get("training_early_stop_turnover_penalty_weight", 0.30))
+    )
+    training_early_stop_hard_dd_limit_pct_cfg = float(
+        max(0.0, training_params.get("training_early_stop_hard_dd_limit_pct", 45.0))
+    )
+    training_early_stop_hard_dd_patience_updates_cfg = int(
+        max(1, training_params.get("training_early_stop_hard_dd_patience_updates", 8))
+    )
+    training_early_stop_mean_adv_abs_threshold_cfg = float(
+        max(0.0, training_params.get("training_early_stop_mean_adv_abs_threshold", 1e-4))
+    )
+    training_early_stop_mean_adv_patience_updates_cfg = int(
+        max(1, training_params.get("training_early_stop_mean_adv_patience_updates", 20))
+    )
+
     deterministic_validation_best_sharpe = -np.inf
     deterministic_validation_best_score = -np.inf
     deterministic_validation_best_episode: Optional[int] = None
@@ -4153,6 +4237,17 @@ def run_experiment6_tape(
         )
     else:
         print("   💾 High-watermark checkpoints: disabled")
+    if training_early_stop_enabled_cfg:
+        print(
+            "   ⏹️ Training early-stop: "
+            f"enabled (warmup={training_early_stop_warmup_steps_cfg:,} steps, "
+            f"patience={training_early_stop_patience_updates_cfg} updates, "
+            f"min_delta={training_early_stop_min_delta_cfg:.3f}, "
+            f"hard_dd={training_early_stop_hard_dd_limit_pct_cfg:.1f}% x "
+            f"{training_early_stop_hard_dd_patience_updates_cfg})"
+        )
+    else:
+        print("   ⏹️ Training early-stop: disabled")
 
     metadata_path = log_dir / f"{training_log_prefix}_metadata.json"
     feature_manifest_path = log_dir / f"{training_log_prefix}_active_feature_manifest.json"
@@ -4254,6 +4349,19 @@ def run_experiment6_tape(
         "step_sharpe_checkpoint_enabled": bool(step_sharpe_checkpoint_enabled_cfg),
         "step_sharpe_checkpoint_threshold": float(step_sharpe_checkpoint_threshold_cfg),
         "step_sharpe_checkpoint_subdir": "step_sharpe_checkpoints",
+        "training_early_stop_enabled": bool(training_early_stop_enabled_cfg),
+        "training_early_stop_warmup_steps": int(training_early_stop_warmup_steps_cfg),
+        "training_early_stop_ema_alpha": float(training_early_stop_ema_alpha_cfg),
+        "training_early_stop_min_delta": float(training_early_stop_min_delta_cfg),
+        "training_early_stop_patience_updates": int(training_early_stop_patience_updates_cfg),
+        "training_early_stop_dd_soft_limit_pct": float(training_early_stop_dd_soft_limit_pct_cfg),
+        "training_early_stop_turnover_soft_limit_pct": float(training_early_stop_turnover_soft_limit_pct_cfg),
+        "training_early_stop_dd_penalty_weight": float(training_early_stop_dd_penalty_weight_cfg),
+        "training_early_stop_turnover_penalty_weight": float(training_early_stop_turnover_penalty_weight_cfg),
+        "training_early_stop_hard_dd_limit_pct": float(training_early_stop_hard_dd_limit_pct_cfg),
+        "training_early_stop_hard_dd_patience_updates": int(training_early_stop_hard_dd_patience_updates_cfg),
+        "training_early_stop_mean_adv_abs_threshold": float(training_early_stop_mean_adv_abs_threshold_cfg),
+        "training_early_stop_mean_adv_patience_updates": int(training_early_stop_mean_adv_patience_updates_cfg),
         "saved_checkpoints_for_this_run": [],
     }
 
@@ -4420,6 +4528,7 @@ def run_experiment6_tape(
             "ppo_gae_lambda_schedule": copy.deepcopy(gae_lambda_schedule),
             "num_parallel_envs": int(num_parallel_envs),
             "actor_lr_schedule": actor_lr_schedule,
+            "critic_lr_schedule": critic_lr_schedule,
             "num_ppo_epochs": num_ppo_epochs,
             "batch_size_ppo": batch_size_schedule[0]["batch_size"],
             "batch_size_ppo_schedule": batch_size_schedule,
@@ -4606,6 +4715,12 @@ def run_experiment6_tape(
     current_timestep_rollout = determine_timesteps_per_update(0)
     current_batch_size_ppo = determine_batch_size_ppo(0, current_timestep_rollout)
     update_count = 0
+    training_early_stop_ema_score: Optional[float] = None
+    training_early_stop_best_ema_score = -np.inf
+    training_early_stop_no_improve_updates = 0
+    training_early_stop_hard_dd_counter = 0
+    training_early_stop_low_adv_counter = 0
+    training_early_stop_trigger_reason: Optional[str] = None
     ra_kl_ema_approx_kl: Optional[float] = None
     ra_kl_last_error_ratio = 0.0
     ra_kl_last_adjust_factor = 1.0
@@ -4743,6 +4858,12 @@ def run_experiment6_tape(
                         current_actor_lr = new_actor_lr
                         agent.set_actor_lr(current_actor_lr)
                         print(f"   [TOOL] Actor learning rate adjusted to {current_actor_lr:.6f} at step {step:,}")
+                    new_critic_lr = determine_critic_lr(step)
+                    if not np.isclose(new_critic_lr, current_critic_lr):
+                        current_critic_lr = new_critic_lr
+                        if hasattr(agent, "set_critic_lr"):
+                            agent.set_critic_lr(current_critic_lr)
+                        print(f"   [TOOL] Critic learning rate adjusted to {current_critic_lr:.6f} at step {step:,}")
 
                     if step_diag_csv_logger is not None:
                         turnover_val = float(info.get("turnover", 0.0) or 0.0)
@@ -4932,6 +5053,12 @@ def run_experiment6_tape(
                 current_actor_lr = new_actor_lr
                 agent.set_actor_lr(current_actor_lr)
                 print(f"   [TOOL] Actor learning rate adjusted to {current_actor_lr:.6f} at step {step:,}")
+            new_critic_lr = determine_critic_lr(step)
+            if not np.isclose(new_critic_lr, current_critic_lr):
+                current_critic_lr = new_critic_lr
+                if hasattr(agent, "set_critic_lr"):
+                    agent.set_critic_lr(current_critic_lr)
+                print(f"   [TOOL] Critic learning rate adjusted to {current_critic_lr:.6f} at step {step:,}")
 
             if step_diag_csv_logger is not None:
                 turnover_val = float(info.get("turnover", 0.0) or 0.0)
@@ -5342,6 +5469,69 @@ def run_experiment6_tape(
             ratio_mean_val = to_scalar(ratio_mean_value)
             ratio_std_val = to_scalar(ratio_std_value)
 
+            training_early_stop_score_val: Optional[float] = None
+            if training_early_stop_enabled_cfg:
+                dd_excess = max(0.0, float(episode_max_dd_val) - training_early_stop_dd_soft_limit_pct_cfg)
+                dd_penalty = dd_excess / training_early_stop_dd_soft_limit_pct_cfg
+                turnover_excess = max(
+                    0.0, float(episode_turnover_pct_val) - training_early_stop_turnover_soft_limit_pct_cfg
+                )
+                turnover_penalty = turnover_excess / training_early_stop_turnover_soft_limit_pct_cfg
+                training_early_stop_score_val = float(
+                    float(episode_sharpe_val)
+                    - training_early_stop_dd_penalty_weight_cfg * dd_penalty
+                    - training_early_stop_turnover_penalty_weight_cfg * turnover_penalty
+                )
+                if training_early_stop_ema_score is None:
+                    training_early_stop_ema_score = training_early_stop_score_val
+                else:
+                    training_early_stop_ema_score = float(
+                        (1.0 - training_early_stop_ema_alpha_cfg) * training_early_stop_ema_score
+                        + training_early_stop_ema_alpha_cfg * training_early_stop_score_val
+                    )
+
+                if step >= training_early_stop_warmup_steps_cfg:
+                    if training_early_stop_ema_score > (
+                        training_early_stop_best_ema_score + training_early_stop_min_delta_cfg
+                    ):
+                        training_early_stop_best_ema_score = training_early_stop_ema_score
+                        training_early_stop_no_improve_updates = 0
+                    else:
+                        training_early_stop_no_improve_updates += 1
+
+                    if float(episode_max_dd_val) >= training_early_stop_hard_dd_limit_pct_cfg:
+                        training_early_stop_hard_dd_counter += 1
+                    else:
+                        training_early_stop_hard_dd_counter = 0
+
+                    if abs(float(mean_advantage_val or 0.0)) <= training_early_stop_mean_adv_abs_threshold_cfg:
+                        training_early_stop_low_adv_counter += 1
+                    else:
+                        training_early_stop_low_adv_counter = 0
+
+                    if training_early_stop_hard_dd_counter >= training_early_stop_hard_dd_patience_updates_cfg:
+                        training_early_stop_trigger_reason = (
+                            "hard_drawdown_guard "
+                            f"(dd>={training_early_stop_hard_dd_limit_pct_cfg:.2f}% for "
+                            f"{training_early_stop_hard_dd_counter} updates)"
+                        )
+                    elif training_early_stop_no_improve_updates >= training_early_stop_patience_updates_cfg:
+                        training_early_stop_trigger_reason = (
+                            "ema_patience_exhausted "
+                            f"(no improvement for {training_early_stop_no_improve_updates} updates)"
+                        )
+                    elif (
+                        training_early_stop_low_adv_counter >= training_early_stop_mean_adv_patience_updates_cfg
+                        and training_early_stop_no_improve_updates >= max(
+                            1, training_early_stop_patience_updates_cfg // 2
+                        )
+                    ):
+                        training_early_stop_trigger_reason = (
+                            "low_advantage_stagnation "
+                            f"(|mean_adv|<={training_early_stop_mean_adv_abs_threshold_cfg:.1e} for "
+                            f"{training_early_stop_low_adv_counter} updates)"
+                        )
+
             # Capture live (snapshot) drawdown controller state for this update log row.
             snapshot_drawdown_lambda = to_scalar(getattr(env_train, "drawdown_lambda", None))
             snapshot_drawdown_lambda_peak = to_scalar(getattr(env_train, "drawdown_lambda_peak", None))
@@ -5406,6 +5596,19 @@ def run_experiment6_tape(
                 f"rollout={current_timestep_rollout} | batch_size={current_batch_size_ppo} | "
                 f"gamma={current_ppo_gamma:.4f} | gae_lambda={current_ppo_gae_lambda:.4f}"
             )
+            if training_early_stop_enabled_cfg and training_early_stop_score_val is not None:
+                ema_disp = float(training_early_stop_ema_score or training_early_stop_score_val)
+                best_disp = float(
+                    training_early_stop_best_ema_score
+                    if np.isfinite(training_early_stop_best_ema_score)
+                    else ema_disp
+                )
+                print(
+                    "   ⏹️ Early-stop monitor: "
+                    f"score={training_early_stop_score_val:.4f} | "
+                    f"ema={ema_disp:.4f} | best_ema={best_disp:.4f} | "
+                    f"no_improve={training_early_stop_no_improve_updates}"
+                )
             if ra_kl_enabled:
                 effective_kl_threshold = float(agent.target_kl * agent.kl_stop_multiplier)
                 ema_display = float(ra_kl_ema_approx_kl) if ra_kl_ema_approx_kl is not None else 0.0
@@ -5567,6 +5770,21 @@ def run_experiment6_tape(
                 "ppo_gae_lambda_active": float(current_ppo_gae_lambda),
                 "profile_name": last_profile_name,
                 "turnover_scalar": current_turnover_scalar,
+                "training_early_stop_score": training_early_stop_score_val,
+                "training_early_stop_ema_score": (
+                    float(training_early_stop_ema_score)
+                    if training_early_stop_ema_score is not None
+                    else None
+                ),
+                "training_early_stop_best_ema_score": (
+                    float(training_early_stop_best_ema_score)
+                    if np.isfinite(training_early_stop_best_ema_score)
+                    else None
+                ),
+                "training_early_stop_no_improve_updates": int(training_early_stop_no_improve_updates),
+                "training_early_stop_hard_dd_counter": int(training_early_stop_hard_dd_counter),
+                "training_early_stop_low_adv_counter": int(training_early_stop_low_adv_counter),
+                "training_early_stop_trigger_reason": training_early_stop_trigger_reason,
             }
 
             training_row.update(
@@ -5683,9 +5901,19 @@ def run_experiment6_tape(
             if train_csv_logger is not None:
                 train_csv_logger.log(training_row)
 
+            if training_early_stop_enabled_cfg and training_early_stop_trigger_reason is not None:
+                print(
+                    "   🛑 Early-stop triggered: "
+                    f"{training_early_stop_trigger_reason} "
+                    f"(step={step:,}, update={update_count})"
+                )
+                break
+
     train_end = time.time()
     train_duration = train_end - train_start
     print(f"\n[OK] THREE-COMPONENT TAPE v3 training completed!")
+    if training_early_stop_trigger_reason is not None:
+        print(f"   🛑 Stop reason: {training_early_stop_trigger_reason}")
     print(f"   Total episodes: {training_episode_count}")
     print(f"   Total timesteps: {step:,}")
     print(f"   Training time: {train_duration:.2f}s ({train_duration/60:.2f}min)")
@@ -5804,6 +6032,9 @@ def run_experiment6_tape(
                     else "final_high_watermark_style"
                 ),
                 "deterministic_validation_last_metrics": _json_ready(deterministic_validation_last_metrics),
+                "training_early_stop_enabled": bool(training_early_stop_enabled_cfg),
+                "training_early_stop_triggered": bool(training_early_stop_trigger_reason is not None),
+                "training_early_stop_trigger_reason": training_early_stop_trigger_reason,
                 "saved_checkpoints_for_this_run": unique_records,
                 "saved_checkpoints_count": int(len(unique_records)),
             }
@@ -5836,6 +6067,7 @@ def run_experiment6_tape(
         training_duration=train_duration,
         turnover_curriculum=turnover_curriculum,
         actor_lr_schedule=actor_lr_schedule,
+        critic_lr_schedule=critic_lr_schedule,
     )
 
 

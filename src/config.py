@@ -30,6 +30,7 @@ ANALYSIS_END_DATE = "2025-09-01"
 # - Benchmark (paper-aligned train cutoff)
 # - COVID stress test (test starts 2020-01-01)
 TRAIN_TEST_SPLIT_DATE_BENCHMARK = "2021-09-01"     # Train: <= 2021-09-01
+TRAIN_TEST_SPLIT_DATE_RECENT = "2021-12-31"        # Train: <= 2021-12-31
 TRAIN_TEST_SPLIT_DATE_COVID_STRESS = "2019-12-31"  # Train: <= 2019-12-31
 TRAIN_TEST_SPLIT_DATE = TRAIN_TEST_SPLIT_DATE_BENCHMARK
 
@@ -75,7 +76,7 @@ DYNAMIC_COVARIANCE_PARAMS = {
 }
 
 ACTUARIAL_PARAMS = {
-    "enabled": True,
+    "enabled": False,
     "severity_buckets": [0.05, 0.10, 0.15, 0.20, 0.25, 0.30],
     "development_horizons": [10, 20, 30, 60, 90, 120],
     "min_events_for_credibility": 2,       # Reduced from 5 — censored events increase sample size
@@ -88,13 +89,18 @@ FUNDAMENTAL_FEATURES_CONFIG = {
     # CSV expected to contain columns: Date, Ticker, FCFE, Revenue, NCFO
     "data_path": os.path.join(BASE_DATA_PATH, "quarterly_fundamentals.csv"),
     "lag_quarters": 8,
-    "staleness_days_normalizer": 90.0
+    "staleness_days_normalizer": 90.0,
+    # Information-availability guard: shift feature availability forward by N days.
+    # If your CSV "Date" is already the publication/release date, keep at 1.
+    # If "Date" is period-end, increase (e.g., 45-60) to avoid look-ahead bias.
+    "report_lag_days": 1,
 }
 
 # Canonical Exp6 feature-audit active set.
 # This is enforced via allowlist to keep training/evaluation deterministic.
-# Non-actuarial count: 55 (includes 3 regime-buy features)
-# Total count: 59 (55 + 4 actuarial)
+# Default runtime uses the non-actuarial subset (actuarial is optional/off).
+# Non-actuarial count: 60 (includes 3 regime-buy + 5 alpha-return features)
+# Full count with actuarial extension: 64 (60 + 4 actuarial)
 PHASE12_AUDIT_ACTIVE_FEATURES_NON_ACTUARIAL = [
     # Returns + risk moments
     "LogReturn_1d",
@@ -130,6 +136,11 @@ PHASE12_AUDIT_ACTIVE_FEATURES_NON_ACTUARIAL = [
     "Regime_Corr_to_Market",
     "Regime_Breadth_Positive",
     "CrossSectional_ZScore_LogReturn_1d",
+    "AlphaRet_1d",
+    "AlphaRet_5d",
+    "AlphaRet_20d",
+    "AlphaRet_5d_Z",
+    "AlphaRet_20d_Z",
     "Residual_Momentum_21",
     "Volume_Percentile_63",
     "ShortTerm_Reversal_5",
@@ -182,10 +193,10 @@ FEATURE_SELECTION_CONFIG = {
     # Enforce the audit plan globally (Phase 1 and eval paths).
     "enforce_allowlist": True,
     "allowlist_apply_to_phase2": False,
-    "active_features_allowlist": copy.deepcopy(PHASE12_AUDIT_ACTIVE_FEATURES),
+    "active_features_allowlist": copy.deepcopy(PHASE12_AUDIT_ACTIVE_FEATURES_NON_ACTUARIAL),
     "feature_audit_plan_name": "exp6_feature_audit_20260221_v2",
     "feature_audit_expected_non_actuarial_count": len(PHASE12_AUDIT_ACTIVE_FEATURES_NON_ACTUARIAL),
-    "feature_audit_expected_total_count": len(PHASE12_AUDIT_ACTIVE_FEATURES),
+    "feature_audit_expected_total_count": len(PHASE12_AUDIT_ACTIVE_FEATURES_NON_ACTUARIAL),
 }
 
 ALPHA_FEATURES_CONFIG = {
@@ -196,6 +207,8 @@ ALPHA_FEATURES_CONFIG = {
     "reversal_window": 5,
     "vol_of_vol_window": 63,
     "beta_window": 63,
+    "alpha_return_windows": [1, 5, 20],
+    "alpha_return_zscore_windows": [5, 20],
     "obv_window": 21,
     "yield_curve": {
         "long_col": "DGS10_level",
@@ -275,6 +288,9 @@ MACRO_DATA_CONFIG = {
     "fred_series_config": FRED_SERIES_CONFIG,
     "business_days_only": True,
     "ffill_limit": None,
+    # Information-availability guard: each macro value becomes usable after N days.
+    # Default 1 day prevents same-day publication leakage.
+    "release_lag_days": 1,
 }
 
 # --- PERFORMANCE CALCULATION PARAMETERS ---
@@ -1268,7 +1284,7 @@ RUN9_ALPHA_OVERRIDES = {
     "TRAIN_TEST_SPLIT_DATE": TRAIN_TEST_SPLIT_DATE_COVID_STRESS,
     "feature_params": {
         "fundamental_features": {"enabled": False},
-        "actuarial_params": {"enabled": True},
+        "actuarial_params": {"enabled": False},
     },
     "agent_params": {
         "actor_critic_type": "TCN_FUSION",
@@ -1471,6 +1487,93 @@ RUN9_ALPHA_OVERRIDES = {
 }
 
 
+RUN10_ALPHA_OVERRIDES = copy.deepcopy(RUN9_ALPHA_OVERRIDES)
+RUN10_ALPHA_OVERRIDES.update(
+    {
+        "TRAIN_TEST_SPLIT_DATE": TRAIN_TEST_SPLIT_DATE_RECENT,
+        "ANALYSIS_START_DATE": "2016-01-01",
+    }
+)
+RUN10_ALPHA_OVERRIDES["agent_params"].update(
+    {
+        "regime_conditioning_enabled": True,
+        "regime_conditioning_mode": "film",
+        "regime_conditioning_dropout": 0.05,
+    }
+)
+RUN10_ALPHA_OVERRIDES["agent_params"]["ppo_params"].update(
+    {
+        "risk_aux_mvo_coef": 0.002,
+    }
+)
+RUN10_ALPHA_OVERRIDES["feature_params"].update(
+    {
+        "actuarial_params": {"enabled": False},
+        "feature_selection": {
+            "active_features_allowlist": copy.deepcopy(PHASE12_AUDIT_ACTIVE_FEATURES_NON_ACTUARIAL),
+            "feature_audit_expected_non_actuarial_count": len(PHASE12_AUDIT_ACTIVE_FEATURES_NON_ACTUARIAL),
+            "feature_audit_expected_total_count": len(PHASE12_AUDIT_ACTIVE_FEATURES_NON_ACTUARIAL),
+        },
+        "alpha_features": {
+            "enabled": True,
+            "alpha_return_windows": [1, 5, 20],
+            "alpha_return_zscore_windows": [5, 20],
+        }
+    }
+)
+RUN10_ALPHA_OVERRIDES["training_params"].update(
+    {
+        "action_execution_beta_schedule": [
+            {"threshold": 0, "beta": 0.25},
+            {"threshold": 100_000, "beta": 0.35},
+            {"threshold": 200_000, "beta": 0.45},
+            {"threshold": 350_000, "beta": 0.50},
+        ],
+        "critic_lr_schedule": [
+            {"threshold": 0, "lr": 1.5e-4},
+            {"threshold": 150_000, "lr": 1.2e-4},
+            {"threshold": 350_000, "lr": 1.0e-4},
+        ],
+        "action_execution_beta_curriculum": {
+            0: 0.25,
+            100_000: 0.35,
+            200_000: 0.45,
+            350_000: 0.50,
+        },
+        "evaluation_action_execution_beta": 0.50,
+        "turnover_penalty_curriculum": {
+            0: 0.35,
+            100_000: 0.55,
+            200_000: 0.75,
+            300_000: 0.90,
+            400_000: 1.00,
+        },
+        "ppo_entropy_coef_schedule": [
+            {"threshold": 0, "entropy_coef": 0.003},
+            {"threshold": 100_000, "entropy_coef": 0.003},
+            {"threshold": 250_000, "entropy_coef": 0.0025},
+            {"threshold": 400_000, "entropy_coef": 0.0015},
+        ],
+        "deterministic_validation_checkpointing_enabled": False,
+        "deterministic_validation_checkpointing_only": False,
+        "periodic_checkpoint_every_steps": 50_000,
+        "training_early_stop_enabled": True,
+        "training_early_stop_warmup_steps": 100_000,
+        "training_early_stop_ema_alpha": 0.10,
+        "training_early_stop_min_delta": 0.01,
+        "training_early_stop_patience_updates": 25,
+        "training_early_stop_dd_soft_limit_pct": 25.0,
+        "training_early_stop_turnover_soft_limit_pct": 35.0,
+        "training_early_stop_dd_penalty_weight": 0.60,
+        "training_early_stop_turnover_penalty_weight": 0.30,
+        "training_early_stop_hard_dd_limit_pct": 45.0,
+        "training_early_stop_hard_dd_patience_updates": 8,
+        "training_early_stop_mean_adv_abs_threshold": 1e-4,
+        "training_early_stop_mean_adv_patience_updates": 20,
+    }
+)
+
+
 def apply_run9_alpha_overrides(config: dict, overrides: dict = None) -> dict:
     """Apply the canonical Run9 alpha-generation training recipe in-place."""
     global TRAIN_TEST_SPLIT_DATE
@@ -1489,6 +1592,7 @@ def assert_run9_alpha_config(config: dict) -> None:
     ppo = agent.get("ppo_params", {})
     env = config.get("environment_params", {})
     training = config.get("training_params", {})
+    feature_params = config.get("feature_params", {})
     assert not bool(agent.get("regime_conditioning_enabled", False)), "regime_conditioning_enabled drifted on"
     assert bool(agent.get("distributional_critic_enabled", False)), "distributional_critic_enabled must stay on"
     assert float(ppo.get("risk_aux_mvo_coef", 0.0)) == 0.0, "risk_aux_mvo_coef must stay off"
@@ -1499,13 +1603,19 @@ def assert_run9_alpha_config(config: dict) -> None:
         "fusion_cross_asset_mixer_enabled must stay off for the canonical alpha run"
     )
     assert bool(training.get("deterministic_validation_checkpointing_enabled", False)), (
-        "deterministic validation must stay enabled"
+        "deterministic validation must stay enabled for Run9"
     )
     assert not bool(training.get("high_watermark_checkpoint_enabled", True)), (
         "legacy high-watermark checkpoints must stay off"
     )
+    assert bool(training.get("deterministic_validation_checkpointing_only", False)), (
+        "deterministic_validation_checkpointing_only must stay enabled for Run9"
+    )
     assert bool(training.get("deterministic_validation_require_spy_outperformance", False)), (
         "deterministic validation must require SPY outperformance"
+    )
+    assert not bool(feature_params.get("actuarial_params", {}).get("enabled", False)), (
+        "Actuarial features are globally disabled and must stay off"
     )
     assert float(ppo.get("entropy_coef", 1.0)) <= 0.003, "base entropy must stay in the low-entropy regime"
     assert float(ppo.get("alpha_dispersion_coef", 0.0)) >= 0.05, "alpha_dispersion_coef drifted below the calibrated floor"
@@ -1531,6 +1641,101 @@ def build_run9_alpha_config(
     if analysis_end_date is not None:
         config["ANALYSIS_END_DATE"] = analysis_end_date
     assert_run9_alpha_config(config)
+    return config
+
+
+def apply_run10_alpha_overrides(config: dict, overrides: dict = None) -> dict:
+    """Apply the canonical Run10 alpha-generation training recipe in-place."""
+    global TRAIN_TEST_SPLIT_DATE
+    resolved = copy.deepcopy(RUN10_ALPHA_OVERRIDES if overrides is None else overrides)
+    split_date = resolved.get("TRAIN_TEST_SPLIT_DATE")
+    if split_date:
+        TRAIN_TEST_SPLIT_DATE = split_date
+        config["TRAIN_TEST_SPLIT_DATE"] = split_date
+    _deep_update_config(config, resolved)
+    return config
+
+
+def assert_run10_alpha_config(config: dict) -> None:
+    """Raise if a config expected to match the Run10 alpha recipe drifted."""
+    agent = config.get("agent_params", {})
+    ppo = agent.get("ppo_params", {})
+    env = config.get("environment_params", {})
+    training = config.get("training_params", {})
+    feature_params = config.get("feature_params", {})
+    assert str(config.get("TRAIN_TEST_SPLIT_DATE", "")) == str(TRAIN_TEST_SPLIT_DATE_RECENT), (
+        "Run10 split date drifted from the recent-window target"
+    )
+    assert str(config.get("ANALYSIS_START_DATE", "")) == "2016-01-01", (
+        "Run10 analysis start date drifted from the recent-window target"
+    )
+    assert bool(agent.get("regime_conditioning_enabled", False)), "regime_conditioning_enabled must stay on"
+    assert str(agent.get("regime_conditioning_mode", "concat")).lower() == "film", "regime_conditioning_mode must be film"
+    assert bool(agent.get("distributional_critic_enabled", False)), "distributional_critic_enabled must stay on"
+    assert float(ppo.get("risk_aux_mvo_coef", 0.0)) >= 0.002, "risk_aux_mvo_coef drifted below the Run10 floor"
+    assert float(ppo.get("risk_aux_cvar_coef", 0.0)) == 0.0, "step-level CVaR aux must stay off"
+    assert not bool(env.get("episode_cvar_enabled", False)), "episode_cvar_enabled must stay off"
+    assert bool(ppo.get("lagrangian_cvar_enabled", False)), "lagrangian_cvar_enabled must stay on"
+    assert not bool(agent.get("fusion_cross_asset_mixer_enabled", True)), (
+        "fusion_cross_asset_mixer_enabled must stay off for the canonical alpha run"
+    )
+    assert not bool(training.get("deterministic_validation_checkpointing_enabled", True)), (
+        "deterministic validation must stay disabled for Run10 compute-efficient mode"
+    )
+    assert not bool(training.get("high_watermark_checkpoint_enabled", True)), (
+        "legacy high-watermark checkpoints must stay off"
+    )
+    assert not bool(training.get("deterministic_validation_checkpointing_only", True)), (
+        "deterministic_validation_checkpointing_only must stay disabled when det-validation is off"
+    )
+    assert int(training.get("periodic_checkpoint_every_steps", 0)) > 0, (
+        "periodic checkpoints must stay enabled in Run10 compute-efficient mode"
+    )
+    assert bool(training.get("training_early_stop_enabled", False)), (
+        "training_early_stop_enabled must stay on for Run10 compute-efficient mode"
+    )
+    assert float(ppo.get("entropy_coef", 1.0)) <= 0.003, "base entropy must stay in the low-entropy regime"
+    assert float(ppo.get("alpha_dispersion_coef", 0.0)) >= 0.05, "alpha_dispersion_coef drifted below the calibrated floor"
+    assert float(ppo.get("aux_return_pred_coef", 0.0)) >= 0.25, "aux_return_pred_coef drifted below the calibrated floor"
+    assert not bool(feature_params.get("actuarial_params", {}).get("enabled", False)), (
+        "Run10 actuarial features must stay disabled"
+    )
+
+    expected_turnover = copy.deepcopy(RUN10_ALPHA_OVERRIDES["training_params"]["turnover_penalty_curriculum"])
+    actual_turnover = {
+        int(threshold): float(value)
+        for threshold, value in dict(training.get("turnover_penalty_curriculum", {})).items()
+    }
+    assert actual_turnover == expected_turnover, "turnover_penalty_curriculum drifted from the canonical Run10 schedule"
+
+    expected_beta = copy.deepcopy(RUN10_ALPHA_OVERRIDES["training_params"]["action_execution_beta_curriculum"])
+    actual_beta = {
+        int(threshold): float(value)
+        for threshold, value in dict(training.get("action_execution_beta_curriculum", {})).items()
+    }
+    assert actual_beta == expected_beta, "action_execution_beta_curriculum drifted from the canonical Run10 schedule"
+
+    expected_entropy = copy.deepcopy(RUN10_ALPHA_OVERRIDES["training_params"]["ppo_entropy_coef_schedule"])
+    actual_entropy = copy.deepcopy(training.get("ppo_entropy_coef_schedule", []))
+    assert actual_entropy == expected_entropy, "ppo_entropy_coef_schedule drifted from the canonical Run10 schedule"
+    expected_critic_schedule = copy.deepcopy(RUN10_ALPHA_OVERRIDES["training_params"]["critic_lr_schedule"])
+    actual_critic_schedule = copy.deepcopy(training.get("critic_lr_schedule", []))
+    assert actual_critic_schedule == expected_critic_schedule, "critic_lr_schedule drifted from the canonical Run10 schedule"
+
+
+def build_run10_alpha_config(
+    phase_name: str = "phase1",
+    *,
+    analysis_end_date: str | None = None,
+    overrides: dict | None = None,
+) -> dict:
+    """Return a deep-copied phase config with feature-audit + Run10 alpha overrides applied."""
+    config = copy.deepcopy(get_active_config(phase_name))
+    enforce_feature_audit_plan(config)
+    apply_run10_alpha_overrides(config, overrides=overrides)
+    if analysis_end_date is not None:
+        config["ANALYSIS_END_DATE"] = analysis_end_date
+    assert_run10_alpha_config(config)
     return config
 
 

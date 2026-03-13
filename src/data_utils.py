@@ -877,6 +877,13 @@ class DataProcessor:
             fundamentals["Date"], utc=True, errors="coerce"
         ).dt.tz_localize(None)
         fundamentals = fundamentals.dropna(subset=["Date"])
+        report_lag_days = int(max(0, params.get("report_lag_days", 0)))
+        if report_lag_days > 0:
+            logger.info(
+                "Applying fundamental as-of lag: report_lag_days=%d (features become available after publication lag).",
+                report_lag_days,
+            )
+        fundamentals["DateEffective"] = fundamentals["Date"] + pd.to_timedelta(report_lag_days, unit="D")
 
         if self.asset_tickers:
             fundamentals = fundamentals[fundamentals["Ticker"].isin(self.asset_tickers)]
@@ -929,8 +936,12 @@ class DataProcessor:
                 daily_frames.append(empty_values)
                 continue
 
-            ticker_fund = ticker_fund.set_index("Date")
-            ticker_fund["ReportDate"] = ticker_fund.index
+            # Use effective date for feature availability, keep original report date for staleness.
+            ticker_fund = ticker_fund.sort_values("DateEffective").drop_duplicates(
+                subset=["DateEffective"], keep="last"
+            )
+            ticker_fund = ticker_fund.set_index("DateEffective")
+            ticker_fund["ReportDate"] = ticker_fund["Date"]
 
             reindexed = ticker_fund[final_feature_cols + ["ReportDate"]].reindex(ticker_dates)
             reindexed[final_feature_cols] = reindexed[final_feature_cols].ffill()
@@ -1352,6 +1363,62 @@ class DataProcessor:
             df[feature_name] = ((df[cross_col] - mean) / std).replace([np.inf, -np.inf], np.nan)
             new_cols.append(feature_name)
 
+        # Alpha returns versus same-day market return proxy (equal-weight universe mean).
+        # This improves relative asset discrimination by removing market-wide drift.
+        alpha_return_windows_raw = alpha_cfg.get("alpha_return_windows", [1, 5, 20])
+        alpha_return_windows: List[int] = []
+        if isinstance(alpha_return_windows_raw, (list, tuple)):
+            for window_raw in alpha_return_windows_raw:
+                try:
+                    window_val = int(window_raw)
+                except (TypeError, ValueError):
+                    continue
+                if window_val > 0:
+                    alpha_return_windows.append(window_val)
+        alpha_return_windows = sorted(set(alpha_return_windows))
+
+        alpha_return_z_windows_raw = alpha_cfg.get("alpha_return_zscore_windows", [5, 20])
+        alpha_return_z_windows = set()
+        if isinstance(alpha_return_z_windows_raw, (list, tuple)):
+            for window_raw in alpha_return_z_windows_raw:
+                try:
+                    window_val = int(window_raw)
+                except (TypeError, ValueError):
+                    continue
+                if window_val > 0:
+                    alpha_return_z_windows.add(window_val)
+
+        if alpha_return_windows and "LogReturn_1d" in df.columns:
+            market_proxy_col = "_tmp_market_return_1d_alpha"
+            base_alpha_col = "_tmp_alpha_return_1d"
+            df[market_proxy_col] = df.groupby(self.date_col)["LogReturn_1d"].transform("mean")
+            df[base_alpha_col] = pd.to_numeric(df["LogReturn_1d"], errors="coerce") - pd.to_numeric(
+                df[market_proxy_col], errors="coerce"
+            )
+
+            for window in alpha_return_windows:
+                feature_name = f"AlphaRet_{window}d"
+                if window == 1:
+                    df[feature_name] = df[base_alpha_col]
+                else:
+                    df[feature_name] = df.groupby(self.ticker_col)[base_alpha_col].transform(
+                        lambda s: s.rolling(window, min_periods=window).sum()
+                    )
+                new_cols.append(feature_name)
+
+                if window in alpha_return_z_windows:
+                    z_name = f"{feature_name}_Z"
+                    rolling_mean = df.groupby(self.ticker_col)[feature_name].transform(
+                        lambda s: s.rolling(window, min_periods=window).mean()
+                    )
+                    rolling_std = df.groupby(self.ticker_col)[feature_name].transform(
+                        lambda s: s.rolling(window, min_periods=window).std(ddof=0)
+                    )
+                    df[z_name] = (df[feature_name] - rolling_mean) / (rolling_std + eps)
+                    new_cols.append(z_name)
+
+            df.drop(columns=[market_proxy_col, base_alpha_col], inplace=True, errors="ignore")
+
         # Residual momentum
         momentum_window = int(alpha_cfg.get("residual_momentum_window", 21))
         if momentum_window > 1 and self.close_col in df.columns:
@@ -1708,6 +1775,13 @@ class DataProcessor:
             logger.warning("Macro data enabled but 'fred_series_config' is empty.")
             return None, []
 
+        default_release_lag_days = int(max(0, macro_config.get("release_lag_days", 0)))
+        if default_release_lag_days > 0:
+            logger.info(
+                "Applying macro as-of lag: release_lag_days=%d (overridable per series).",
+                default_release_lag_days,
+            )
+
         for spec in series_configs:
             base_series = self._download_macro_series(fred_client, spec, date_index)
             if base_series is None:
@@ -1721,6 +1795,12 @@ class DataProcessor:
                 transformed = self._apply_macro_transformation(base_series, calc)
                 if transformed is None:
                     continue
+
+                # Strict as-of alignment: value at day t becomes usable only after lag.
+                # Per-series override takes precedence over macro-level default.
+                release_lag_days = int(max(0, spec.get("release_lag_days", default_release_lag_days)))
+                if release_lag_days > 0:
+                    transformed = transformed.shift(release_lag_days)
 
                 col_name = f"{series_name}_{calc}"
                 macro_df[col_name] = transformed.values
