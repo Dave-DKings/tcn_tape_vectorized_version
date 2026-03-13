@@ -2263,6 +2263,14 @@ def run_experiment6_tape(
         fallback_value=base_entropy_coef,
     )
 
+    # Auxiliary per-asset return prediction coefficient schedule.
+    base_aux_return_pred_coef = float(ppo_params_root.get("aux_return_pred_coef", 0.1))
+    aux_return_pred_coef_schedule = _parse_float_schedule(
+        training_params.get("aux_return_pred_coef_schedule", []),
+        value_key="aux_return_pred_coef",
+        fallback_value=base_aux_return_pred_coef,
+    )
+
     # SOTA-FIX: Dirichlet temperature annealing schedule
     base_temperature = float(
         config.get("agent_params", {}).get("dirichlet_logit_temperature", 1.0)
@@ -2297,6 +2305,16 @@ def run_experiment6_tape(
         for entry in entropy_coef_schedule:
             if current_step >= int(entry["threshold"]):
                 active = float(entry["entropy_coef"])
+            else:
+                break
+        return active
+
+    def determine_aux_return_pred_coef(current_step: int) -> float:
+        """Resolve current aux-return loss coefficient from schedule."""
+        active = float(aux_return_pred_coef_schedule[0]["aux_return_pred_coef"])
+        for entry in aux_return_pred_coef_schedule:
+            if current_step >= int(entry["threshold"]):
+                active = float(entry["aux_return_pred_coef"])
             else:
                 break
         return active
@@ -3167,10 +3185,14 @@ def run_experiment6_tape(
     entropy_schedule_pretty = " => ".join(
         f"{entry['entropy_coef']:.4f}@{entry['threshold']:,}" for entry in entropy_coef_schedule
     )
+    aux_return_coef_schedule_pretty = " => ".join(
+        f"{entry['aux_return_pred_coef']:.4f}@{entry['threshold']:,}" for entry in aux_return_pred_coef_schedule
+    )
     temp_schedule_pretty = " => ".join(
         f"{entry['temperature']:.4f}@{entry['threshold']:,}" for entry in temperature_schedule
     )
     print(f"   🎯 Entropy coef schedule: {entropy_schedule_pretty}")
+    print(f"   🧪 Aux-return coef schedule: {aux_return_coef_schedule_pretty}")
     print(f"   🌡️ Temperature schedule: {temp_schedule_pretty}")
     if len(timestep_update_schedule) > 1:
         rollout_schedule_pretty = " => ".join(
@@ -4706,10 +4728,13 @@ def run_experiment6_tape(
     current_ppo_gamma = float(determine_ppo_gamma(0))
     current_ppo_gae_lambda = float(determine_ppo_gae_lambda(0))
     current_entropy_coef = float(determine_entropy_coef(0))
+    current_aux_return_pred_coef = float(determine_aux_return_pred_coef(0))
     current_temperature = float(determine_temperature(0))
     agent.gamma = current_ppo_gamma
     agent.gae_lambda = current_ppo_gae_lambda
     agent.entropy_coef = current_entropy_coef
+    if hasattr(agent, "aux_return_pred_coef"):
+        agent.aux_return_pred_coef = current_aux_return_pred_coef
     if hasattr(agent.actor, 'set_temperature'):
         agent.actor.set_temperature(current_temperature)
     current_timestep_rollout = determine_timesteps_per_update(0)
@@ -4780,6 +4805,15 @@ def run_experiment6_tape(
             agent.entropy_coef = current_entropy_coef
             print(f"\n🎯 ENTROPY COEF UPDATE at {step:,} steps:")
             print(f"   entropy_coef: {current_entropy_coef:.4f}")
+
+        # Aux-return coefficient schedule
+        active_aux_return_pred_coef = float(determine_aux_return_pred_coef(step))
+        if not np.isclose(active_aux_return_pred_coef, current_aux_return_pred_coef):
+            current_aux_return_pred_coef = active_aux_return_pred_coef
+            if hasattr(agent, "aux_return_pred_coef"):
+                agent.aux_return_pred_coef = current_aux_return_pred_coef
+            print(f"\n🧪 AUX-RETURN COEF UPDATE at {step:,} steps:")
+            print(f"   aux_return_pred_coef: {current_aux_return_pred_coef:.4f}")
 
         # SOTA-FIX: Dirichlet temperature schedule
         active_temperature = float(determine_temperature(step))

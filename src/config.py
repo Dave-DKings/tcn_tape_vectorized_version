@@ -1341,7 +1341,7 @@ RUN9_ALPHA_OVERRIDES = {
             "risk_aux_mvo_long_only": True,
             "risk_aux_mvo_risky_budget": 0.95,
             "aux_return_pred_enabled": True,
-            "aux_return_pred_coef": 0.25,
+            "aux_return_pred_coef": 0.35,
             "lagrangian_cvar_enabled": True,
             "lagrangian_cvar_threshold": -0.025,
             "lagrangian_cvar_lr": 0.004,
@@ -1371,7 +1371,7 @@ RUN9_ALPHA_OVERRIDES = {
         "drawdown_constraint": {
             "target": 0.15,
             "tolerance": -0.01,
-            "penalty_coef": 2.5,
+            "penalty_coef": 1.5,
             "lambda_init": 0.10,
             "lambda_carry_decay": 0.4,
         },
@@ -1412,9 +1412,9 @@ RUN9_ALPHA_OVERRIDES = {
             {"threshold": 400_000, "entropy_coef": 0.001},
         ],
         "dirichlet_temperature_schedule": [
-            {"threshold": 0, "temperature": 1.2},
-            {"threshold": 150_000, "temperature": 1.0},
-            {"threshold": 300_000, "temperature": 0.9},
+            {"threshold": 0, "temperature": 1.0},
+            {"threshold": 150_000, "temperature": 0.9},
+            {"threshold": 300_000, "temperature": 0.8},
         ],
         "ra_kl_enabled": False,
         "use_episode_length_curriculum": True,
@@ -1438,7 +1438,7 @@ RUN9_ALPHA_OVERRIDES = {
             200_000: 0.55,
             350_000: 0.55,
         },
-        "evaluation_action_execution_beta": 0.55,
+        "evaluation_action_execution_beta": 0.60,
         "turnover_penalty_curriculum": {
             0: 0.50,
             100_000: 0.75,
@@ -1504,6 +1504,14 @@ RUN10_ALPHA_OVERRIDES["agent_params"].update(
 RUN10_ALPHA_OVERRIDES["agent_params"]["ppo_params"].update(
     {
         "risk_aux_mvo_coef": 0.002,
+        "lagrangian_cvar_penalty_scale": 3.0,
+    }
+)
+RUN10_ALPHA_OVERRIDES["environment_params"].update(
+    {
+        "drawdown_constraint": {
+            "penalty_coef": 1.5,
+        },
     }
 )
 RUN10_ALPHA_OVERRIDES["feature_params"].update(
@@ -1524,10 +1532,10 @@ RUN10_ALPHA_OVERRIDES["feature_params"].update(
 RUN10_ALPHA_OVERRIDES["training_params"].update(
     {
         "action_execution_beta_schedule": [
-            {"threshold": 0, "beta": 0.25},
-            {"threshold": 100_000, "beta": 0.35},
-            {"threshold": 200_000, "beta": 0.45},
-            {"threshold": 350_000, "beta": 0.50},
+            {"threshold": 0, "beta": 0.35},
+            {"threshold": 100_000, "beta": 0.45},
+            {"threshold": 200_000, "beta": 0.55},
+            {"threshold": 350_000, "beta": 0.60},
         ],
         "critic_lr_schedule": [
             {"threshold": 0, "lr": 1.5e-4},
@@ -1535,14 +1543,14 @@ RUN10_ALPHA_OVERRIDES["training_params"].update(
             {"threshold": 350_000, "lr": 1.0e-4},
         ],
         "action_execution_beta_curriculum": {
-            0: 0.25,
-            100_000: 0.35,
-            200_000: 0.45,
-            350_000: 0.50,
-        },
-        "evaluation_action_execution_beta": 0.50,
-        "turnover_penalty_curriculum": {
             0: 0.35,
+            100_000: 0.45,
+            200_000: 0.55,
+            350_000: 0.60,
+        },
+        "evaluation_action_execution_beta": 0.60,
+        "turnover_penalty_curriculum": {
+            0: 0.25,
             100_000: 0.55,
             200_000: 0.75,
             300_000: 0.90,
@@ -1554,9 +1562,22 @@ RUN10_ALPHA_OVERRIDES["training_params"].update(
             {"threshold": 250_000, "entropy_coef": 0.0025},
             {"threshold": 400_000, "entropy_coef": 0.0015},
         ],
+        "aux_return_pred_coef_schedule": [
+            {"threshold": 0, "aux_return_pred_coef": 0.35},
+            {"threshold": 150_000, "aux_return_pred_coef": 0.30},
+            {"threshold": 300_000, "aux_return_pred_coef": 0.25},
+        ],
+        "dirichlet_temperature_schedule": [
+            {"threshold": 0, "temperature": 1.0},
+            {"threshold": 150_000, "temperature": 0.9},
+            {"threshold": 300_000, "temperature": 0.8},
+        ],
         "deterministic_validation_checkpointing_enabled": False,
         "deterministic_validation_checkpointing_only": False,
         "periodic_checkpoint_every_steps": 50_000,
+        "high_watermark_checkpoint_enabled": True,
+        "high_watermark_sharpe_threshold": 0.70,
+        "high_watermark_max_drawdown_abs_threshold": 0.25,
         "training_early_stop_enabled": True,
         "training_early_stop_warmup_steps": 100_000,
         "training_early_stop_ema_alpha": 0.10,
@@ -1619,7 +1640,7 @@ def assert_run9_alpha_config(config: dict) -> None:
     )
     assert float(ppo.get("entropy_coef", 1.0)) <= 0.003, "base entropy must stay in the low-entropy regime"
     assert float(ppo.get("alpha_dispersion_coef", 0.0)) >= 0.05, "alpha_dispersion_coef drifted below the calibrated floor"
-    assert float(ppo.get("aux_return_pred_coef", 0.0)) >= 0.25, "aux_return_pred_coef drifted below the calibrated floor"
+    assert float(ppo.get("aux_return_pred_coef", 0.0)) >= 0.35, "aux_return_pred_coef drifted below the calibrated floor"
     expected_turnover = copy.deepcopy(RUN9_ALPHA_OVERRIDES["training_params"]["turnover_penalty_curriculum"])
     actual_turnover = {
         int(threshold): float(value)
@@ -1682,8 +1703,8 @@ def assert_run10_alpha_config(config: dict) -> None:
     assert not bool(training.get("deterministic_validation_checkpointing_enabled", True)), (
         "deterministic validation must stay disabled for Run10 compute-efficient mode"
     )
-    assert not bool(training.get("high_watermark_checkpoint_enabled", True)), (
-        "legacy high-watermark checkpoints must stay off"
+    assert bool(training.get("high_watermark_checkpoint_enabled", False)), (
+        "high_watermark_checkpoint_enabled must stay on for Run10 checkpoint selection"
     )
     assert not bool(training.get("deterministic_validation_checkpointing_only", True)), (
         "deterministic_validation_checkpointing_only must stay disabled when det-validation is off"
@@ -1718,6 +1739,13 @@ def assert_run10_alpha_config(config: dict) -> None:
     expected_entropy = copy.deepcopy(RUN10_ALPHA_OVERRIDES["training_params"]["ppo_entropy_coef_schedule"])
     actual_entropy = copy.deepcopy(training.get("ppo_entropy_coef_schedule", []))
     assert actual_entropy == expected_entropy, "ppo_entropy_coef_schedule drifted from the canonical Run10 schedule"
+    expected_aux_return_coef_schedule = copy.deepcopy(
+        RUN10_ALPHA_OVERRIDES["training_params"]["aux_return_pred_coef_schedule"]
+    )
+    actual_aux_return_coef_schedule = copy.deepcopy(training.get("aux_return_pred_coef_schedule", []))
+    assert actual_aux_return_coef_schedule == expected_aux_return_coef_schedule, (
+        "aux_return_pred_coef_schedule drifted from the canonical Run10 schedule"
+    )
     expected_critic_schedule = copy.deepcopy(RUN10_ALPHA_OVERRIDES["training_params"]["critic_lr_schedule"])
     actual_critic_schedule = copy.deepcopy(training.get("critic_lr_schedule", []))
     assert actual_critic_schedule == expected_critic_schedule, "critic_lr_schedule drifted from the canonical Run10 schedule"
