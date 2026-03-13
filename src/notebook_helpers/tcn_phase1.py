@@ -6196,6 +6196,12 @@ def evaluate_experiment6_checkpoint(
             env_params.get("turnover_penalty_scalar", 1.5),
         )
     )
+    eval_action_execution_beta = float(
+        training_params.get(
+            "evaluation_action_execution_beta",
+            env_params.get("action_execution_beta", 1.0),
+        )
+    )
 
     def _resolve_explicit_paths(path_override: str) -> Tuple[str, str, str]:
         """Return (actor_path, critic_path, description) for a user-provided checkpoint path or prefix."""
