@@ -1596,6 +1596,11 @@ RUN10_ALPHA_OVERRIDES["training_params"].update(
 
 
 RUN11_RELAXED_OVERRIDES = copy.deepcopy(RUN10_ALPHA_OVERRIDES)
+RUN11_RELAXED_OVERRIDES.update(
+    {
+        "ANALYSIS_START_DATE": "2012-01-01",
+    }
+)
 RUN11_RELAXED_OVERRIDES["agent_params"]["ppo_params"].update(
     {
         "lagrangian_cvar_threshold": -0.035,
@@ -1858,8 +1863,8 @@ def assert_run11_relaxed_config(config: dict) -> None:
     assert str(config.get("TRAIN_TEST_SPLIT_DATE", "")) == str(TRAIN_TEST_SPLIT_DATE_RECENT), (
         "Run11 split date drifted from the recent-window target"
     )
-    assert str(config.get("ANALYSIS_START_DATE", "")) == "2016-01-01", (
-        "Run11 analysis start date drifted from the recent-window target"
+    assert str(config.get("ANALYSIS_START_DATE", "")) == "2012-01-01", (
+        "Run11 analysis start date drifted from the 10-year training target"
     )
     assert bool(agent.get("regime_conditioning_enabled", False)), "regime_conditioning_enabled must stay on"
     assert str(agent.get("regime_conditioning_mode", "concat")).lower() == "film", "regime_conditioning_mode must be film"
