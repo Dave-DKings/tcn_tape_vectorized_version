@@ -565,6 +565,12 @@ PHASE1_CONFIG = {
         "dual_head_projection_use_constraints": False,
         "dual_head_projection_max_single_position": 0.25,
         "dual_head_projection_min_cash_position": 0.05,
+        # Mixture-of-Dirichlets policy head.
+        "mixture_dirichlet_enabled": False,
+        "mixture_dirichlet_num_components": 3,
+        "mixture_dirichlet_gating_hidden_dims": [64],
+        "mixture_dirichlet_component_hidden_dims": [64],
+        "mixture_dirichlet_eval_mode": "top_component_mean",
 
         # Dirichlet alpha activation (controls action concentration)
         "dirichlet_alpha_activation": "exp_tanh",   # PERF-FIX #4c: exp(tanh(x)*scale) — better diversity than softplus
@@ -603,6 +609,9 @@ PHASE1_CONFIG = {
             "alpha_diversity_coef": 0.01,             # SOTA-FIX: HHI anti-concentration penalty (sign corrected)
             "alpha_dispersion_coef": 0.0,            # Run9: penalize near-uniform allocations (disabled by default)
             "alpha_dispersion_target_std": 0.05,
+            "mixture_dirichlet_balance_coef": 0.0,
+            "mixture_dirichlet_separation_coef": 0.0,
+            "mixture_dirichlet_entropy_coef": 0.0,
             # Optional risk-aware actor auxiliaries.
             "use_risk_aux_loss": True,
             # Per-asset feature index used as one-step return proxy in structured state tensor.
@@ -1367,6 +1376,7 @@ RUN9_ALPHA_OVERRIDES = {
         "outperformance_bonus_enabled": False,
         "spy_outperformance_bonus_enabled": True,
         "spy_outperformance_bonus_scalar": 3.0,
+        "regime_sampling_mode": "uniform_regime",
         "episode_cvar_enabled": False,
         "drawdown_constraint": {
             "target": 0.15,
@@ -1678,6 +1688,29 @@ RUN11_RELAXED_OVERRIDES["training_params"].update(
     }
 )
 
+RUN12_MIXTURE_OVERRIDES = copy.deepcopy(RUN11_RELAXED_OVERRIDES)
+RUN12_MIXTURE_OVERRIDES["agent_params"].update(
+    {
+        "mixture_dirichlet_enabled": True,
+        "mixture_dirichlet_num_components": 3,
+        "mixture_dirichlet_gating_hidden_dims": [64],
+        "mixture_dirichlet_component_hidden_dims": [64],
+        "mixture_dirichlet_eval_mode": "top_component_mean",
+    }
+)
+RUN12_MIXTURE_OVERRIDES["agent_params"]["ppo_params"].update(
+    {
+        "mixture_dirichlet_balance_coef": 0.01,
+        "mixture_dirichlet_separation_coef": 0.01,
+        "mixture_dirichlet_entropy_coef": 0.002,
+    }
+)
+RUN12_MIXTURE_OVERRIDES["environment_params"].update(
+    {
+        "regime_sampling_mode": "balanced_quota",
+    }
+)
+
 
 def apply_run9_alpha_overrides(config: dict, overrides: dict = None) -> dict:
     """Apply the canonical Run9 alpha-generation training recipe in-place."""
@@ -1948,6 +1981,64 @@ def build_run11_relaxed_config(
     if analysis_end_date is not None:
         config["ANALYSIS_END_DATE"] = analysis_end_date
     assert_run11_relaxed_config(config)
+    return config
+
+
+def apply_run12_mixture_overrides(config: dict, overrides: dict = None) -> dict:
+    """Apply the canonical Run12 mixture-head exploration recipe in-place."""
+    global TRAIN_TEST_SPLIT_DATE
+    resolved = copy.deepcopy(RUN12_MIXTURE_OVERRIDES if overrides is None else overrides)
+    split_date = resolved.get("TRAIN_TEST_SPLIT_DATE")
+    if split_date:
+        TRAIN_TEST_SPLIT_DATE = split_date
+        config["TRAIN_TEST_SPLIT_DATE"] = split_date
+    _deep_update_config(config, resolved)
+    return config
+
+
+def assert_run12_mixture_config(config: dict) -> None:
+    """Raise if a config expected to match the Run12 mixture-head recipe drifted."""
+    assert_run11_relaxed_config(config)
+    agent = config.get("agent_params", {})
+    ppo = agent.get("ppo_params", {})
+    env = config.get("environment_params", {})
+
+    assert bool(agent.get("mixture_dirichlet_enabled", False)), (
+        "mixture_dirichlet_enabled must stay on for Run12"
+    )
+    assert int(agent.get("mixture_dirichlet_num_components", 0)) == 3, (
+        "Run12 mixture head must keep 3 components"
+    )
+    assert str(agent.get("mixture_dirichlet_eval_mode", "")).lower() == "top_component_mean", (
+        "Run12 mixture eval mode must stay top_component_mean"
+    )
+    assert float(ppo.get("mixture_dirichlet_balance_coef", 0.0)) > 0.0, (
+        "Run12 mixture_dirichlet_balance_coef must stay on"
+    )
+    assert float(ppo.get("mixture_dirichlet_separation_coef", 0.0)) > 0.0, (
+        "Run12 mixture_dirichlet_separation_coef must stay on"
+    )
+    assert float(ppo.get("mixture_dirichlet_entropy_coef", 0.0)) > 0.0, (
+        "Run12 mixture_dirichlet_entropy_coef must stay on"
+    )
+    assert str(env.get("regime_sampling_mode", "")).lower() == "balanced_quota", (
+        "Run12 regime_sampling_mode must stay balanced_quota"
+    )
+
+
+def build_run12_mixture_config(
+    phase_name: str = "phase1",
+    *,
+    analysis_end_date: str | None = None,
+    overrides: dict | None = None,
+) -> dict:
+    """Return a deep-copied phase config with feature-audit + Run12 mixture-head overrides applied."""
+    config = copy.deepcopy(get_active_config(phase_name))
+    enforce_feature_audit_plan(config)
+    apply_run12_mixture_overrides(config, overrides=overrides)
+    if analysis_end_date is not None:
+        config["ANALYSIS_END_DATE"] = analysis_end_date
+    assert_run12_mixture_config(config)
     return config
 
 

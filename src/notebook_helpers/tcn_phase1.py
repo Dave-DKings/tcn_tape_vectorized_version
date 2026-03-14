@@ -897,6 +897,10 @@ TRAINING_FIELDNAMES: List[str] = [
     "alpha_max",
     "alpha_mean",
     "alpha_cap_hit_frac",
+    "mixture_balance_loss",
+    "mixture_separation_loss",
+    "mixture_gating_entropy",
+    "mixture_component_usage",
     "ratio_mean",
     "ratio_std",
     "drawdown_lambda_peak",
@@ -4832,6 +4836,7 @@ def run_experiment6_tape(
                     "states": [],
                     "actions": [],
                     "log_probs": [],
+                    "mixture_components": [],
                     "rewards": [],
                     "values": [],
                     "dones": [],
@@ -4852,6 +4857,10 @@ def run_experiment6_tape(
                     sequence_histories=seq_histories_batch,
                     deterministic=False,
                 )
+                batch_mixture_components = None
+                batch_action_meta = getattr(agent, "_latest_batch_action_metadata", {}) or {}
+                if batch_action_meta.get("mixture_components", None) is not None:
+                    batch_mixture_components = np.asarray(batch_action_meta["mixture_components"], dtype=np.int32)
 
                 for batch_pos, env_idx in enumerate(active_indices):
                     active_env = train_envs[env_idx]
@@ -4877,6 +4886,9 @@ def run_experiment6_tape(
                     rollout_buffers[env_idx]["states"].append(stored_state)
                     rollout_buffers[env_idx]["actions"].append(action)
                     rollout_buffers[env_idx]["log_probs"].append(log_prob)
+                    rollout_buffers[env_idx]["mixture_components"].append(
+                        int(batch_mixture_components[batch_pos]) if batch_mixture_components is not None else -1
+                    )
                     rollout_buffers[env_idx]["rewards"].append(float(reward))
                     rollout_buffers[env_idx]["values"].append(value)
                     rollout_buffers[env_idx]["dones"].append(bool(done or truncated))
@@ -5026,7 +5038,7 @@ def run_experiment6_tape(
             for env_idx, buffer in enumerate(rollout_buffers):
                 if not buffer["rewards"]:
                     continue
-                for key in ("states", "actions", "log_probs", "rewards", "values", "dones"):
+                for key in ("states", "actions", "log_probs", "mixture_components", "rewards", "values", "dones"):
                     agent.memory[key].extend(buffer[key])
 
                 rewards_raw = np.asarray(buffer["rewards"], dtype=np.float32)
@@ -5078,7 +5090,15 @@ def run_experiment6_tape(
                 lagrangian_cvar_penalties_this_update.append(float(lagrangian_penalty_step))
                 lagrangian_cvar_values_this_update.append(float(lagrangian_rolling_cvar_step))
 
-            agent.store_transition(obs, action, log_prob, reward, value, done)
+            agent.store_transition(
+                obs,
+                action,
+                log_prob,
+                reward,
+                value,
+                done,
+                mixture_component=(getattr(agent, "_latest_action_metadata", {}) or {}).get("mixture_component", -1),
+            )
             obs = next_obs
             step += 1
 
@@ -5375,6 +5395,10 @@ def run_experiment6_tape(
         alpha_per_asset = update_metrics.get("alpha_per_asset", None)  # Per-asset alpha means
         ratio_mean_value = update_metrics.get("ratio_mean", 0.0)
         ratio_std_value = update_metrics.get("ratio_std", 0.0)
+        mixture_balance_loss_value = update_metrics.get("mixture_balance_loss", 0.0)
+        mixture_separation_loss_value = update_metrics.get("mixture_separation_loss", 0.0)
+        mixture_gating_entropy_value = update_metrics.get("mixture_gating_entropy", 0.0)
+        mixture_component_usage_value = update_metrics.get("mixture_component_usage", None)
 
         if ra_kl_enabled:
             approx_kl_scalar = to_scalar(approx_kl_value)
@@ -5502,6 +5526,14 @@ def run_experiment6_tape(
                 alpha_cap_hit_frac_val = 0.0
             ratio_mean_val = to_scalar(ratio_mean_value)
             ratio_std_val = to_scalar(ratio_std_value)
+            mixture_balance_loss_val = to_scalar(mixture_balance_loss_value)
+            mixture_separation_loss_val = to_scalar(mixture_separation_loss_value)
+            mixture_gating_entropy_val = to_scalar(mixture_gating_entropy_value)
+            mixture_component_usage_val = None
+            if mixture_component_usage_value is not None:
+                mixture_component_usage_arr = np.asarray(mixture_component_usage_value, dtype=np.float32).flatten()
+                if mixture_component_usage_arr.size > 0:
+                    mixture_component_usage_val = mixture_component_usage_arr
 
             training_early_stop_score_val: Optional[float] = None
             if training_early_stop_enabled_cfg:
@@ -5624,6 +5656,12 @@ def run_experiment6_tape(
                 f"hhi_loss={alpha_diversity_loss_val:.4f} | "
                 f"dispersion_loss={alpha_dispersion_loss_val:.4f}"
             )
+            if mixture_gating_entropy_val or mixture_balance_loss_val or mixture_separation_loss_val:
+                print(
+                    f"   🧩 Mixture Head: gate_entropy={mixture_gating_entropy_val:.4f} | "
+                    f"balance_loss={mixture_balance_loss_val:.4f} | "
+                    f"separation_loss={mixture_separation_loss_val:.4f}"
+                )
             print(
                 f"   ⚙️ Optimizer: actor_lr={agent.get_actor_lr():.6f} | "
                 f"critic_lr={agent.get_critic_lr():.6f} | target_kl={agent.target_kl:.4f} | "
@@ -5672,6 +5710,11 @@ def run_experiment6_tape(
                         _top3 = " | ".join(f"{t}={a:.2f}" for t, a in _ranked[:3])
                         _bot3 = " | ".join(f"{t}={a:.2f}" for t, a in _ranked[-3:])
                         print(f"   🏷️ Alpha Per-Asset  TOP: {_top3}  BOT: {_bot3}")
+                if mixture_component_usage_val is not None:
+                    usage_fmt = " | ".join(
+                        f"C{i}={u:.1%}" for i, u in enumerate(mixture_component_usage_val.tolist())
+                    )
+                    print(f"   🎛️ Mixture Usage: {usage_fmt}")
                 if _regime_sampling_enabled:
                     regime_total_samples, regime_counts = _aggregate_regime_sampling_stats(train_envs)
                     if regime_total_samples > 0 and regime_counts:
@@ -5841,9 +5884,17 @@ def run_experiment6_tape(
                     "alpha_min": alpha_min_val,
                     "alpha_max": alpha_max_val,
                     "alpha_mean": alpha_mean_val,
-                    "alpha_cap_hit_frac": alpha_cap_hit_frac_val,
-                    "ratio_mean": ratio_mean_val,
-                    "ratio_std": ratio_std_val,
+                "alpha_cap_hit_frac": alpha_cap_hit_frac_val,
+                "mixture_balance_loss": mixture_balance_loss_val,
+                "mixture_separation_loss": mixture_separation_loss_val,
+                "mixture_gating_entropy": mixture_gating_entropy_val,
+                "mixture_component_usage": (
+                    json.dumps([float(v) for v in mixture_component_usage_val.tolist()])
+                    if mixture_component_usage_val is not None
+                    else None
+                ),
+                "ratio_mean": ratio_mean_val,
+                "ratio_std": ratio_std_val,
                     "terminal_drawdown_lambda": terminal_drawdown_lambda,
                     "terminal_drawdown_lambda_peak": terminal_drawdown_lambda_peak,
                     "terminal_drawdown_avg_excess": terminal_drawdown_avg_excess,
@@ -6744,7 +6795,15 @@ def evaluate_experiment6_checkpoint(
         # Single actor forward pass to get alpha values (+ optional projection logits)
         actor_raw = agent_eval.actor(state_input, training=False)
         projection_logits = None
-        if hasattr(agent_eval, "_split_actor_outputs"):
+        mixture_alpha = None
+        mixture_probs = None
+        if hasattr(agent_eval, "_parse_actor_outputs"):
+            parsed_actor = agent_eval._parse_actor_outputs(actor_raw)
+            alpha = parsed_actor["alpha"]
+            projection_logits = parsed_actor["projection_logits"]
+            mixture_alpha = parsed_actor.get("mixture_alpha")
+            mixture_probs = parsed_actor.get("mixture_probs")
+        elif hasattr(agent_eval, "_split_actor_outputs"):
             alpha, projection_logits, _ = agent_eval._split_actor_outputs(actor_raw)
         elif isinstance(actor_raw, dict):
             alpha = tf.cast(actor_raw.get("alpha", actor_raw), tf.float32)
@@ -6757,15 +6816,28 @@ def evaluate_experiment6_checkpoint(
                 projection_logits = tf.cast(actor_raw[1], tf.float32)
         else:
             alpha = tf.cast(actor_raw, tf.float32)
+
+        # Create distributions from alpha outputs
+        import tensorflow_probability as tfp
+        tfd = tfp.distributions
+
         alpha = tf.maximum(alpha, tf.constant(1e-6, dtype=alpha.dtype))  # Ensure alpha > 0
+        mode_name = _normalize_mode(eval_mode, fallback="mode")
+
+        selected_component_idx = None
+        if mixture_alpha is not None and mixture_probs is not None:
+            mixture_alpha = tf.maximum(mixture_alpha, tf.constant(1e-6, dtype=mixture_alpha.dtype))
+            if mode_name == "sample":
+                comp_dist = tfd.Categorical(probs=mixture_probs)
+                selected_component_idx = comp_dist.sample()
+            else:
+                selected_component_idx = tf.argmax(mixture_probs, axis=-1, output_type=tf.int32)
+            alpha = agent_eval._gather_component_alpha(mixture_alpha, selected_component_idx)
+
         alpha_values = alpha.numpy()[0] if needs_squeeze else alpha.numpy()  # Store for return
         
         # Create Dirichlet distribution from alpha
-        import tensorflow_probability as tfp
-        tfd = tfp.distributions
         dirichlet = tfd.Dirichlet(alpha)
-        
-        mode_name = _normalize_mode(eval_mode, fallback="mode")
 
         if mode_name == "sample":
             action = dirichlet.sample()
@@ -6809,6 +6881,9 @@ def evaluate_experiment6_checkpoint(
 
         # Get log probability
         log_prob = dirichlet.log_prob(action)
+        if selected_component_idx is not None:
+            comp_dist = tfd.Categorical(probs=mixture_probs)
+            log_prob = log_prob + comp_dist.log_prob(selected_component_idx)
         
         # Get value estimate
         value = tf.cast(agent_eval.critic(state_input, training=False), tf.float32)

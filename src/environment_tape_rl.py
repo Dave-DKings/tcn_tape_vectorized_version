@@ -446,6 +446,14 @@ class PortfolioEnvTAPE(gym.Env):
                         f"{{{', '.join(f'{k}: {len(v)}' for k, v in self._regime_date_indices.items())}}}")
         self._regime_sample_counts = {}  # tracks how many episodes started in each regime
         self._regime_sample_total = 0
+        env_params = self.config.get("environment_params", {}) if isinstance(self.config, dict) else {}
+        self.regime_sampling_mode = str(env_params.get("regime_sampling_mode", "uniform_regime")).lower().strip()
+        if self.regime_sampling_mode not in {"uniform_regime", "balanced_quota"}:
+            logger.warning(
+                "Unknown regime_sampling_mode=%s; falling back to uniform_regime",
+                self.regime_sampling_mode,
+            )
+            self.regime_sampling_mode = "uniform_regime"
 
         # Build return matrix: (days, assets)
         self._build_return_matrix()
@@ -1002,7 +1010,17 @@ class PortfolioEnvTAPE(gym.Env):
                 available_regimes = [r for r, indices in self._regime_date_indices.items()
                                      if any(i <= max_start for i in indices)]
                 if available_regimes:
-                    chosen_regime = available_regimes[self.np_random.randint(0, len(available_regimes))]
+                    if self.regime_sampling_mode == "balanced_quota":
+                        min_count = min(int(self._regime_sample_counts.get(r, 0)) for r in available_regimes)
+                        least_sampled_regimes = [
+                            r for r in available_regimes
+                            if int(self._regime_sample_counts.get(r, 0)) == min_count
+                        ]
+                        chosen_regime = least_sampled_regimes[
+                            self.np_random.randint(0, len(least_sampled_regimes))
+                        ]
+                    else:
+                        chosen_regime = available_regimes[self.np_random.randint(0, len(available_regimes))]
                     valid_starts = [i for i in self._regime_date_indices[chosen_regime] if i <= max_start]
                     if valid_starts:
                         self.day = valid_starts[self.np_random.randint(0, len(valid_starts))]
@@ -1345,13 +1363,12 @@ class PortfolioEnvTAPE(gym.Env):
             if len(returns_array) > 0 and returns_array.std() > 0:
                 sharpe_ratio_final = (252 ** 0.5) * returns_array.mean() / returns_array.std()
             
-            # Sortino Ratio (downside risk only)
+            # Sortino Ratio: downside deviation over ALL observations (MAR=0)
             sortino_ratio = 0.0
-            downside_returns = returns_array[returns_array < 0]
-            if len(downside_returns) > 0:
-                downside_std = downside_returns.std()
-                if downside_std > 0:
-                    sortino_ratio = (252 ** 0.5) * returns_array.mean() / downside_std
+            downside_diff = np.minimum(returns_array, 0.0)
+            downside_dev = float(np.sqrt((downside_diff ** 2).mean()))
+            if downside_dev > 1e-12:
+                sortino_ratio = (252 ** 0.5) * returns_array.mean() / downside_dev
             
             # Maximum Drawdown (MDD)
             portfolio_values = np.array(self.portfolio_history)

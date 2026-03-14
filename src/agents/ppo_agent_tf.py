@@ -320,6 +320,20 @@ class PPOAgentTF:
         self.dual_head_projection_use_constraints = bool(
             config.get('dual_head_projection_use_constraints', ppo_params.get('dual_head_projection_use_constraints', False))
         )
+        self.mixture_dirichlet_enabled = bool(config.get('mixture_dirichlet_enabled', False))
+        self.mixture_dirichlet_num_components = int(max(1, config.get('mixture_dirichlet_num_components', 1)))
+        self.mixture_dirichlet_eval_mode = str(
+            config.get('mixture_dirichlet_eval_mode', 'top_component_mean')
+        ).lower().strip()
+        self.mixture_dirichlet_balance_coef = float(
+            max(ppo_params.get('mixture_dirichlet_balance_coef', 0.0), 0.0)
+        )
+        self.mixture_dirichlet_separation_coef = float(
+            max(ppo_params.get('mixture_dirichlet_separation_coef', 0.0), 0.0)
+        )
+        self.mixture_dirichlet_entropy_coef = float(
+            max(ppo_params.get('mixture_dirichlet_entropy_coef', 0.0), 0.0)
+        )
         raw_max_single = config.get('max_single_position', ppo_params.get('dual_head_projection_max_single_position', 0.20))
         raw_min_cash = config.get('min_cash_position', ppo_params.get('dual_head_projection_min_cash_position', 0.05))
         try:
@@ -357,10 +371,13 @@ class PPOAgentTF:
             'states': [],
             'actions': [],
             'log_probs': [],
+            'mixture_components': [],
             'rewards': [],
             'values': [],
             'dones': []
         }
+        self._latest_action_metadata = {}
+        self._latest_batch_action_metadata = {}
         
         logger.info(f"Initialized {name}")
         logger.info(f"  State dim: {state_dim}, Num assets: {num_assets}, Actions: {self.num_actions}")
@@ -976,13 +993,22 @@ class PPOAgentTF:
 
     def _split_actor_outputs(self, actor_output):
         """Return (alpha, projection_logits or None, aux_return_preds or None) from actor output."""
+        parsed = self._parse_actor_outputs(actor_output)
+        return parsed["alpha"], parsed["projection_logits"], parsed["aux_return_preds"]
+
+    def _parse_actor_outputs(self, actor_output):
+        """Normalize actor outputs into a single dict for both single and mixture policies."""
         projection_logits = None
         aux_return_preds = None
         alpha = actor_output
+        mixture_alpha = None
+        mixture_gating_logits = None
         if isinstance(actor_output, dict):
             alpha = actor_output.get("alpha", actor_output.get("dirichlet_alpha", None))
             projection_logits = actor_output.get("projection_logits", actor_output.get("softmax_logits", None))
             aux_return_preds = actor_output.get("aux_return_preds", None)
+            mixture_alpha = actor_output.get("mixture_alpha", None)
+            mixture_gating_logits = actor_output.get("mixture_gating_logits", None)
         elif isinstance(actor_output, (tuple, list)) and len(actor_output) > 0:
             alpha = actor_output[0]
             if len(actor_output) > 1:
@@ -997,7 +1023,38 @@ class PPOAgentTF:
             projection_logits = _to_tensor_with_cast(projection_logits, tf.float32)
         if aux_return_preds is not None:
             aux_return_preds = _to_tensor_with_cast(aux_return_preds, tf.float32)
-        return alpha, projection_logits, aux_return_preds
+        if mixture_alpha is not None:
+            mixture_alpha = _to_tensor_with_cast(mixture_alpha, tf.float32)
+            mixture_alpha = tf.maximum(mixture_alpha, tf.constant(1e-6, dtype=mixture_alpha.dtype))
+        if mixture_gating_logits is not None:
+            mixture_gating_logits = _to_tensor_with_cast(mixture_gating_logits, tf.float32)
+
+        mixture_probs = None
+        if mixture_alpha is not None and mixture_gating_logits is not None:
+            mixture_probs = tf.nn.softmax(mixture_gating_logits, axis=-1)
+            alpha = tf.reduce_sum(mixture_probs[..., tf.newaxis] * mixture_alpha, axis=1)
+
+        return {
+            "alpha": alpha,
+            "projection_logits": projection_logits,
+            "aux_return_preds": aux_return_preds,
+            "mixture_alpha": mixture_alpha,
+            "mixture_gating_logits": mixture_gating_logits,
+            "mixture_probs": mixture_probs,
+        }
+
+    def _gather_component_alpha(self, mixture_alpha: tf.Tensor, component_indices: tf.Tensor) -> tf.Tensor:
+        """Select per-sample component alpha from (batch, K, action_dim)."""
+        component_indices = tf.cast(component_indices, tf.int32)
+        batch_indices = tf.range(tf.shape(mixture_alpha)[0], dtype=tf.int32)
+        gather_idx = tf.stack([batch_indices, component_indices], axis=-1)
+        selected = tf.gather_nd(mixture_alpha, gather_idx)
+        return tf.maximum(selected, tf.constant(1e-6, dtype=selected.dtype))
+
+    def _mixture_component_means(self, mixture_alpha: tf.Tensor) -> tf.Tensor:
+        denom = tf.reduce_sum(mixture_alpha, axis=-1, keepdims=True)
+        denom = tf.maximum(denom, tf.constant(1e-8, dtype=mixture_alpha.dtype))
+        return mixture_alpha / denom
 
     def _normalize_simplex(self, weights: tf.Tensor) -> tf.Tensor:
         """Enforce strictly-positive simplex weights."""
@@ -1109,6 +1166,45 @@ class PPOAgentTF:
 
         blended = (1.0 - rho) * self._normalize_simplex(action) + rho * proj_weights
         return self._normalize_simplex(blended)
+
+    def _deterministic_dirichlet_action(self, alpha: tf.Tensor, evaluation_mode: str) -> tf.Tensor:
+        """Return deterministic action from Dirichlet alphas."""
+        dirichlet = tfd.Dirichlet(alpha)
+        if evaluation_mode == 'mean':
+            return dirichlet.mean()
+        if evaluation_mode == 'mode':
+            min_alpha = tf.reduce_min(alpha, axis=-1, keepdims=True)
+            use_formula = min_alpha > 1.0
+            sum_alpha = tf.reduce_sum(alpha, axis=-1, keepdims=True)
+            k = tf.cast(tf.shape(alpha)[-1], alpha.dtype)
+            mode_formula = (alpha - 1.0) / (sum_alpha - k)
+            max_indices = tf.argmax(alpha, axis=-1)
+            mode_vertex = tf.one_hot(max_indices, depth=tf.shape(alpha)[-1], dtype=alpha.dtype)
+            return tf.where(use_formula, mode_formula, mode_vertex)
+        if evaluation_mode == 'mean_plus_noise':
+            mean_val = dirichlet.mean()
+            noise = tf.random.normal(shape=tf.shape(mean_val), mean=0.0, stddev=0.005)
+            action = mean_val + noise
+            action = tf.maximum(action, 1e-6)
+            return action / tf.reduce_sum(action, axis=-1, keepdims=True)
+        return dirichlet.mean()
+
+    def _select_mixture_component(
+        self,
+        mixture_probs: tf.Tensor,
+        *,
+        deterministic: bool,
+        stochastic: bool,
+    ) -> tf.Tensor:
+        """Select component indices for mixture policy."""
+        categorical = tfd.Categorical(probs=mixture_probs)
+        if stochastic:
+            return categorical.sample()
+        if deterministic and self.mixture_dirichlet_eval_mode == "weighted_component_mean":
+            return tf.argmax(mixture_probs, axis=-1, output_type=tf.int32)
+        if deterministic:
+            return tf.argmax(mixture_probs, axis=-1, output_type=tf.int32)
+        return categorical.sample()
     
     def get_action_and_value(self, state, deterministic=False, stochastic=False, evaluation_mode='mean_plus_noise'):
         """
@@ -1134,63 +1230,29 @@ class PPOAgentTF:
         
         # Get actor outputs (alpha + optional softmax/projection logits)
         actor_output = self.actor(state_input, training=False)
-        alpha, projection_logits, _ = self._split_actor_outputs(actor_output)
-        
-        # Create Dirichlet distribution
-        dirichlet = tfd.Dirichlet(alpha)
-        
-        # [OK] FIX: stochastic parameter forces sampling even when not training
+        actor_parts = self._parse_actor_outputs(actor_output)
+        alpha = actor_parts["alpha"]
+        projection_logits = actor_parts["projection_logits"]
+        mixture_alpha = actor_parts["mixture_alpha"]
+        mixture_probs = actor_parts["mixture_probs"]
+
+        selected_component = None
+        if self.mixture_dirichlet_enabled and mixture_alpha is not None and mixture_probs is not None:
+            selected_component = self._select_mixture_component(
+                mixture_probs,
+                deterministic=bool(deterministic and not stochastic),
+                stochastic=bool(stochastic),
+            )
+            alpha_for_action = self._gather_component_alpha(mixture_alpha, selected_component)
+        else:
+            alpha_for_action = alpha
+
+        dirichlet = tfd.Dirichlet(alpha_for_action)
         if stochastic:
-            # Force stochastic sampling for Monte Carlo evaluation
             action = dirichlet.sample()
         elif deterministic:
-            # Deterministic evaluation strategies
-            if evaluation_mode == 'mean':
-                # Use the mean of the Dirichlet distribution
-                # For Dirichlet, mean = alpha / sum(alpha)
-                action = dirichlet.mean()
-                
-            elif evaluation_mode == 'mode':
-                # Mode for Dirichlet:
-                # If alpha > 1: (alpha - 1) / (sum(alpha) - K)
-                # If alpha <= 1: Mode is at vertices (argmax)
-                
-                # Check if all alpha > 1 (per sample)
-                min_alpha = tf.reduce_min(alpha, axis=-1, keepdims=True)
-                use_formula = min_alpha > 1.0
-                
-                # Formula for alpha > 1
-                sum_alpha = tf.reduce_sum(alpha, axis=-1, keepdims=True)
-                k = tf.cast(tf.shape(alpha)[-1], alpha.dtype)
-                mode_formula = (alpha - 1.0) / (sum_alpha - k)
-                
-                # Vertex for alpha <= 1 (argmax)
-                max_indices = tf.argmax(alpha, axis=-1)
-                mode_vertex = tf.one_hot(
-                    max_indices,
-                    depth=tf.shape(alpha)[-1],
-                    dtype=alpha.dtype,
-                )
-                
-                # Select based on validity
-                action = tf.where(use_formula, mode_formula, mode_vertex)
-                
-            elif evaluation_mode == 'mean_plus_noise':
-                # Mean + small noise (epsilon) to break symmetry/flatness
-                # Useful when mean is too conservative/flat
-                mean_val = dirichlet.mean()
-                noise = tf.random.normal(shape=tf.shape(mean_val), mean=0.0, stddev=0.005) # Small epsilon
-                action = mean_val + noise
-                # Re-normalize and clip
-                action = tf.maximum(action, 1e-6)
-                action = action / tf.reduce_sum(action, axis=-1, keepdims=True)
-                
-            else:
-                # Default fallback
-                action = dirichlet.mean()
-                
+            action = self._deterministic_dirichlet_action(alpha_for_action, evaluation_mode)
         else:
-            # Sample from the distribution
             action = dirichlet.sample()
 
         action = self._blend_action_with_projection(
@@ -1201,8 +1263,10 @@ class PPOAgentTF:
             use_eval_settings=bool(deterministic or stochastic),
         )
         
-        # Calculate log probability (then clip to avoid numerical blow-ups)
         log_prob = dirichlet.log_prob(action)
+        if selected_component is not None and mixture_probs is not None:
+            categorical = tfd.Categorical(probs=mixture_probs)
+            log_prob = log_prob + categorical.log_prob(selected_component)
         
         # Get value estimate
         value = self.critic(state_input, training=False)
@@ -1214,6 +1278,12 @@ class PPOAgentTF:
             action = tf.squeeze(action, 0)
             log_prob = tf.squeeze(log_prob, 0)
             value = tf.squeeze(value, 0)
+            if selected_component is not None:
+                selected_component = tf.squeeze(selected_component, 0)
+
+        self._latest_action_metadata = {
+            "mixture_component": None if selected_component is None else int(np.asarray(selected_component.numpy()).reshape(-1)[0]),
+        }
         
         return action, log_prob, value
 
@@ -1264,35 +1334,29 @@ class PPOAgentTF:
             states_for_storage = [np.asarray(state, dtype=np.float32) for state in states_list]
 
         actor_output = self.actor(prepared_state, training=False)
-        alpha, projection_logits, _ = self._split_actor_outputs(actor_output)
-        dirichlet = tfd.Dirichlet(alpha)
+        actor_parts = self._parse_actor_outputs(actor_output)
+        alpha = actor_parts["alpha"]
+        projection_logits = actor_parts["projection_logits"]
+        mixture_alpha = actor_parts["mixture_alpha"]
+        mixture_probs = actor_parts["mixture_probs"]
+
+        selected_components = None
+        if self.mixture_dirichlet_enabled and mixture_alpha is not None and mixture_probs is not None:
+            selected_components = self._select_mixture_component(
+                mixture_probs,
+                deterministic=bool(deterministic and not stochastic),
+                stochastic=bool(stochastic),
+            )
+            alpha_for_action = self._gather_component_alpha(mixture_alpha, selected_components)
+        else:
+            alpha_for_action = alpha
+
+        dirichlet = tfd.Dirichlet(alpha_for_action)
 
         if stochastic:
             action = dirichlet.sample()
         elif deterministic:
-            if evaluation_mode == 'mean':
-                action = dirichlet.mean()
-            elif evaluation_mode == 'mode':
-                min_alpha = tf.reduce_min(alpha, axis=-1, keepdims=True)
-                use_formula = min_alpha > 1.0
-                sum_alpha = tf.reduce_sum(alpha, axis=-1, keepdims=True)
-                k = tf.cast(tf.shape(alpha)[-1], alpha.dtype)
-                mode_formula = (alpha - 1.0) / (sum_alpha - k)
-                max_indices = tf.argmax(alpha, axis=-1)
-                mode_vertex = tf.one_hot(
-                    max_indices,
-                    depth=tf.shape(alpha)[-1],
-                    dtype=alpha.dtype,
-                )
-                action = tf.where(use_formula, mode_formula, mode_vertex)
-            elif evaluation_mode == 'mean_plus_noise':
-                mean_val = dirichlet.mean()
-                noise = tf.random.normal(shape=tf.shape(mean_val), mean=0.0, stddev=0.005)
-                action = mean_val + noise
-                action = tf.maximum(action, 1e-6)
-                action = action / tf.reduce_sum(action, axis=-1, keepdims=True)
-            else:
-                action = dirichlet.mean()
+            action = self._deterministic_dirichlet_action(alpha_for_action, evaluation_mode)
         else:
             action = dirichlet.sample()
 
@@ -1305,9 +1369,16 @@ class PPOAgentTF:
         )
 
         log_prob = dirichlet.log_prob(action)
+        if selected_components is not None and mixture_probs is not None:
+            categorical = tfd.Categorical(probs=mixture_probs)
+            log_prob = log_prob + categorical.log_prob(selected_components)
         value = self.critic(prepared_state, training=False)
         value = self._critic_values_to_scalar(value)
         value = self._denormalize_value(value)
+
+        self._latest_batch_action_metadata = {
+            "mixture_components": None if selected_components is None else np.asarray(selected_components.numpy(), dtype=np.int32),
+        }
 
         return (
             np.asarray(action.numpy(), dtype=np.float32),
@@ -1316,7 +1387,7 @@ class PPOAgentTF:
             states_for_storage,
         )
     
-    def store_transition(self, state, action, log_prob, reward, value, done):
+    def store_transition(self, state, action, log_prob, reward, value, done, mixture_component=None):
         """
         Store a transition in memory with shape normalization.
         
@@ -1358,11 +1429,18 @@ class PPOAgentTF:
             log_prob = float(log_prob.numpy())
         if isinstance(value, tf.Tensor):
             value = float(value.numpy())
+        if mixture_component is None:
+            mixture_component = self._latest_action_metadata.get("mixture_component", -1)
+        try:
+            mixture_component = int(mixture_component)
+        except Exception:
+            mixture_component = -1
         
         # Store in memory
         self.memory['states'].append(state)
         self.memory['actions'].append(action)
         self.memory['log_probs'].append(float(log_prob))
+        self.memory['mixture_components'].append(mixture_component)
         self.memory['rewards'].append(float(reward))
         self.memory['values'].append(float(value))
         self.memory['dones'].append(bool(done))
@@ -1656,7 +1734,7 @@ class PPOAgentTF:
         return total_aux, sharpe_proxy, sharpe_loss, mvo_loss, cvar_proxy, cvar_loss
 
     # @tf.function  # DISABLED: Causes weight caching issues with PPO ratio stuck at 1.0
-    def _actor_loss(self, states, actions, log_probs_old, advantages):
+    def _actor_loss(self, states, actions, log_probs_old, advantages, mixture_components=None):
         """
         Compute the actor loss (PPO clipped objective + entropy bonus).
         
@@ -1671,13 +1749,64 @@ class PPOAgentTF:
         """
         # Get current policy distribution
         actor_output = self.actor(states, training=True)
-        alpha, projection_logits, aux_return_preds = self._split_actor_outputs(actor_output)
-        
-        dirichlet = tfd.Dirichlet(alpha)
-        
-        # Current log probabilities
-        log_probs_new = dirichlet.log_prob(actions)
-        
+        actor_parts = self._parse_actor_outputs(actor_output)
+        alpha = actor_parts["alpha"]
+        projection_logits = actor_parts["projection_logits"]
+        aux_return_preds = actor_parts["aux_return_preds"]
+        mixture_alpha = actor_parts["mixture_alpha"]
+        mixture_gating_logits = actor_parts["mixture_gating_logits"]
+        mixture_probs = actor_parts["mixture_probs"]
+
+        mixture_balance_loss = tf.constant(0.0, dtype=tf.float32)
+        mixture_separation_loss = tf.constant(0.0, dtype=tf.float32)
+        mixture_gating_entropy = tf.constant(0.0, dtype=tf.float32)
+
+        if self.mixture_dirichlet_enabled and mixture_alpha is not None and mixture_probs is not None:
+            if mixture_components is None:
+                raise ValueError("mixture_components must be provided when mixture_dirichlet_enabled=True")
+            mixture_components = tf.cast(mixture_components, tf.int32)
+            alpha_for_policy = self._gather_component_alpha(mixture_alpha, mixture_components)
+            dirichlet = tfd.Dirichlet(alpha_for_policy)
+            categorical = tfd.Categorical(probs=mixture_probs)
+            log_probs_new = dirichlet.log_prob(actions) + categorical.log_prob(mixture_components)
+            component_entropies = tfd.Dirichlet(mixture_alpha).entropy()
+            mixture_gating_entropy = tf.reduce_mean(categorical.entropy())
+            entropy = tf.reduce_mean(
+                tf.reduce_sum(mixture_probs * component_entropies, axis=-1)
+                + self.mixture_dirichlet_entropy_coef * categorical.entropy()
+            )
+            mean_probs = tf.reduce_mean(mixture_probs, axis=0)
+            uniform_probs = tf.fill(
+                tf.shape(mean_probs),
+                tf.cast(1.0 / tf.cast(tf.shape(mean_probs)[0], tf.float32), tf.float32),
+            )
+            mixture_balance_loss = (
+                tf.constant(self.mixture_dirichlet_balance_coef, dtype=tf.float32)
+                * tf.reduce_sum(
+                    mean_probs * (
+                        tf.math.log(tf.maximum(mean_probs, 1e-8))
+                        - tf.math.log(tf.maximum(uniform_probs, 1e-8))
+                    )
+                )
+            )
+            component_means = self._mixture_component_means(mixture_alpha)
+            comp_i = tf.expand_dims(component_means, axis=2)
+            comp_j = tf.expand_dims(component_means, axis=1)
+            pairwise_dist = tf.reduce_mean(tf.abs(comp_i - comp_j), axis=-1)
+            num_components = tf.shape(pairwise_dist)[-1]
+            off_diag_mask = 1.0 - tf.eye(num_components, dtype=pairwise_dist.dtype)
+            mean_pairwise_dist = tf.reduce_sum(pairwise_dist * off_diag_mask, axis=[1, 2]) / tf.maximum(
+                tf.reduce_sum(off_diag_mask), 1.0
+            )
+            mixture_separation_loss = (
+                tf.constant(self.mixture_dirichlet_separation_coef, dtype=tf.float32)
+                * tf.reduce_mean(tf.maximum(0.10 - mean_pairwise_dist, 0.0))
+            )
+        else:
+            dirichlet = tfd.Dirichlet(alpha)
+            log_probs_new = dirichlet.log_prob(actions)
+            entropy = tf.reduce_mean(dirichlet.entropy())
+
         # Stabilize PPO ratio by clipping the log-probability delta
         log_prob_delta_raw = log_probs_new - log_probs_old
         log_prob_delta_raw = tf.clip_by_value(log_prob_delta_raw, -10.0, 10.0)
@@ -1698,7 +1827,6 @@ class PPOAgentTF:
         policy_loss = -tf.reduce_mean(tf.minimum(surr1, surr2))
         
         # Entropy bonus for exploration
-        entropy = tf.reduce_mean(dirichlet.entropy())
         entropy_loss = -self.entropy_coef * entropy
         
         (
@@ -1777,6 +1905,8 @@ class PPOAgentTF:
             + diversity_loss
             + dispersion_loss
             + aux_return_loss
+            + mixture_balance_loss
+            + mixture_separation_loss
         )
         
         approx_kl = tf.reduce_mean(log_probs_old - log_probs_new)
@@ -1800,6 +1930,9 @@ class PPOAgentTF:
             cvar_aux_loss,
             diversity_loss,
             dispersion_loss,
+            mixture_balance_loss,
+            mixture_separation_loss,
+            mixture_gating_entropy,
         )
     
     @tf.function(reduce_retracing=True)
@@ -1898,6 +2031,7 @@ class PPOAgentTF:
         states_np = np.array(self.memory['states'])
         actions = np.array(self.memory['actions'])
         log_probs_old = np.array(self.memory['log_probs'])
+        mixture_components_old = np.array(self.memory.get('mixture_components', []), dtype=np.int32)
         rewards = np.array(self.memory['rewards'])
         values = np.array(self.memory['values'])
         dones = np.array(self.memory['dones'])
@@ -1982,6 +2116,10 @@ class PPOAgentTF:
         states = self._convert_states_for_network(states_np)
         actions = tf.constant(actions, dtype=tf.float32)
         log_probs_old = tf.constant(log_probs_old, dtype=tf.float32)
+        mixture_components_old = tf.constant(
+            mixture_components_old if mixture_components_old.size else np.full(len(actions), -1, dtype=np.int32),
+            dtype=tf.int32,
+        )
         advantages = tf.constant(advantages, dtype=tf.float32)
         returns = tf.constant(returns, dtype=tf.float32)
         old_values_tf = tf.constant(values_old, dtype=tf.float32)
@@ -2027,6 +2165,10 @@ class PPOAgentTF:
             'alpha_mean': 0.0,
             'alpha_std': 0.0,  # Track alpha diversity for TCN learning
             'alpha_cap_hit_frac': 0.0,
+            'mixture_balance_loss': 0.0,
+            'mixture_separation_loss': 0.0,
+            'mixture_gating_entropy': 0.0,
+            'mixture_component_usage': np.zeros(self.mixture_dirichlet_num_components, dtype=np.float64),
             # Track risky-asset alpha means only; cash is handled separately in actions
             # and would break ticker-aligned diagnostics if included here.
             'alpha_per_asset': np.zeros(self.num_assets, dtype=np.float64),
@@ -2073,6 +2215,7 @@ class PPOAgentTF:
                     batch_states = tf.gather(states, batch_indices)
                 batch_actions = tf.gather(actions, batch_indices)
                 batch_log_probs_old = tf.gather(log_probs_old, batch_indices)
+                batch_mixture_components_old = tf.gather(mixture_components_old, batch_indices)
                 batch_advantages = tf.gather(advantages, batch_indices)
                 batch_returns = tf.gather(returns, batch_indices)
                 batch_old_values = tf.gather(old_values_tf, batch_indices)
@@ -2096,8 +2239,11 @@ class PPOAgentTF:
                         cvar_aux_loss,
                         diversity_loss,
                         dispersion_loss,
+                        mixture_balance_loss,
+                        mixture_separation_loss,
+                        mixture_gating_entropy,
                     ) = self._actor_loss(
-                        batch_states, batch_actions, batch_log_probs_old, batch_advantages
+                        batch_states, batch_actions, batch_log_probs_old, batch_advantages, batch_mixture_components_old
                     )
                 
                 actor_grads = tape.gradient(actor_loss, self.actor.trainable_variables)
@@ -2153,6 +2299,9 @@ class PPOAgentTF:
                 stats['risk_aux_cvar_loss'] += float(cvar_aux_loss)
                 stats['alpha_diversity_loss'] += float(diversity_loss)
                 stats['alpha_dispersion_loss'] += float(dispersion_loss)
+                stats['mixture_balance_loss'] += float(mixture_balance_loss)
+                stats['mixture_separation_loss'] += float(mixture_separation_loss)
+                stats['mixture_gating_entropy'] += float(mixture_gating_entropy)
                 if self.risk_aux_cvar_adaptive_enabled:
                     self._update_adaptive_cvar_coef(float(cvar_aux_proxy))
                 stats['risk_aux_cvar_coef'] = float(self.risk_aux_cvar_coef)
@@ -2168,6 +2317,12 @@ class PPOAgentTF:
                 stats['alpha_cap_hit_frac'] += alpha_cap_hit_frac_batch
                 risky_alpha_batch = alpha_batch[..., :self.num_assets]
                 stats['alpha_per_asset'] += np.mean(risky_alpha_batch, axis=0).astype(np.float64)
+                if self.mixture_dirichlet_enabled:
+                    valid_components = np.asarray(batch_mixture_components_old.numpy(), dtype=np.int32)
+                    valid_components = valid_components[(valid_components >= 0) & (valid_components < self.mixture_dirichlet_num_components)]
+                    if valid_components.size > 0:
+                        counts = np.bincount(valid_components, minlength=self.mixture_dirichlet_num_components)
+                        stats['mixture_component_usage'] += counts.astype(np.float64)
                 stats['ratio_mean'] += float(ratio_mean)
                 stats['ratio_std'] += float(ratio_std)
                 stats['approx_kl'] += float(approx_kl)
@@ -2212,12 +2367,16 @@ class PPOAgentTF:
                        'risk_aux_total', 'risk_aux_sharpe_proxy', 'risk_aux_sharpe_loss', 'risk_aux_mvo_loss',
                        'risk_aux_cvar_proxy', 'risk_aux_cvar_loss',
                        'alpha_diversity_loss', 'alpha_dispersion_loss',
+                       'mixture_balance_loss', 'mixture_separation_loss', 'mixture_gating_entropy',
                        'policy_loss', 'entropy_loss', 'entropy',
                        'actor_grad_norm', 'critic_grad_norm', 'alpha_min', 'alpha_max', 'alpha_mean', 'alpha_std',
                        'alpha_cap_hit_frac',
                        'ratio_mean', 'ratio_std', 'approx_kl', 'clip_fraction', 'value_clip_fraction']:
                 stats[key] /= num_updates
             stats['alpha_per_asset'] /= num_updates
+            usage_total = float(np.sum(stats['mixture_component_usage']))
+            if usage_total > 0.0:
+                stats['mixture_component_usage'] /= usage_total
 
         # Remove temporary counter
         del stats['num_grad_updates']

@@ -54,6 +54,14 @@ _DEFAULT_DISTRIBUTIONAL_NUM_QUANTILES = int(_DEFAULT_AGENT_PARAMS.get('distribut
 _DEFAULT_ALPHA_ACTIVATION = _DEFAULT_AGENT_PARAMS.get('dirichlet_alpha_activation', 'elu')
 _DEFAULT_EXP_CLIP = tuple(_DEFAULT_AGENT_PARAMS.get('dirichlet_exp_clip', (-5.0, 3.0)))
 _DEFAULT_DUAL_HEAD_ENABLED = bool(_DEFAULT_AGENT_PARAMS.get('dual_head_enabled', False))
+_DEFAULT_MIXTURE_DIRICHLET_ENABLED = bool(_DEFAULT_AGENT_PARAMS.get('mixture_dirichlet_enabled', False))
+_DEFAULT_MIXTURE_DIRICHLET_COMPONENTS = int(_DEFAULT_AGENT_PARAMS.get('mixture_dirichlet_num_components', 3))
+_DEFAULT_MIXTURE_DIRICHLET_GATING_HIDDEN_DIMS = list(
+    _DEFAULT_AGENT_PARAMS.get('mixture_dirichlet_gating_hidden_dims', [64])
+)
+_DEFAULT_MIXTURE_DIRICHLET_COMPONENT_HIDDEN_DIMS = list(
+    _DEFAULT_AGENT_PARAMS.get('mixture_dirichlet_component_hidden_dims', [64])
+)
 _RUNTIME_STATE_AUGMENTATION_ENABLED = _DEFAULT_STATE_AUGMENTATION_ENABLED
 
 
@@ -733,6 +741,8 @@ class DirichletActor(Model):
         self,
         *,
         logits_for_alpha: tf.Tensor,
+        mixture_logits_for_alpha: Optional[tf.Tensor] = None,
+        mixture_gating_logits: Optional[tf.Tensor] = None,
         projection_logits: Optional[tf.Tensor] = None,
         aux_return_preds: Optional[tf.Tensor] = None,
     ):
@@ -742,10 +752,21 @@ class DirichletActor(Model):
         are available, in which case a dict is returned.
         Dual-head mode returns dict with dirichlet alpha + softmax/projection logits.
         """
+        proj_logits = logits_for_alpha if projection_logits is None else projection_logits
         alpha = self._compute_alpha(logits_for_alpha)
+        if mixture_logits_for_alpha is not None:
+            mixture_alpha = self._compute_alpha(mixture_logits_for_alpha)
+            result = {
+                "alpha": alpha,
+                "mixture_alpha": mixture_alpha,
+                "mixture_gating_logits": mixture_gating_logits,
+                "projection_logits": proj_logits if self._dual_head_enabled else None,
+            }
+            if aux_return_preds is not None:
+                result["aux_return_preds"] = aux_return_preds
+            return result
         # If aux predictions exist OR dual-head is enabled, return structured dict
         if self._dual_head_enabled or aux_return_preds is not None:
-            proj_logits = logits_for_alpha if projection_logits is None else projection_logits
             result = {
                 "alpha": alpha,
                 "projection_logits": proj_logits if self._dual_head_enabled else None,
@@ -1176,6 +1197,10 @@ class TCNFusionActor(DirichletActor):
         adaptive_temperature_min: float = 0.8,
         adaptive_temperature_max: float = 2.5,
         dual_head_enabled: Optional[bool] = None,
+        mixture_dirichlet_enabled: Optional[bool] = None,
+        mixture_dirichlet_num_components: Optional[int] = None,
+        mixture_dirichlet_gating_hidden_dims: Optional[List[int]] = None,
+        mixture_dirichlet_component_hidden_dims: Optional[List[int]] = None,
         aux_return_enabled: bool = False,
         exp_tanh_scale: float = 2.5,
     ):
@@ -1229,6 +1254,14 @@ class TCNFusionActor(DirichletActor):
             regime_conditioning_dropout = _DEFAULT_REGIME_CONDITIONING_DROPOUT
         if dual_head_enabled is None:
             dual_head_enabled = _DEFAULT_DUAL_HEAD_ENABLED
+        if mixture_dirichlet_enabled is None:
+            mixture_dirichlet_enabled = _DEFAULT_MIXTURE_DIRICHLET_ENABLED
+        if mixture_dirichlet_num_components is None:
+            mixture_dirichlet_num_components = _DEFAULT_MIXTURE_DIRICHLET_COMPONENTS
+        if mixture_dirichlet_gating_hidden_dims is None:
+            mixture_dirichlet_gating_hidden_dims = _DEFAULT_MIXTURE_DIRICHLET_GATING_HIDDEN_DIMS
+        if mixture_dirichlet_component_hidden_dims is None:
+            mixture_dirichlet_component_hidden_dims = _DEFAULT_MIXTURE_DIRICHLET_COMPONENT_HIDDEN_DIMS
 
         super(TCNFusionActor, self).__init__(
             name=name,
@@ -1487,6 +1520,67 @@ class TCNFusionActor(DirichletActor):
                 layers.Dropout(0.05),
                 layers.Dense(1, activation=None, name=f'{name}_aux_ret_out'),
             ], name=f'{name}_aux_return_predictor')
+        self.mixture_dirichlet_enabled = bool(mixture_dirichlet_enabled)
+        self.mixture_dirichlet_num_components = max(1, int(mixture_dirichlet_num_components))
+        gating_dims = [int(x) for x in (mixture_dirichlet_gating_hidden_dims or []) if int(x) > 0]
+        component_dims = [int(x) for x in (mixture_dirichlet_component_hidden_dims or []) if int(x) > 0]
+        self.mixture_gating_layers: List[Tuple[layers.Dense, layers.Dropout]] = []
+        self.mixture_component_layers: List[Tuple[layers.Dense, layers.Dropout]] = []
+        self.mixture_component_norm = None
+        self.mixture_gating_logits_layer = None
+        self.mixture_output_layer = None
+        self.per_asset_component_logit_head = None
+        self.cash_component_logit_head = None
+        if self.mixture_dirichlet_enabled:
+            for i, hidden_units in enumerate(gating_dims):
+                self.mixture_gating_layers.append(
+                    (
+                        layers.Dense(hidden_units, activation="gelu", name=f"{name}_mix_gate_{i}"),
+                        layers.Dropout(float(fusion_alpha_head_dropout), name=f"{name}_mix_gate_drop_{i}"),
+                    )
+                )
+            self.mixture_gating_logits_layer = layers.Dense(
+                self.mixture_dirichlet_num_components,
+                activation=None,
+                kernel_initializer="orthogonal",
+                bias_initializer="zeros",
+                name=f"{name}_mixture_gating_logits",
+            )
+            if component_dims:
+                self.mixture_component_norm = layers.LayerNormalization(
+                    epsilon=1e-6, name=f"{name}_mixture_component_norm"
+                )
+                for i, hidden_units in enumerate(component_dims):
+                    self.mixture_component_layers.append(
+                        (
+                            layers.Dense(hidden_units, activation="gelu", name=f"{name}_mix_comp_{i}"),
+                            layers.Dropout(float(fusion_alpha_head_dropout), name=f"{name}_mix_comp_drop_{i}"),
+                        )
+                    )
+            if self.per_asset_alpha_head_enabled:
+                self.per_asset_component_logit_head = layers.Dense(
+                    self.mixture_dirichlet_num_components,
+                    activation=None,
+                    kernel_initializer="orthogonal",
+                    bias_initializer=tf.keras.initializers.Constant(0.5),
+                    name=f"{name}_per_asset_component_logit",
+                )
+                if self.num_actions > self.num_assets:
+                    self.cash_component_logit_head = layers.Dense(
+                        (self.num_actions - self.num_assets) * self.mixture_dirichlet_num_components,
+                        activation=None,
+                        kernel_initializer="orthogonal",
+                        bias_initializer=tf.keras.initializers.Constant(0.5),
+                        name=f"{name}_cash_component_logit",
+                    )
+            else:
+                self.mixture_output_layer = layers.Dense(
+                    self.num_actions * self.mixture_dirichlet_num_components,
+                    activation=None,
+                    kernel_initializer="orthogonal",
+                    bias_initializer=tf.keras.initializers.Constant(0.5),
+                    name=f"{name}_mixture_output",
+                )
 
     def _align_feature_dim(self, x: tf.Tensor) -> tf.Tensor:
         """Pad/slice dynamic feature width so local/context split stays valid."""
@@ -1727,8 +1821,50 @@ class TCNFusionActor(DirichletActor):
                 alpha_features = fused
             logits = self.output_layer(alpha_features, training=training)
 
+        gating_logits = None
+        mixture_logits = None
+        if self.mixture_dirichlet_enabled and self.mixture_gating_logits_layer is not None:
+            gating_features = fused
+            for dense_layer, dropout_layer in self.mixture_gating_layers:
+                gating_features = dense_layer(gating_features)
+                gating_features = dropout_layer(gating_features, training=training)
+            gating_logits = self.mixture_gating_logits_layer(gating_features, training=training)
+
+            if self.per_asset_alpha_head_enabled and self.per_asset_component_logit_head is not None:
+                component_features = x_assets
+                if self.mixture_component_norm is not None:
+                    component_features = self.mixture_component_norm(component_features)
+                for dense_layer, dropout_layer in self.mixture_component_layers:
+                    component_features = dense_layer(component_features)
+                    component_features = dropout_layer(component_features, training=training)
+                risky_component_logits = self.per_asset_component_logit_head(component_features, training=training)
+                risky_component_logits = tf.transpose(risky_component_logits, perm=[0, 2, 1])
+                if self.cash_component_logit_head is not None:
+                    cash_component_logits = self.cash_component_logit_head(fused, training=training)
+                    cash_component_logits = tf.reshape(
+                        cash_component_logits,
+                        (-1, self.mixture_dirichlet_num_components, self.num_actions - self.num_assets),
+                    )
+                    mixture_logits = tf.concat([risky_component_logits, cash_component_logits], axis=-1)
+                else:
+                    mixture_logits = risky_component_logits
+            else:
+                component_features = alpha_features if 'alpha_features' in locals() else fused
+                if self.mixture_component_norm is not None:
+                    component_features = self.mixture_component_norm(component_features)
+                for dense_layer, dropout_layer in self.mixture_component_layers:
+                    component_features = dense_layer(component_features)
+                    component_features = dropout_layer(component_features, training=training)
+                mixture_logits = self.mixture_output_layer(component_features, training=training)
+                mixture_logits = tf.reshape(
+                    mixture_logits,
+                    (-1, self.mixture_dirichlet_num_components, self.num_actions),
+                )
+
         return self._format_actor_output(
             logits_for_alpha=logits,
+            mixture_logits_for_alpha=mixture_logits,
+            mixture_gating_logits=gating_logits,
             aux_return_preds=aux_preds,
         )
 
@@ -2520,6 +2656,20 @@ def create_actor_critic(architecture: str,
         ),
     }
     dual_head_enabled_cfg = bool(config.get("dual_head_enabled", _DEFAULT_DUAL_HEAD_ENABLED))
+    mixture_kwargs = {
+        "mixture_dirichlet_enabled": bool(
+            config.get("mixture_dirichlet_enabled", _DEFAULT_MIXTURE_DIRICHLET_ENABLED)
+        ),
+        "mixture_dirichlet_num_components": int(
+            config.get("mixture_dirichlet_num_components", _DEFAULT_MIXTURE_DIRICHLET_COMPONENTS)
+        ),
+        "mixture_dirichlet_gating_hidden_dims": list(
+            config.get("mixture_dirichlet_gating_hidden_dims", _DEFAULT_MIXTURE_DIRICHLET_GATING_HIDDEN_DIMS)
+        ),
+        "mixture_dirichlet_component_hidden_dims": list(
+            config.get("mixture_dirichlet_component_hidden_dims", _DEFAULT_MIXTURE_DIRICHLET_COMPONENT_HIDDEN_DIMS)
+        ),
+    }
     ppo_params_cfg = config.get("ppo_params", {}) if isinstance(config.get("ppo_params", {}), dict) else {}
     aux_return_enabled_cfg = bool(
         config.get("aux_return_pred_enabled", ppo_params_cfg.get("aux_return_pred_enabled", False))
@@ -2552,6 +2702,7 @@ def create_actor_critic(architecture: str,
                 fusion_context_cross_attention_dropout=config.get('fusion_context_cross_attention_dropout', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_DROPOUT),
                 fusion_per_asset_alpha_head=config.get('fusion_per_asset_alpha_head', _DEFAULT_FUSION_PER_ASSET_ALPHA_HEAD),
                 dual_head_enabled=dual_head_enabled_cfg,
+                **mixture_kwargs,
                 aux_return_enabled=aux_return_enabled_cfg,
                 **recurrent_kwargs,
                 **regime_kwargs,
@@ -2659,6 +2810,7 @@ def create_actor_critic(architecture: str,
             fusion_context_cross_attention_dropout=config.get('fusion_context_cross_attention_dropout', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_DROPOUT),
             fusion_per_asset_alpha_head=config.get('fusion_per_asset_alpha_head', _DEFAULT_FUSION_PER_ASSET_ALPHA_HEAD),
             dual_head_enabled=dual_head_enabled_cfg,
+            **mixture_kwargs,
             aux_return_enabled=aux_return_enabled_cfg,
             exp_tanh_scale=float(config.get('dirichlet_exp_tanh_scale', 2.5)),
             **recurrent_kwargs,
