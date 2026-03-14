@@ -1601,6 +1601,17 @@ RUN11_RELAXED_OVERRIDES.update(
         "ANALYSIS_START_DATE": "2012-01-01",
     }
 )
+RUN11_RELAXED_OVERRIDES["agent_params"].update(
+    {
+        "fusion_cross_asset_mixer_enabled": True,
+        "fusion_cross_asset_mixer_layers": 1,
+        "fusion_cross_asset_mixer_expansion": 2.0,
+        "fusion_cross_asset_mixer_dropout": 0.10,
+        "recurrent_memory_enabled": True,
+        "recurrent_memory_units": 64,
+        "recurrent_memory_dropout": 0.1,
+    }
+)
 RUN11_RELAXED_OVERRIDES["agent_params"]["ppo_params"].update(
     {
         "lagrangian_cvar_threshold": -0.035,
@@ -1868,6 +1879,12 @@ def assert_run11_relaxed_config(config: dict) -> None:
     )
     assert bool(agent.get("regime_conditioning_enabled", False)), "regime_conditioning_enabled must stay on"
     assert str(agent.get("regime_conditioning_mode", "concat")).lower() == "film", "regime_conditioning_mode must be film"
+    assert bool(agent.get("fusion_cross_asset_mixer_enabled", False)), (
+        "fusion_cross_asset_mixer_enabled must stay on for Run11 architecture upgrade"
+    )
+    assert bool(agent.get("recurrent_memory_enabled", False)), (
+        "recurrent_memory_enabled must stay on for the Run11 architecture upgrade"
+    )
     assert bool(agent.get("distributional_critic_enabled", False)), "distributional_critic_enabled must stay on"
     assert float(ppo.get("lagrangian_cvar_penalty_scale", 999.0)) <= 0.75, (
         "lagrangian_cvar_penalty_scale drifted above the relaxed Run11 cap"
