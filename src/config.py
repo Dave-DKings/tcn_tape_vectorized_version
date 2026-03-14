@@ -1595,6 +1595,74 @@ RUN10_ALPHA_OVERRIDES["training_params"].update(
 )
 
 
+RUN11_RELAXED_OVERRIDES = copy.deepcopy(RUN10_ALPHA_OVERRIDES)
+RUN11_RELAXED_OVERRIDES["agent_params"]["ppo_params"].update(
+    {
+        "lagrangian_cvar_threshold": -0.035,
+        "lagrangian_cvar_lr": 0.002,
+        "lagrangian_cvar_lambda_max": 2.0,
+        "lagrangian_cvar_penalty_scale": 0.75,
+        "cvar_advantage_weight": 0.0,
+        "alpha_diversity_coef": 0.005,
+        "alpha_dispersion_coef": 0.02,
+        "alpha_dispersion_target_std": 0.10,
+    }
+)
+RUN11_RELAXED_OVERRIDES["environment_params"].update(
+    {
+        "target_turnover": 0.60,
+        "turnover_penalty_scalar": 0.15,
+        "action_realization_penalty_scalar": 0.10,
+        "tape_terminal_gate_a_enabled": True,
+        "tape_terminal_gate_a_sharpe_threshold": 0.0,
+        "tape_terminal_gate_a_max_drawdown": 0.30,
+        "drawdown_constraint": {
+            "target": 0.27,
+            "tolerance": -0.02,
+            "penalty_coef": 0.50,
+            "lambda_init": 0.05,
+            "lambda_carry_decay": 0.20,
+        },
+    }
+)
+RUN11_RELAXED_OVERRIDES["training_params"].update(
+    {
+        "action_execution_beta_schedule": [
+            {"threshold": 0, "beta": 0.50},
+            {"threshold": 100_000, "beta": 0.65},
+            {"threshold": 200_000, "beta": 0.80},
+            {"threshold": 350_000, "beta": 1.00},
+        ],
+        "action_execution_beta_curriculum": {
+            0: 0.50,
+            100_000: 0.65,
+            200_000: 0.80,
+            350_000: 1.00,
+        },
+        "evaluation_action_execution_beta": 1.00,
+        "turnover_penalty_curriculum": {
+            0: 0.10,
+            100_000: 0.15,
+            200_000: 0.20,
+            300_000: 0.25,
+            400_000: 0.30,
+        },
+        "periodic_checkpoint_every_steps": 50_000,
+        "high_watermark_checkpoint_enabled": True,
+        "high_watermark_sharpe_threshold": 0.60,
+        "high_watermark_max_drawdown_abs_threshold": 0.30,
+        "step_sharpe_checkpoint_enabled": True,
+        "step_sharpe_checkpoint_threshold": 1.15,
+        "training_early_stop_dd_soft_limit_pct": 35.0,
+        "training_early_stop_turnover_soft_limit_pct": 60.0,
+        "training_early_stop_dd_penalty_weight": 0.25,
+        "training_early_stop_turnover_penalty_weight": 0.10,
+        "training_early_stop_hard_dd_limit_pct": 60.0,
+        "training_early_stop_hard_dd_patience_updates": 12,
+    }
+)
+
+
 def apply_run9_alpha_overrides(config: dict, overrides: dict = None) -> dict:
     """Apply the canonical Run9 alpha-generation training recipe in-place."""
     global TRAIN_TEST_SPLIT_DATE
@@ -1764,6 +1832,100 @@ def build_run10_alpha_config(
     if analysis_end_date is not None:
         config["ANALYSIS_END_DATE"] = analysis_end_date
     assert_run10_alpha_config(config)
+    return config
+
+
+def apply_run11_relaxed_overrides(config: dict, overrides: dict = None) -> dict:
+    """Apply the canonical Run11 relaxed-risk exploration recipe in-place."""
+    global TRAIN_TEST_SPLIT_DATE
+    resolved = copy.deepcopy(RUN11_RELAXED_OVERRIDES if overrides is None else overrides)
+    split_date = resolved.get("TRAIN_TEST_SPLIT_DATE")
+    if split_date:
+        TRAIN_TEST_SPLIT_DATE = split_date
+        config["TRAIN_TEST_SPLIT_DATE"] = split_date
+    _deep_update_config(config, resolved)
+    return config
+
+
+def assert_run11_relaxed_config(config: dict) -> None:
+    """Raise if a config expected to match the Run11 relaxed recipe drifted."""
+    agent = config.get("agent_params", {})
+    ppo = agent.get("ppo_params", {})
+    env = config.get("environment_params", {})
+    training = config.get("training_params", {})
+    feature_params = config.get("feature_params", {})
+
+    assert str(config.get("TRAIN_TEST_SPLIT_DATE", "")) == str(TRAIN_TEST_SPLIT_DATE_RECENT), (
+        "Run11 split date drifted from the recent-window target"
+    )
+    assert str(config.get("ANALYSIS_START_DATE", "")) == "2016-01-01", (
+        "Run11 analysis start date drifted from the recent-window target"
+    )
+    assert bool(agent.get("regime_conditioning_enabled", False)), "regime_conditioning_enabled must stay on"
+    assert str(agent.get("regime_conditioning_mode", "concat")).lower() == "film", "regime_conditioning_mode must be film"
+    assert bool(agent.get("distributional_critic_enabled", False)), "distributional_critic_enabled must stay on"
+    assert float(ppo.get("lagrangian_cvar_penalty_scale", 999.0)) <= 0.75, (
+        "lagrangian_cvar_penalty_scale drifted above the relaxed Run11 cap"
+    )
+    assert float(ppo.get("cvar_advantage_weight", 999.0)) == 0.0, "cvar_advantage_weight must stay off for Run11"
+    assert float(env.get("target_turnover", 0.0)) >= 0.60, "target_turnover drifted below the relaxed Run11 floor"
+    assert float(env.get("turnover_penalty_scalar", 999.0)) <= 0.15, (
+        "turnover_penalty_scalar drifted above the relaxed Run11 cap"
+    )
+    assert float(env.get("action_realization_penalty_scalar", 999.0)) <= 0.10, (
+        "action_realization_penalty_scalar drifted above the relaxed Run11 cap"
+    )
+    dd = env.get("drawdown_constraint", {}) or {}
+    assert float(dd.get("target", 0.0)) >= 0.27, "drawdown target drifted below the relaxed Run11 floor"
+    assert float(dd.get("penalty_coef", 999.0)) <= 0.50, "drawdown penalty coef drifted above the relaxed Run11 cap"
+    assert bool(env.get("tape_terminal_gate_a_enabled", False)), "Run11 Gate A must stay enabled"
+    assert float(env.get("tape_terminal_gate_a_max_drawdown", 0.0)) == 0.30, (
+        "Run11 terminal Gate A max drawdown must stay aligned at 30%"
+    )
+    assert not bool(training.get("deterministic_validation_checkpointing_enabled", True)), (
+        "deterministic validation must stay disabled for Run11 compute-efficient mode"
+    )
+    assert bool(training.get("high_watermark_checkpoint_enabled", False)), (
+        "high_watermark_checkpoint_enabled must stay on for Run11 checkpoint selection"
+    )
+    assert bool(training.get("step_sharpe_checkpoint_enabled", False)), (
+        "step_sharpe_checkpoint_enabled must stay on for Run11 checkpoint capture"
+    )
+    assert int(training.get("periodic_checkpoint_every_steps", 0)) > 0, (
+        "periodic checkpoints must stay enabled for Run11"
+    )
+    assert not bool(feature_params.get("actuarial_params", {}).get("enabled", False)), (
+        "Run11 actuarial features must stay disabled"
+    )
+
+    expected_turnover = copy.deepcopy(RUN11_RELAXED_OVERRIDES["training_params"]["turnover_penalty_curriculum"])
+    actual_turnover = {
+        int(threshold): float(value)
+        for threshold, value in dict(training.get("turnover_penalty_curriculum", {})).items()
+    }
+    assert actual_turnover == expected_turnover, "turnover_penalty_curriculum drifted from the canonical Run11 schedule"
+
+    expected_beta = copy.deepcopy(RUN11_RELAXED_OVERRIDES["training_params"]["action_execution_beta_curriculum"])
+    actual_beta = {
+        int(threshold): float(value)
+        for threshold, value in dict(training.get("action_execution_beta_curriculum", {})).items()
+    }
+    assert actual_beta == expected_beta, "action_execution_beta_curriculum drifted from the canonical Run11 schedule"
+
+
+def build_run11_relaxed_config(
+    phase_name: str = "phase1",
+    *,
+    analysis_end_date: str | None = None,
+    overrides: dict | None = None,
+) -> dict:
+    """Return a deep-copied phase config with feature-audit + Run11 relaxed overrides applied."""
+    config = copy.deepcopy(get_active_config(phase_name))
+    enforce_feature_audit_plan(config)
+    apply_run11_relaxed_overrides(config, overrides=overrides)
+    if analysis_end_date is not None:
+        config["ANALYSIS_END_DATE"] = analysis_end_date
+    assert_run11_relaxed_config(config)
     return config
 
 
