@@ -2074,11 +2074,68 @@ def apply_run12_mixture_overrides(config: dict, overrides: dict = None) -> dict:
 
 def assert_run12_mixture_config(config: dict) -> None:
     """Raise if a config expected to match the Run12 mixture-head recipe drifted."""
-    assert_run11_relaxed_config(config)
     agent = config.get("agent_params", {})
     ppo = agent.get("ppo_params", {})
     env = config.get("environment_params", {})
     training = config.get("training_params", {})
+    feature_params = config.get("feature_params", {})
+    dd = env.get("drawdown_constraint", {}) or {}
+
+    assert str(config.get("TRAIN_TEST_SPLIT_DATE", "")) == str(TRAIN_TEST_SPLIT_DATE_RECENT), (
+        "Run12 split date drifted from the recent-window target"
+    )
+    assert str(config.get("ANALYSIS_START_DATE", "")) == "2012-01-01", (
+        "Run12 analysis start date drifted from the 10-year training target"
+    )
+    assert bool(agent.get("regime_conditioning_enabled", False)), "regime_conditioning_enabled must stay on"
+    assert str(agent.get("regime_conditioning_mode", "concat")).lower() == "film", (
+        "regime_conditioning_mode must be film"
+    )
+    assert bool(agent.get("fusion_cross_asset_mixer_enabled", False)), (
+        "fusion_cross_asset_mixer_enabled must stay on for Run12"
+    )
+    assert bool(agent.get("recurrent_memory_enabled", False)), (
+        "recurrent_memory_enabled must stay on for Run12"
+    )
+    assert bool(agent.get("distributional_critic_enabled", False)), "distributional_critic_enabled must stay on"
+    assert float(ppo.get("lagrangian_cvar_penalty_scale", 999.0)) <= 0.75, (
+        "lagrangian_cvar_penalty_scale drifted above the relaxed Run12 cap"
+    )
+    assert float(ppo.get("cvar_advantage_weight", 999.0)) == 0.0, (
+        "cvar_advantage_weight must stay off for Run12"
+    )
+    assert float(env.get("target_turnover", 0.0)) >= 0.60, (
+        "target_turnover drifted below the relaxed Run12 floor"
+    )
+    assert float(env.get("turnover_penalty_scalar", 999.0)) <= 0.15, (
+        "turnover_penalty_scalar drifted above the relaxed Run12 cap"
+    )
+    assert float(env.get("action_realization_penalty_scalar", 999.0)) <= 0.10, (
+        "action_realization_penalty_scalar drifted above the relaxed Run12 cap"
+    )
+    assert float(dd.get("target", 0.0)) >= 0.27, "drawdown target drifted below the relaxed Run12 floor"
+    assert float(dd.get("penalty_coef", 999.0)) <= 0.50, (
+        "drawdown penalty coef drifted above the relaxed Run12 cap"
+    )
+    assert bool(env.get("tape_terminal_gate_a_enabled", False)), "Run12 Gate A must stay enabled"
+    assert float(env.get("tape_terminal_gate_a_max_drawdown", 0.0)) == 0.30, (
+        "Run12 terminal Gate A max drawdown must stay aligned at 30%"
+    )
+    assert not bool(training.get("deterministic_validation_checkpointing_enabled", True)), (
+        "deterministic validation must stay disabled for Run12 compute-efficient mode"
+    )
+    assert bool(training.get("high_watermark_checkpoint_enabled", False)), (
+        "high_watermark_checkpoint_enabled must stay on for Run12 checkpoint selection"
+    )
+    assert bool(training.get("step_sharpe_checkpoint_enabled", False)), (
+        "step_sharpe_checkpoint_enabled must stay on for Run12 checkpoint capture"
+    )
+    assert int(training.get("periodic_checkpoint_every_steps", 0)) > 0, (
+        "periodic checkpoints must stay enabled for Run12"
+    )
+    assert not bool(feature_params.get("actuarial_params", {}).get("enabled", False)), (
+        "Run12 actuarial features must stay disabled"
+    )
 
     assert int(training.get("max_total_timesteps", 0)) == 300_000, (
         "Run12 max_total_timesteps must stay at 300,000"
@@ -2103,6 +2160,72 @@ def assert_run12_mixture_config(config: dict) -> None:
     )
     assert str(env.get("regime_sampling_mode", "")).lower() == "balanced_quota", (
         "Run12 regime_sampling_mode must stay balanced_quota"
+    )
+
+    expected_turnover = copy.deepcopy(RUN12_MIXTURE_OVERRIDES["training_params"]["turnover_penalty_curriculum"])
+    actual_turnover = {
+        int(threshold): float(value)
+        for threshold, value in dict(training.get("turnover_penalty_curriculum", {})).items()
+    }
+    assert actual_turnover == expected_turnover, (
+        "Run12 turnover_penalty_curriculum drifted from the canonical schedule"
+    )
+
+    expected_beta = copy.deepcopy(RUN12_MIXTURE_OVERRIDES["training_params"]["action_execution_beta_curriculum"])
+    actual_beta = {
+        int(threshold): float(value)
+        for threshold, value in dict(training.get("action_execution_beta_curriculum", {})).items()
+    }
+    assert actual_beta == expected_beta, (
+        "Run12 action_execution_beta_curriculum drifted from the canonical schedule"
+    )
+
+    expected_rollout = copy.deepcopy(RUN12_MIXTURE_OVERRIDES["training_params"]["timesteps_per_ppo_update_schedule"])
+    actual_rollout = copy.deepcopy(training.get("timesteps_per_ppo_update_schedule", []))
+    assert actual_rollout == expected_rollout, (
+        "Run12 timesteps_per_ppo_update_schedule drifted from the canonical schedule"
+    )
+
+    expected_batch = copy.deepcopy(RUN12_MIXTURE_OVERRIDES["training_params"]["batch_size_ppo_schedule"])
+    actual_batch = copy.deepcopy(training.get("batch_size_ppo_schedule", []))
+    assert actual_batch == expected_batch, (
+        "Run12 batch_size_ppo_schedule drifted from the canonical schedule"
+    )
+
+    expected_gamma = copy.deepcopy(RUN12_MIXTURE_OVERRIDES["training_params"]["ppo_gamma_schedule"])
+    actual_gamma = copy.deepcopy(training.get("ppo_gamma_schedule", []))
+    assert actual_gamma == expected_gamma, (
+        "Run12 ppo_gamma_schedule drifted from the canonical schedule"
+    )
+
+    expected_gae = copy.deepcopy(RUN12_MIXTURE_OVERRIDES["training_params"]["ppo_gae_lambda_schedule"])
+    actual_gae = copy.deepcopy(training.get("ppo_gae_lambda_schedule", []))
+    assert actual_gae == expected_gae, (
+        "Run12 ppo_gae_lambda_schedule drifted from the canonical schedule"
+    )
+
+    expected_entropy = copy.deepcopy(RUN12_MIXTURE_OVERRIDES["training_params"]["ppo_entropy_coef_schedule"])
+    actual_entropy = copy.deepcopy(training.get("ppo_entropy_coef_schedule", []))
+    assert actual_entropy == expected_entropy, (
+        "Run12 ppo_entropy_coef_schedule drifted from the canonical schedule"
+    )
+
+    expected_aux = copy.deepcopy(RUN12_MIXTURE_OVERRIDES["training_params"]["aux_return_pred_coef_schedule"])
+    actual_aux = copy.deepcopy(training.get("aux_return_pred_coef_schedule", []))
+    assert actual_aux == expected_aux, (
+        "Run12 aux_return_pred_coef_schedule drifted from the canonical schedule"
+    )
+
+    expected_temp = copy.deepcopy(RUN12_MIXTURE_OVERRIDES["training_params"]["dirichlet_temperature_schedule"])
+    actual_temp = copy.deepcopy(training.get("dirichlet_temperature_schedule", []))
+    assert actual_temp == expected_temp, (
+        "Run12 dirichlet_temperature_schedule drifted from the canonical schedule"
+    )
+
+    expected_episode = copy.deepcopy(RUN12_MIXTURE_OVERRIDES["training_params"]["episode_length_curriculum_schedule"])
+    actual_episode = copy.deepcopy(training.get("episode_length_curriculum_schedule", []))
+    assert actual_episode == expected_episode, (
+        "Run12 episode_length_curriculum_schedule drifted from the canonical schedule"
     )
 
 
