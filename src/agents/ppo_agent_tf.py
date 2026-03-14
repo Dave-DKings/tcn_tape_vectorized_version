@@ -334,6 +334,23 @@ class PPOAgentTF:
         self.mixture_dirichlet_entropy_coef = float(
             max(ppo_params.get('mixture_dirichlet_entropy_coef', 0.0), 0.0)
         )
+        self.mixture_component_dispersion_coef = float(
+            max(ppo_params.get('mixture_component_dispersion_coef', 0.0), 0.0)
+        )
+        self.mixture_component_target_std = float(
+            max(ppo_params.get('mixture_component_target_std', 0.0), 0.0)
+        )
+        self.mixture_component_min_distance = float(
+            max(ppo_params.get('mixture_component_min_distance', 0.0), 0.0)
+        )
+        self.mixture_dirichlet_balance_schedule = self._parse_threshold_coef_schedule(
+            ppo_params.get('mixture_dirichlet_balance_schedule', []),
+            fallback_coef=self.mixture_dirichlet_balance_coef,
+        )
+        self.mixture_dirichlet_entropy_schedule = self._parse_threshold_coef_schedule(
+            ppo_params.get('mixture_dirichlet_entropy_schedule', []),
+            fallback_coef=self.mixture_dirichlet_entropy_coef,
+        )
         raw_max_single = config.get('max_single_position', ppo_params.get('dual_head_projection_max_single_position', 0.20))
         raw_min_cash = config.get('min_cash_position', ppo_params.get('dual_head_projection_min_cash_position', 0.05))
         try:
@@ -1136,6 +1153,35 @@ class PPOAgentTF:
                 break
         return float(np.clip(rho, 0.0, 1.0))
 
+    def _parse_threshold_coef_schedule(self, schedule_cfg, *, fallback_coef: float) -> list:
+        """Parse a simple threshold->coef schedule used by mixture regularizers."""
+        parsed = []
+        if isinstance(schedule_cfg, (list, tuple)):
+            for entry in schedule_cfg:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    threshold = int(entry.get('threshold', 0))
+                    coef = float(entry.get('coef', fallback_coef))
+                except (TypeError, ValueError):
+                    continue
+                parsed.append({"threshold": max(0, threshold), "coef": max(0.0, coef)})
+        if not parsed:
+            parsed = [{"threshold": 0, "coef": max(0.0, float(fallback_coef))}]
+        parsed.sort(key=lambda item: item["threshold"])
+        if parsed[0]["threshold"] != 0:
+            parsed.insert(0, {"threshold": 0, "coef": parsed[0]["coef"]})
+        return parsed
+
+    def _get_threshold_coef(self, schedule: list, fallback_coef: float) -> float:
+        coef = float(fallback_coef)
+        for entry in schedule:
+            if self._global_step >= int(entry["threshold"]):
+                coef = float(entry["coef"])
+            else:
+                break
+        return max(0.0, coef)
+
     def _blend_action_with_projection(
         self,
         dirichlet_action: tf.Tensor,
@@ -1759,6 +1805,7 @@ class PPOAgentTF:
 
         mixture_balance_loss = tf.constant(0.0, dtype=tf.float32)
         mixture_separation_loss = tf.constant(0.0, dtype=tf.float32)
+        mixture_component_dispersion_loss = tf.constant(0.0, dtype=tf.float32)
         mixture_gating_entropy = tf.constant(0.0, dtype=tf.float32)
 
         if self.mixture_dirichlet_enabled and mixture_alpha is not None and mixture_probs is not None:
@@ -1771,17 +1818,31 @@ class PPOAgentTF:
             log_probs_new = dirichlet.log_prob(actions) + categorical.log_prob(mixture_components)
             component_entropies = tfd.Dirichlet(mixture_alpha).entropy()
             mixture_gating_entropy = tf.reduce_mean(categorical.entropy())
+            gating_entropy_coef = tf.constant(
+                self._get_threshold_coef(
+                    self.mixture_dirichlet_entropy_schedule,
+                    self.mixture_dirichlet_entropy_coef,
+                ),
+                dtype=tf.float32,
+            )
             entropy = tf.reduce_mean(
                 tf.reduce_sum(mixture_probs * component_entropies, axis=-1)
-                + self.mixture_dirichlet_entropy_coef * categorical.entropy()
+                + gating_entropy_coef * categorical.entropy()
             )
             mean_probs = tf.reduce_mean(mixture_probs, axis=0)
             uniform_probs = tf.fill(
                 tf.shape(mean_probs),
                 tf.cast(1.0 / tf.cast(tf.shape(mean_probs)[0], tf.float32), tf.float32),
             )
+            balance_coef = tf.constant(
+                self._get_threshold_coef(
+                    self.mixture_dirichlet_balance_schedule,
+                    self.mixture_dirichlet_balance_coef,
+                ),
+                dtype=tf.float32,
+            )
             mixture_balance_loss = (
-                tf.constant(self.mixture_dirichlet_balance_coef, dtype=tf.float32)
+                balance_coef
                 * tf.reduce_sum(
                     mean_probs * (
                         tf.math.log(tf.maximum(mean_probs, 1e-8))
@@ -1800,8 +1861,24 @@ class PPOAgentTF:
             )
             mixture_separation_loss = (
                 tf.constant(self.mixture_dirichlet_separation_coef, dtype=tf.float32)
-                * tf.reduce_mean(tf.maximum(0.10 - mean_pairwise_dist, 0.0))
+                * tf.reduce_mean(
+                    tf.maximum(
+                        tf.constant(self.mixture_component_min_distance, dtype=tf.float32)
+                        - mean_pairwise_dist,
+                        0.0,
+                    )
+                )
             )
+            if self.mixture_component_dispersion_coef > 0.0:
+                component_std = tf.math.reduce_std(component_means, axis=-1)
+                component_shortfall = tf.maximum(
+                    tf.constant(self.mixture_component_target_std, dtype=tf.float32) - component_std,
+                    0.0,
+                )
+                mixture_component_dispersion_loss = (
+                    tf.constant(self.mixture_component_dispersion_coef, dtype=tf.float32)
+                    * tf.reduce_mean(component_shortfall)
+                )
         else:
             dirichlet = tfd.Dirichlet(alpha)
             log_probs_new = dirichlet.log_prob(actions)
@@ -1907,6 +1984,7 @@ class PPOAgentTF:
             + aux_return_loss
             + mixture_balance_loss
             + mixture_separation_loss
+            + mixture_component_dispersion_loss
         )
         
         approx_kl = tf.reduce_mean(log_probs_old - log_probs_new)
@@ -1932,6 +2010,7 @@ class PPOAgentTF:
             dispersion_loss,
             mixture_balance_loss,
             mixture_separation_loss,
+            mixture_component_dispersion_loss,
             mixture_gating_entropy,
         )
     
@@ -2167,6 +2246,7 @@ class PPOAgentTF:
             'alpha_cap_hit_frac': 0.0,
             'mixture_balance_loss': 0.0,
             'mixture_separation_loss': 0.0,
+            'mixture_component_dispersion_loss': 0.0,
             'mixture_gating_entropy': 0.0,
             'mixture_component_usage': np.zeros(self.mixture_dirichlet_num_components, dtype=np.float64),
             # Track risky-asset alpha means only; cash is handled separately in actions
@@ -2241,6 +2321,7 @@ class PPOAgentTF:
                         dispersion_loss,
                         mixture_balance_loss,
                         mixture_separation_loss,
+                        mixture_component_dispersion_loss,
                         mixture_gating_entropy,
                     ) = self._actor_loss(
                         batch_states, batch_actions, batch_log_probs_old, batch_advantages, batch_mixture_components_old
@@ -2301,6 +2382,7 @@ class PPOAgentTF:
                 stats['alpha_dispersion_loss'] += float(dispersion_loss)
                 stats['mixture_balance_loss'] += float(mixture_balance_loss)
                 stats['mixture_separation_loss'] += float(mixture_separation_loss)
+                stats['mixture_component_dispersion_loss'] += float(mixture_component_dispersion_loss)
                 stats['mixture_gating_entropy'] += float(mixture_gating_entropy)
                 if self.risk_aux_cvar_adaptive_enabled:
                     self._update_adaptive_cvar_coef(float(cvar_aux_proxy))
@@ -2367,7 +2449,8 @@ class PPOAgentTF:
                        'risk_aux_total', 'risk_aux_sharpe_proxy', 'risk_aux_sharpe_loss', 'risk_aux_mvo_loss',
                        'risk_aux_cvar_proxy', 'risk_aux_cvar_loss',
                        'alpha_diversity_loss', 'alpha_dispersion_loss',
-                       'mixture_balance_loss', 'mixture_separation_loss', 'mixture_gating_entropy',
+                       'mixture_balance_loss', 'mixture_separation_loss',
+                       'mixture_component_dispersion_loss', 'mixture_gating_entropy',
                        'policy_loss', 'entropy_loss', 'entropy',
                        'actor_grad_norm', 'critic_grad_norm', 'alpha_min', 'alpha_max', 'alpha_mean', 'alpha_std',
                        'alpha_cap_hit_frac',

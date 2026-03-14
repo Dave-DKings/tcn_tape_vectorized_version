@@ -612,6 +612,11 @@ PHASE1_CONFIG = {
             "mixture_dirichlet_balance_coef": 0.0,
             "mixture_dirichlet_separation_coef": 0.0,
             "mixture_dirichlet_entropy_coef": 0.0,
+            "mixture_component_dispersion_coef": 0.0,
+            "mixture_component_target_std": 0.30,
+            "mixture_component_min_distance": 0.10,
+            "mixture_dirichlet_balance_schedule": [],
+            "mixture_dirichlet_entropy_schedule": [],
             # Optional risk-aware actor auxiliaries.
             "use_risk_aux_loss": True,
             # Per-asset feature index used as one-step return proxy in structured state tensor.
@@ -1700,9 +1705,24 @@ RUN12_MIXTURE_OVERRIDES["agent_params"].update(
 )
 RUN12_MIXTURE_OVERRIDES["agent_params"]["ppo_params"].update(
     {
-        "mixture_dirichlet_balance_coef": 0.01,
-        "mixture_dirichlet_separation_coef": 0.01,
-        "mixture_dirichlet_entropy_coef": 0.002,
+        "mixture_dirichlet_balance_coef": 0.015,
+        "mixture_dirichlet_separation_coef": 0.06,
+        "mixture_dirichlet_entropy_coef": 0.003,
+        "mixture_component_dispersion_coef": 0.04,
+        "mixture_component_target_std": 0.30,
+        "mixture_component_min_distance": 0.18,
+        "mixture_dirichlet_balance_schedule": [
+            {"threshold": 0, "coef": 0.015},
+            {"threshold": 80_000, "coef": 0.008},
+            {"threshold": 160_000, "coef": 0.003},
+            {"threshold": 220_000, "coef": 0.001},
+        ],
+        "mixture_dirichlet_entropy_schedule": [
+            {"threshold": 0, "coef": 0.003},
+            {"threshold": 80_000, "coef": 0.0015},
+            {"threshold": 160_000, "coef": 0.0007},
+            {"threshold": 220_000, "coef": 0.0002},
+        ],
     }
 )
 RUN12_MIXTURE_OVERRIDES["environment_params"].update(
@@ -2157,6 +2177,15 @@ def assert_run12_mixture_config(config: dict) -> None:
     )
     assert float(ppo.get("mixture_dirichlet_entropy_coef", 0.0)) > 0.0, (
         "Run12 mixture_dirichlet_entropy_coef must stay on"
+    )
+    assert float(ppo.get("mixture_component_dispersion_coef", 0.0)) > 0.0, (
+        "Run12 mixture_component_dispersion_coef must stay on"
+    )
+    assert float(ppo.get("mixture_component_target_std", 0.0)) >= 0.30, (
+        "Run12 mixture_component_target_std must stay at least 0.30"
+    )
+    assert float(ppo.get("mixture_component_min_distance", 0.0)) >= 0.18, (
+        "Run12 mixture_component_min_distance must stay at least 0.18"
     )
     assert str(env.get("regime_sampling_mode", "")).lower() == "balanced_quota", (
         "Run12 regime_sampling_mode must stay balanced_quota"

@@ -899,6 +899,7 @@ TRAINING_FIELDNAMES: List[str] = [
     "alpha_cap_hit_frac",
     "mixture_balance_loss",
     "mixture_separation_loss",
+    "mixture_component_dispersion_loss",
     "mixture_gating_entropy",
     "mixture_component_usage",
     "ratio_mean",
@@ -5397,6 +5398,7 @@ def run_experiment6_tape(
         ratio_std_value = update_metrics.get("ratio_std", 0.0)
         mixture_balance_loss_value = update_metrics.get("mixture_balance_loss", 0.0)
         mixture_separation_loss_value = update_metrics.get("mixture_separation_loss", 0.0)
+        mixture_component_dispersion_loss_value = update_metrics.get("mixture_component_dispersion_loss", 0.0)
         mixture_gating_entropy_value = update_metrics.get("mixture_gating_entropy", 0.0)
         mixture_component_usage_value = update_metrics.get("mixture_component_usage", None)
 
@@ -5528,6 +5530,7 @@ def run_experiment6_tape(
             ratio_std_val = to_scalar(ratio_std_value)
             mixture_balance_loss_val = to_scalar(mixture_balance_loss_value)
             mixture_separation_loss_val = to_scalar(mixture_separation_loss_value)
+            mixture_component_dispersion_loss_val = to_scalar(mixture_component_dispersion_loss_value)
             mixture_gating_entropy_val = to_scalar(mixture_gating_entropy_value)
             mixture_component_usage_val = None
             if mixture_component_usage_value is not None:
@@ -5656,11 +5659,17 @@ def run_experiment6_tape(
                 f"hhi_loss={alpha_diversity_loss_val:.4f} | "
                 f"dispersion_loss={alpha_dispersion_loss_val:.4f}"
             )
-            if mixture_gating_entropy_val or mixture_balance_loss_val or mixture_separation_loss_val:
+            if (
+                mixture_gating_entropy_val
+                or mixture_balance_loss_val
+                or mixture_separation_loss_val
+                or mixture_component_dispersion_loss_val
+            ):
                 print(
                     f"   🧩 Mixture Head: gate_entropy={mixture_gating_entropy_val:.4f} | "
                     f"balance_loss={mixture_balance_loss_val:.4f} | "
-                    f"separation_loss={mixture_separation_loss_val:.4f}"
+                    f"separation_loss={mixture_separation_loss_val:.4f} | "
+                    f"component_dispersion_loss={mixture_component_dispersion_loss_val:.4f}"
                 )
             print(
                 f"   ⚙️ Optimizer: actor_lr={agent.get_actor_lr():.6f} | "
@@ -5887,6 +5896,7 @@ def run_experiment6_tape(
                 "alpha_cap_hit_frac": alpha_cap_hit_frac_val,
                 "mixture_balance_loss": mixture_balance_loss_val,
                 "mixture_separation_loss": mixture_separation_loss_val,
+                "mixture_component_dispersion_loss": mixture_component_dispersion_loss_val,
                 "mixture_gating_entropy": mixture_gating_entropy_val,
                 "mixture_component_usage": (
                     json.dumps([float(v) for v in mixture_component_usage_val.tolist()])
