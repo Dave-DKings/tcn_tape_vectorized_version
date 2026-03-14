@@ -1710,6 +1710,82 @@ RUN12_MIXTURE_OVERRIDES["environment_params"].update(
         "regime_sampling_mode": "balanced_quota",
     }
 )
+RUN12_MIXTURE_OVERRIDES["training_params"].update(
+    {
+        "max_total_timesteps": 300_000,
+        "timesteps_per_ppo_update_schedule": [
+            {"threshold": 0, "timesteps_per_update": 1008},
+            {"threshold": 100_000, "timesteps_per_update": 1512},
+            {"threshold": 220_000, "timesteps_per_update": 2016},
+        ],
+        "batch_size_ppo_schedule": [
+            {"threshold": 0, "batch_size": 252},
+            {"threshold": 100_000, "batch_size": 336},
+            {"threshold": 220_000, "batch_size": 504},
+        ],
+        "actor_lr_schedule": [
+            {"threshold": 0, "lr": 3e-5},
+            {"threshold": 100_000, "lr": 2e-5},
+            {"threshold": 220_000, "lr": 1e-5},
+        ],
+        "critic_lr_schedule": [
+            {"threshold": 0, "lr": 1.5e-4},
+            {"threshold": 100_000, "lr": 1.2e-4},
+            {"threshold": 220_000, "lr": 1.0e-4},
+        ],
+        "ppo_gamma_schedule": [
+            {"threshold": 0, "gamma": 0.990},
+            {"threshold": 100_000, "gamma": 0.995},
+            {"threshold": 220_000, "gamma": 0.998},
+        ],
+        "ppo_gae_lambda_schedule": [
+            {"threshold": 0, "gae_lambda": 0.92},
+            {"threshold": 100_000, "gae_lambda": 0.95},
+            {"threshold": 220_000, "gae_lambda": 0.97},
+        ],
+        "ppo_entropy_coef_schedule": [
+            {"threshold": 0, "entropy_coef": 0.003},
+            {"threshold": 100_000, "entropy_coef": 0.003},
+            {"threshold": 200_000, "entropy_coef": 0.0025},
+            {"threshold": 280_000, "entropy_coef": 0.0015},
+        ],
+        "aux_return_pred_coef_schedule": [
+            {"threshold": 0, "aux_return_pred_coef": 0.35},
+            {"threshold": 100_000, "aux_return_pred_coef": 0.30},
+            {"threshold": 220_000, "aux_return_pred_coef": 0.25},
+        ],
+        "dirichlet_temperature_schedule": [
+            {"threshold": 0, "temperature": 1.0},
+            {"threshold": 100_000, "temperature": 0.9},
+            {"threshold": 220_000, "temperature": 0.8},
+        ],
+        "episode_length_curriculum_schedule": [
+            {"threshold": 0, "limit": 756},
+            {"threshold": 60_000, "limit": 1008},
+            {"threshold": 180_000, "limit": 1500},
+            {"threshold": 260_000, "limit": None},
+        ],
+        "action_execution_beta_schedule": [
+            {"threshold": 0, "beta": 0.50},
+            {"threshold": 60_000, "beta": 0.65},
+            {"threshold": 140_000, "beta": 0.80},
+            {"threshold": 220_000, "beta": 1.00},
+        ],
+        "action_execution_beta_curriculum": {
+            0: 0.50,
+            60_000: 0.65,
+            140_000: 0.80,
+            220_000: 1.00,
+        },
+        "turnover_penalty_curriculum": {
+            0: 0.10,
+            60_000: 0.15,
+            140_000: 0.20,
+            220_000: 0.25,
+            280_000: 0.30,
+        },
+    }
+)
 
 
 def apply_run9_alpha_overrides(config: dict, overrides: dict = None) -> dict:
@@ -2002,7 +2078,11 @@ def assert_run12_mixture_config(config: dict) -> None:
     agent = config.get("agent_params", {})
     ppo = agent.get("ppo_params", {})
     env = config.get("environment_params", {})
+    training = config.get("training_params", {})
 
+    assert int(training.get("max_total_timesteps", 0)) == 300_000, (
+        "Run12 max_total_timesteps must stay at 300,000"
+    )
     assert bool(agent.get("mixture_dirichlet_enabled", False)), (
         "mixture_dirichlet_enabled must stay on for Run12"
     )
