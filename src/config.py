@@ -1807,6 +1807,23 @@ RUN12_MIXTURE_OVERRIDES["training_params"].update(
     }
 )
 
+RUN13_MLP_OVERRIDES = copy.deepcopy(RUN12_MIXTURE_OVERRIDES)
+RUN13_MLP_OVERRIDES["agent_params"].update(
+    {
+        "actor_critic_type": "MLP",
+        "use_fusion": False,
+        "use_attention": False,
+        "recurrent_memory_enabled": False,
+        "fusion_cross_asset_mixer_enabled": False,
+        "fusion_asset_identity_enabled": False,
+        "fusion_context_cross_attention_enabled": False,
+        "fusion_per_asset_alpha_head": False,
+        "actor_hidden_dims": [1024, 512, 256],
+        "critic_hidden_dims": [1024, 512, 256],
+        "mlp_dropout": 0.10,
+    }
+)
+
 
 def apply_run9_alpha_overrides(config: dict, overrides: dict = None) -> dict:
     """Apply the canonical Run9 alpha-generation training recipe in-place."""
@@ -2274,6 +2291,194 @@ def build_run12_mixture_config(
     return config
 
 
+def apply_run13_mlp_overrides(config: dict, overrides: dict = None) -> dict:
+    """Apply the canonical Run13 MLP ablation recipe in-place."""
+    global TRAIN_TEST_SPLIT_DATE
+    resolved = copy.deepcopy(RUN13_MLP_OVERRIDES if overrides is None else overrides)
+    split_date = resolved.get("TRAIN_TEST_SPLIT_DATE")
+    if split_date:
+        TRAIN_TEST_SPLIT_DATE = split_date
+        config["TRAIN_TEST_SPLIT_DATE"] = split_date
+    _deep_update_config(config, resolved)
+    return config
+
+
+def assert_run13_mlp_config(config: dict) -> None:
+    """Raise if a config expected to match the Run13 MLP ablation drifted."""
+    agent = config.get("agent_params", {})
+    ppo = agent.get("ppo_params", {})
+    env = config.get("environment_params", {})
+    training = config.get("training_params", {})
+    feature_params = config.get("feature_params", {})
+    dd = env.get("drawdown_constraint", {}) or {}
+
+    assert str(config.get("TRAIN_TEST_SPLIT_DATE", "")) == str(TRAIN_TEST_SPLIT_DATE_RECENT), (
+        "Run13 split date drifted from the recent-window target"
+    )
+    assert str(config.get("ANALYSIS_START_DATE", "")) == "2012-01-01", (
+        "Run13 analysis start date drifted from the 10-year training target"
+    )
+    assert str(agent.get("actor_critic_type", "")).upper() == "MLP", "Run13 must use the MLP actor-critic"
+    assert not bool(agent.get("use_fusion", False)), "Run13 must keep fusion disabled"
+    assert not bool(agent.get("use_attention", False)), "Run13 must keep attention disabled"
+    assert not bool(agent.get("fusion_cross_asset_mixer_enabled", False)), (
+        "Run13 must keep fusion_cross_asset_mixer_enabled off"
+    )
+    assert not bool(agent.get("recurrent_memory_enabled", False)), (
+        "Run13 must keep recurrent_memory_enabled off"
+    )
+    assert bool(agent.get("regime_conditioning_enabled", False)), "regime_conditioning_enabled must stay on"
+    assert str(agent.get("regime_conditioning_mode", "concat")).lower() == "film", (
+        "regime_conditioning_mode must stay film"
+    )
+    assert bool(agent.get("distributional_critic_enabled", False)), "distributional_critic_enabled must stay on"
+    assert bool(agent.get("mixture_dirichlet_enabled", False)), "mixture_dirichlet_enabled must stay on"
+    assert int(agent.get("mixture_dirichlet_num_components", 0)) == 3, (
+        "Run13 mixture head must keep 3 components"
+    )
+    assert str(agent.get("mixture_dirichlet_eval_mode", "")).lower() == "top_component_mean", (
+        "Run13 mixture eval mode must stay top_component_mean"
+    )
+    assert float(agent.get("mlp_dropout", 0.0)) > 0.0, "Run13 mlp_dropout must stay configured"
+    assert bool(agent.get("actor_hidden_dims", [])), "Run13 actor_hidden_dims must stay configured"
+    assert bool(agent.get("critic_hidden_dims", [])), "Run13 critic_hidden_dims must stay configured"
+    assert float(ppo.get("lagrangian_cvar_penalty_scale", 999.0)) <= 0.75, (
+        "lagrangian_cvar_penalty_scale drifted above the relaxed Run13 cap"
+    )
+    assert float(ppo.get("cvar_advantage_weight", 999.0)) == 0.0, (
+        "cvar_advantage_weight must stay off for Run13"
+    )
+    assert float(ppo.get("mixture_dirichlet_balance_coef", 0.0)) > 0.0, (
+        "Run13 mixture_dirichlet_balance_coef must stay on"
+    )
+    assert float(ppo.get("mixture_dirichlet_separation_coef", 0.0)) > 0.0, (
+        "Run13 mixture_dirichlet_separation_coef must stay on"
+    )
+    assert float(ppo.get("mixture_component_dispersion_coef", 0.0)) > 0.0, (
+        "Run13 mixture_component_dispersion_coef must stay on"
+    )
+    assert float(env.get("target_turnover", 0.0)) >= 0.60, (
+        "target_turnover drifted below the relaxed Run13 floor"
+    )
+    assert float(env.get("turnover_penalty_scalar", 999.0)) <= 0.15, (
+        "turnover_penalty_scalar drifted above the relaxed Run13 cap"
+    )
+    assert float(env.get("action_realization_penalty_scalar", 999.0)) <= 0.10, (
+        "action_realization_penalty_scalar drifted above the relaxed Run13 cap"
+    )
+    assert float(dd.get("target", 0.0)) >= 0.27, "drawdown target drifted below the relaxed Run13 floor"
+    assert float(dd.get("penalty_coef", 999.0)) <= 0.50, (
+        "drawdown penalty coef drifted above the relaxed Run13 cap"
+    )
+    assert bool(env.get("tape_terminal_gate_a_enabled", False)), "Run13 Gate A must stay enabled"
+    assert float(env.get("tape_terminal_gate_a_max_drawdown", 0.0)) == 0.30, (
+        "Run13 terminal Gate A max drawdown must stay aligned at 30%"
+    )
+    assert str(env.get("regime_sampling_mode", "")).lower() == "balanced_quota", (
+        "Run13 regime_sampling_mode must stay balanced_quota"
+    )
+    assert int(training.get("max_total_timesteps", 0)) == 300_000, (
+        "Run13 max_total_timesteps must stay at 300,000"
+    )
+    assert not bool(training.get("deterministic_validation_checkpointing_enabled", True)), (
+        "deterministic validation must stay disabled for Run13 compute-efficient mode"
+    )
+    assert bool(training.get("high_watermark_checkpoint_enabled", False)), (
+        "high_watermark_checkpoint_enabled must stay on for Run13 checkpoint selection"
+    )
+    assert bool(training.get("step_sharpe_checkpoint_enabled", False)), (
+        "step_sharpe_checkpoint_enabled must stay on for Run13 checkpoint capture"
+    )
+    assert int(training.get("periodic_checkpoint_every_steps", 0)) > 0, (
+        "periodic checkpoints must stay enabled for Run13"
+    )
+    assert not bool(feature_params.get("actuarial_params", {}).get("enabled", False)), (
+        "Run13 actuarial features must stay disabled"
+    )
+
+    expected_turnover = copy.deepcopy(RUN13_MLP_OVERRIDES["training_params"]["turnover_penalty_curriculum"])
+    actual_turnover = {
+        int(threshold): float(value)
+        for threshold, value in dict(training.get("turnover_penalty_curriculum", {})).items()
+    }
+    assert actual_turnover == expected_turnover, (
+        "Run13 turnover_penalty_curriculum drifted from the canonical schedule"
+    )
+
+    expected_beta = copy.deepcopy(RUN13_MLP_OVERRIDES["training_params"]["action_execution_beta_curriculum"])
+    actual_beta = {
+        int(threshold): float(value)
+        for threshold, value in dict(training.get("action_execution_beta_curriculum", {})).items()
+    }
+    assert actual_beta == expected_beta, (
+        "Run13 action_execution_beta_curriculum drifted from the canonical schedule"
+    )
+
+    expected_rollout = copy.deepcopy(RUN13_MLP_OVERRIDES["training_params"]["timesteps_per_ppo_update_schedule"])
+    actual_rollout = copy.deepcopy(training.get("timesteps_per_ppo_update_schedule", []))
+    assert actual_rollout == expected_rollout, (
+        "Run13 timesteps_per_ppo_update_schedule drifted from the canonical schedule"
+    )
+
+    expected_batch = copy.deepcopy(RUN13_MLP_OVERRIDES["training_params"]["batch_size_ppo_schedule"])
+    actual_batch = copy.deepcopy(training.get("batch_size_ppo_schedule", []))
+    assert actual_batch == expected_batch, (
+        "Run13 batch_size_ppo_schedule drifted from the canonical schedule"
+    )
+
+    expected_gamma = copy.deepcopy(RUN13_MLP_OVERRIDES["training_params"]["ppo_gamma_schedule"])
+    actual_gamma = copy.deepcopy(training.get("ppo_gamma_schedule", []))
+    assert actual_gamma == expected_gamma, (
+        "Run13 ppo_gamma_schedule drifted from the canonical schedule"
+    )
+
+    expected_gae = copy.deepcopy(RUN13_MLP_OVERRIDES["training_params"]["ppo_gae_lambda_schedule"])
+    actual_gae = copy.deepcopy(training.get("ppo_gae_lambda_schedule", []))
+    assert actual_gae == expected_gae, (
+        "Run13 ppo_gae_lambda_schedule drifted from the canonical schedule"
+    )
+
+    expected_entropy = copy.deepcopy(RUN13_MLP_OVERRIDES["training_params"]["ppo_entropy_coef_schedule"])
+    actual_entropy = copy.deepcopy(training.get("ppo_entropy_coef_schedule", []))
+    assert actual_entropy == expected_entropy, (
+        "Run13 ppo_entropy_coef_schedule drifted from the canonical schedule"
+    )
+
+    expected_aux = copy.deepcopy(RUN13_MLP_OVERRIDES["training_params"]["aux_return_pred_coef_schedule"])
+    actual_aux = copy.deepcopy(training.get("aux_return_pred_coef_schedule", []))
+    assert actual_aux == expected_aux, (
+        "Run13 aux_return_pred_coef_schedule drifted from the canonical schedule"
+    )
+
+    expected_temp = copy.deepcopy(RUN13_MLP_OVERRIDES["training_params"]["dirichlet_temperature_schedule"])
+    actual_temp = copy.deepcopy(training.get("dirichlet_temperature_schedule", []))
+    assert actual_temp == expected_temp, (
+        "Run13 dirichlet_temperature_schedule drifted from the canonical schedule"
+    )
+
+    expected_episode = copy.deepcopy(RUN13_MLP_OVERRIDES["training_params"]["episode_length_curriculum_schedule"])
+    actual_episode = copy.deepcopy(training.get("episode_length_curriculum_schedule", []))
+    assert actual_episode == expected_episode, (
+        "Run13 episode_length_curriculum_schedule drifted from the canonical schedule"
+    )
+
+
+def build_run13_mlp_config(
+    phase_name: str = "phase1",
+    *,
+    analysis_end_date: str | None = None,
+    overrides: dict | None = None,
+) -> dict:
+    """Return a deep-copied phase config with feature-audit + Run13 MLP overrides applied."""
+    config = copy.deepcopy(get_active_config(phase_name))
+    enforce_feature_audit_plan(config)
+    apply_run13_mlp_overrides(config, overrides=overrides)
+    if analysis_end_date is not None:
+        config["ANALYSIS_END_DATE"] = analysis_end_date
+    assert_run13_mlp_config(config)
+    return config
+
+
 def get_active_config(phase_name: str = None):
     """Selects the active configuration based on phase_name or environment variable."""
     if phase_name is None:
@@ -2375,12 +2580,12 @@ def get_profile_by_name(profile_name: str):
 
 def get_available_architectures():
     """Returns list of supported neural network architectures."""
-    return ['TCN', 'TCN_ATTENTION', 'TCN_FUSION']
+    return ['MLP', 'TCN', 'TCN_ATTENTION', 'TCN_FUSION']
 
 def is_sequential_architecture(architecture: str) -> bool:
     """Check if architecture requires sequential (3D) input."""
     architecture_upper = architecture.upper()
-    sequential_archs = ['TCN', 'TCN_ATTENTION', 'TCN_FUSION', 'GRU', 'RNN']
+    sequential_archs = ['MLP', 'TCN', 'TCN_ATTENTION', 'TCN_FUSION', 'GRU', 'RNN']
     return any(arch in architecture_upper for arch in sequential_archs)
 
 def validate_agent_params(agent_params: dict) -> bool:

@@ -777,6 +777,261 @@ class DirichletActor(Model):
         return alpha
 
 
+class MLPActor(DirichletActor):
+    """
+    Windowed MLP actor.
+
+    Consumes the same historical sequence window as the TCN variants, but
+    flattens the full window and applies a dense backbone instead of temporal
+    convolutions.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        num_actions: int,
+        hidden_dims: Optional[List[int]] = None,
+        dropout: Optional[float] = None,
+        regime_conditioning_enabled: Optional[bool] = None,
+        regime_conditioning_hidden_dim: Optional[int] = None,
+        regime_conditioning_dropout: Optional[float] = None,
+        regime_conditioning_mode: Optional[str] = None,
+        name: str = "mlp_actor",
+        epsilon_start: float = 0.5,
+        epsilon_min: float = 0.1,
+        alpha_activation: str = None,
+        exp_clip: Tuple[float, float] = None,
+        logit_temperature: float = None,
+        alpha_cap: float = None,
+        adaptive_temperature_enabled: bool = False,
+        adaptive_temperature_base: float = 1.0,
+        adaptive_temperature_slope: float = 0.0,
+        adaptive_temperature_min: float = 0.8,
+        adaptive_temperature_max: float = 2.5,
+        dual_head_enabled: Optional[bool] = None,
+        mixture_dirichlet_enabled: Optional[bool] = None,
+        mixture_dirichlet_num_components: Optional[int] = None,
+        mixture_dirichlet_gating_hidden_dims: Optional[List[int]] = None,
+        mixture_dirichlet_component_hidden_dims: Optional[List[int]] = None,
+        aux_return_enabled: bool = False,
+        exp_tanh_scale: float = 2.5,
+    ):
+        if hidden_dims is None:
+            hidden_dims = _DEFAULT_ACTOR_HIDDEN_DIMS
+        if dropout is None:
+            dropout = _DEFAULT_TCN_DROPOUT
+        if regime_conditioning_enabled is None:
+            regime_conditioning_enabled = _DEFAULT_REGIME_CONDITIONING_ENABLED
+        if regime_conditioning_hidden_dim is None:
+            regime_conditioning_hidden_dim = _DEFAULT_REGIME_CONDITIONING_HIDDEN_DIM
+        if regime_conditioning_dropout is None:
+            regime_conditioning_dropout = _DEFAULT_REGIME_CONDITIONING_DROPOUT
+        if dual_head_enabled is None:
+            dual_head_enabled = _DEFAULT_DUAL_HEAD_ENABLED
+        if mixture_dirichlet_enabled is None:
+            mixture_dirichlet_enabled = _DEFAULT_MIXTURE_DIRICHLET_ENABLED
+        if mixture_dirichlet_num_components is None:
+            mixture_dirichlet_num_components = _DEFAULT_MIXTURE_DIRICHLET_COMPONENTS
+        if mixture_dirichlet_gating_hidden_dims is None:
+            mixture_dirichlet_gating_hidden_dims = _DEFAULT_MIXTURE_DIRICHLET_GATING_HIDDEN_DIMS
+        if mixture_dirichlet_component_hidden_dims is None:
+            mixture_dirichlet_component_hidden_dims = _DEFAULT_MIXTURE_DIRICHLET_COMPONENT_HIDDEN_DIMS
+
+        super(MLPActor, self).__init__(
+            name=name,
+            epsilon_start=epsilon_start,
+            epsilon_min=epsilon_min,
+            alpha_activation=alpha_activation,
+            exp_clip=exp_clip,
+            logit_temperature=logit_temperature,
+            alpha_cap=alpha_cap,
+            adaptive_temperature_enabled=adaptive_temperature_enabled,
+            adaptive_temperature_base=adaptive_temperature_base,
+            adaptive_temperature_slope=adaptive_temperature_slope,
+            adaptive_temperature_min=adaptive_temperature_min,
+            adaptive_temperature_max=adaptive_temperature_max,
+            dual_head_enabled=bool(dual_head_enabled),
+            exp_tanh_scale=exp_tanh_scale,
+        )
+
+        sanitized_hidden_dims = [int(x) for x in (hidden_dims or []) if int(x) > 0]
+        if not sanitized_hidden_dims:
+            sanitized_hidden_dims = list(_DEFAULT_ACTOR_HIDDEN_DIMS)
+        self.input_dim = int(input_dim)
+        self.num_actions = int(num_actions)
+        self.latent_dim = int(sanitized_hidden_dims[-1])
+        self.regime_conditioning_enabled = bool(regime_conditioning_enabled)
+        self.regime_conditioning_mode = str(
+            regime_conditioning_mode if regime_conditioning_mode is not None else _DEFAULT_REGIME_CONDITIONING_MODE
+        ).lower().strip()
+
+        self.input_norm = layers.LayerNormalization(epsilon=1e-6, name=f"{name}_input_norm")
+        self.hidden_layers: List[Tuple[layers.Dense, layers.Dropout]] = []
+        for i, hidden_units in enumerate(sanitized_hidden_dims):
+            self.hidden_layers.append(
+                (
+                    layers.Dense(hidden_units, activation="gelu", name=f"{name}_dense_{i}"),
+                    layers.Dropout(float(dropout), name=f"{name}_dropout_{i}"),
+                )
+            )
+
+        self.regime_encoder = None
+        self.regime_fusion = None
+        self.regime_dropout = None
+        self.regime_film_layer = None
+        if self.regime_conditioning_enabled:
+            hidden_dim = max(8, int(regime_conditioning_hidden_dim))
+            if self.regime_conditioning_mode == "film":
+                self.regime_film_layer = FiLMLayer(
+                    feature_dim=self.latent_dim,
+                    conditioning_dim=9,
+                    hidden_dim=hidden_dim,
+                    dropout=float(max(0.0, regime_conditioning_dropout)),
+                    name=f"{name}_regime_film",
+                )
+            else:
+                self.regime_encoder = tf.keras.Sequential(
+                    [
+                        layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense1"),
+                        layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense2"),
+                    ],
+                    name=f"{name}_regime_encoder",
+                )
+                self.regime_fusion = layers.Dense(
+                    self.latent_dim,
+                    activation="relu",
+                    name=f"{name}_regime_fusion",
+                )
+                self.regime_dropout = layers.Dropout(float(max(0.0, regime_conditioning_dropout)))
+
+        self.output_layer = layers.Dense(
+            self.num_actions,
+            activation=None,
+            kernel_initializer="orthogonal",
+            bias_initializer=tf.keras.initializers.Constant(0.5),
+            name=f"{name}_output",
+        )
+        self.projection_layer = None
+        if self._dual_head_enabled:
+            self.projection_layer = layers.Dense(
+                self.num_actions,
+                activation=None,
+                kernel_initializer="orthogonal",
+                bias_initializer="zeros",
+                name=f"{name}_projection",
+            )
+
+        self._aux_return_enabled = bool(aux_return_enabled)
+        self.aux_return_head = None
+        if self._aux_return_enabled:
+            self.aux_return_head = tf.keras.Sequential(
+                [
+                    layers.Dense(max(32, self.latent_dim // 2), activation="relu", name=f"{name}_aux_h1"),
+                    layers.Dropout(0.05),
+                    layers.Dense(max(1, self.num_actions - 1), activation=None, name=f"{name}_aux_out"),
+                ],
+                name=f"{name}_aux_return_predictor",
+            )
+
+        self.mixture_dirichlet_enabled = bool(mixture_dirichlet_enabled)
+        self.mixture_dirichlet_num_components = max(1, int(mixture_dirichlet_num_components))
+        gating_dims = [int(x) for x in (mixture_dirichlet_gating_hidden_dims or []) if int(x) > 0]
+        component_dims = [int(x) for x in (mixture_dirichlet_component_hidden_dims or []) if int(x) > 0]
+        self.mixture_gating_layers: List[Tuple[layers.Dense, layers.Dropout]] = []
+        self.mixture_component_layers: List[Tuple[layers.Dense, layers.Dropout]] = []
+        self.mixture_component_norm = None
+        self.mixture_gating_logits_layer = None
+        self.mixture_output_layer = None
+        if self.mixture_dirichlet_enabled:
+            for i, hidden_units in enumerate(gating_dims):
+                self.mixture_gating_layers.append(
+                    (
+                        layers.Dense(hidden_units, activation="gelu", name=f"{name}_mix_gate_{i}"),
+                        layers.Dropout(float(dropout), name=f"{name}_mix_gate_drop_{i}"),
+                    )
+                )
+            self.mixture_gating_logits_layer = layers.Dense(
+                self.mixture_dirichlet_num_components,
+                activation=None,
+                kernel_initializer="orthogonal",
+                bias_initializer="zeros",
+                name=f"{name}_mixture_gating_logits",
+            )
+            if component_dims:
+                self.mixture_component_norm = layers.LayerNormalization(
+                    epsilon=1e-6, name=f"{name}_mixture_component_norm"
+                )
+                for i, hidden_units in enumerate(component_dims):
+                    self.mixture_component_layers.append(
+                        (
+                            layers.Dense(hidden_units, activation="gelu", name=f"{name}_mix_comp_{i}"),
+                            layers.Dropout(float(dropout), name=f"{name}_mix_comp_drop_{i}"),
+                        )
+                    )
+            self.mixture_output_layer = layers.Dense(
+                self.num_actions * self.mixture_dirichlet_num_components,
+                activation=None,
+                kernel_initializer="orthogonal",
+                bias_initializer=tf.keras.initializers.Constant(0.5),
+                name=f"{name}_mixture_output",
+            )
+
+    def call(self, state, training=None):
+        sequence = _flatten_structured_sequence_input(state)
+        if sequence.shape.rank == 2:
+            sequence = tf.expand_dims(sequence, axis=0)
+        regime_seq = sequence
+
+        x = tf.reshape(sequence, (tf.shape(sequence)[0], -1))
+        x = self.input_norm(x)
+        for dense_layer, dropout_layer in self.hidden_layers:
+            x = dense_layer(x)
+            x = dropout_layer(x, training=training)
+
+        if self.regime_conditioning_enabled:
+            regime_summary = _compute_regime_summary_features(regime_seq)
+            if self.regime_film_layer is not None:
+                x = self.regime_film_layer(x, regime_summary, training=training)
+            elif self.regime_encoder is not None and self.regime_fusion is not None:
+                regime_embed = self.regime_encoder(regime_summary, training=training)
+                x = self.regime_fusion(tf.concat([x, regime_embed], axis=-1), training=training)
+                if self.regime_dropout is not None:
+                    x = self.regime_dropout(x, training=training)
+
+        logits = self.output_layer(x, training=training)
+        projection_logits = self.projection_layer(x, training=training) if self.projection_layer is not None else None
+        aux_preds = self.aux_return_head(x, training=training) if self.aux_return_head is not None else None
+
+        gating_logits = None
+        mixture_logits = None
+        if self.mixture_dirichlet_enabled and self.mixture_gating_logits_layer is not None:
+            gating_features = x
+            for dense_layer, dropout_layer in self.mixture_gating_layers:
+                gating_features = dense_layer(gating_features)
+                gating_features = dropout_layer(gating_features, training=training)
+            gating_logits = self.mixture_gating_logits_layer(gating_features, training=training)
+
+            component_features = x
+            if self.mixture_component_norm is not None:
+                component_features = self.mixture_component_norm(component_features)
+            for dense_layer, dropout_layer in self.mixture_component_layers:
+                component_features = dense_layer(component_features)
+                component_features = dropout_layer(component_features, training=training)
+            mixture_logits = self.mixture_output_layer(component_features, training=training)
+            mixture_logits = tf.reshape(
+                mixture_logits,
+                (-1, self.mixture_dirichlet_num_components, self.num_actions),
+            )
+
+        return self._format_actor_output(
+            logits_for_alpha=logits,
+            mixture_logits_for_alpha=mixture_logits,
+            mixture_gating_logits=gating_logits,
+            projection_logits=projection_logits,
+            aux_return_preds=aux_preds,
+        )
+
+
 class TCNActor(DirichletActor):
     """
     Temporal Convolutional Network Actor.
@@ -2013,6 +2268,126 @@ class TCNCritic(Model):
         return value
 
 
+class MLPCritic(Model):
+    """
+    Windowed MLP critic that flattens the full sequence window and predicts a
+    scalar value or quantile distribution.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims: Optional[List[int]] = None,
+        dropout: Optional[float] = None,
+        regime_conditioning_enabled: Optional[bool] = None,
+        regime_conditioning_hidden_dim: Optional[int] = None,
+        regime_conditioning_dropout: Optional[float] = None,
+        regime_conditioning_mode: Optional[str] = None,
+        distributional_critic_enabled: Optional[bool] = None,
+        distributional_num_quantiles: Optional[int] = None,
+        name: str = "mlp_critic",
+    ):
+        super(MLPCritic, self).__init__(name=name)
+
+        if hidden_dims is None:
+            hidden_dims = _DEFAULT_CRITIC_HIDDEN_DIMS
+        if dropout is None:
+            dropout = _DEFAULT_TCN_DROPOUT
+        if regime_conditioning_enabled is None:
+            regime_conditioning_enabled = _DEFAULT_REGIME_CONDITIONING_ENABLED
+        if regime_conditioning_hidden_dim is None:
+            regime_conditioning_hidden_dim = _DEFAULT_REGIME_CONDITIONING_HIDDEN_DIM
+        if regime_conditioning_dropout is None:
+            regime_conditioning_dropout = _DEFAULT_REGIME_CONDITIONING_DROPOUT
+        if distributional_critic_enabled is None:
+            distributional_critic_enabled = _DEFAULT_DISTRIBUTIONAL_CRITIC_ENABLED
+        if distributional_num_quantiles is None:
+            distributional_num_quantiles = _DEFAULT_DISTRIBUTIONAL_NUM_QUANTILES
+
+        sanitized_hidden_dims = [int(x) for x in (hidden_dims or []) if int(x) > 0]
+        if not sanitized_hidden_dims:
+            sanitized_hidden_dims = list(_DEFAULT_CRITIC_HIDDEN_DIMS)
+        self.input_dim = int(input_dim)
+        self.latent_dim = int(sanitized_hidden_dims[-1])
+        self.regime_conditioning_enabled = bool(regime_conditioning_enabled)
+        self.regime_conditioning_mode = str(
+            regime_conditioning_mode if regime_conditioning_mode is not None else _DEFAULT_REGIME_CONDITIONING_MODE
+        ).lower().strip()
+        self.distributional_critic_enabled = bool(distributional_critic_enabled)
+        self.distributional_num_quantiles = max(2, int(distributional_num_quantiles))
+
+        self.input_norm = layers.LayerNormalization(epsilon=1e-6, name=f"{name}_input_norm")
+        self.hidden_layers: List[Tuple[layers.Dense, layers.Dropout]] = []
+        for i, hidden_units in enumerate(sanitized_hidden_dims):
+            self.hidden_layers.append(
+                (
+                    layers.Dense(hidden_units, activation="gelu", name=f"{name}_dense_{i}"),
+                    layers.Dropout(float(dropout), name=f"{name}_dropout_{i}"),
+                )
+            )
+
+        self.regime_encoder = None
+        self.regime_fusion = None
+        self.regime_dropout = None
+        self.regime_film_layer = None
+        if self.regime_conditioning_enabled:
+            hidden_dim = max(8, int(regime_conditioning_hidden_dim))
+            if self.regime_conditioning_mode == "film":
+                self.regime_film_layer = FiLMLayer(
+                    feature_dim=self.latent_dim,
+                    conditioning_dim=9,
+                    hidden_dim=hidden_dim,
+                    dropout=float(max(0.0, regime_conditioning_dropout)),
+                    name=f"{name}_regime_film",
+                )
+            else:
+                self.regime_encoder = tf.keras.Sequential(
+                    [
+                        layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense1"),
+                        layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense2"),
+                    ],
+                    name=f"{name}_regime_encoder",
+                )
+                self.regime_fusion = layers.Dense(
+                    self.latent_dim,
+                    activation="relu",
+                    name=f"{name}_regime_fusion",
+                )
+                self.regime_dropout = layers.Dropout(float(max(0.0, regime_conditioning_dropout)))
+
+        output_units = self.distributional_num_quantiles if self.distributional_critic_enabled else 1
+        self.output_layer = layers.Dense(
+            output_units,
+            activation=None,
+            kernel_initializer="orthogonal",
+            name=f"{name}_output",
+        )
+
+    def call(self, state, training=None):
+        sequence = _flatten_structured_sequence_input(state)
+        if sequence.shape.rank == 2:
+            sequence = tf.expand_dims(sequence, axis=0)
+        regime_seq = sequence
+
+        x = tf.reshape(sequence, (tf.shape(sequence)[0], -1))
+        x = self.input_norm(x)
+        for dense_layer, dropout_layer in self.hidden_layers:
+            x = dense_layer(x)
+            x = dropout_layer(x, training=training)
+
+        if self.regime_conditioning_enabled:
+            regime_summary = _compute_regime_summary_features(regime_seq)
+            if self.regime_film_layer is not None:
+                x = self.regime_film_layer(x, regime_summary, training=training)
+            elif self.regime_encoder is not None and self.regime_fusion is not None:
+                regime_embed = self.regime_encoder(regime_summary, training=training)
+                x = self.regime_fusion(tf.concat([x, regime_embed], axis=-1), training=training)
+                if self.regime_dropout is not None:
+                    x = self.regime_dropout(x, training=training)
+
+        return self.output_layer(x, training=training)
+
+
 class TCNAttentionCritic(Model):
     """
     TCN + Attention Critic.
@@ -2611,7 +2986,7 @@ def create_actor_critic(architecture: str,
     Factory function to create Actor and Critic networks based on architecture type.
     
     Args:
-        architecture: One of ['TCN', 'TCN_ATTENTION', 'TCN_FUSION']
+        architecture: One of ['MLP', 'TCN', 'TCN_ATTENTION', 'TCN_FUSION']
         input_dim: Input dimension for sequential models
         num_actions: Number of actions (assets + cash)
         config: Configuration dictionary with architecture-specific parameters
@@ -2674,7 +3049,28 @@ def create_actor_critic(architecture: str,
     aux_return_enabled_cfg = bool(
         config.get("aux_return_pred_enabled", ppo_params_cfg.get("aux_return_pred_enabled", False))
     )
-    if arch_upper == 'TCN':
+    if arch_upper == 'MLP':
+        actor = MLPActor(
+            input_dim=input_dim,
+            num_actions=num_actions,
+            hidden_dims=config.get('actor_hidden_dims', _DEFAULT_ACTOR_HIDDEN_DIMS),
+            dropout=config.get('mlp_dropout', config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT)),
+            dual_head_enabled=dual_head_enabled_cfg,
+            **mixture_kwargs,
+            aux_return_enabled=aux_return_enabled_cfg,
+            exp_tanh_scale=float(config.get('dirichlet_exp_tanh_scale', 2.5)),
+            **regime_kwargs,
+            **epsilon_kwargs,
+        )
+        critic = MLPCritic(
+            input_dim=input_dim,
+            hidden_dims=config.get('critic_hidden_dims', _DEFAULT_CRITIC_HIDDEN_DIMS),
+            dropout=config.get('mlp_dropout', config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT)),
+            **regime_kwargs,
+            **critic_distributional_kwargs,
+        )
+
+    elif arch_upper == 'TCN':
         if config.get('use_fusion', False):
             resolved_num_assets = int(config.get('num_assets', max(1, num_actions - 1)))
             actor = TCNFusionActor(
@@ -2873,7 +3269,7 @@ def create_actor_critic(architecture: str,
     else:
         raise ValueError(
             f"Unknown architecture: {architecture}. "
-            f"Must be one of: TCN, TCN_ATTENTION, TCN_FUSION"
+            f"Must be one of: MLP, TCN, TCN_ATTENTION, TCN_FUSION"
         )
     
     return actor, critic
