@@ -790,6 +790,7 @@ class MLPActor(DirichletActor):
         self,
         input_dim: int,
         num_actions: int,
+        sequence_length: int = 60,
         hidden_dims: Optional[List[int]] = None,
         dropout: Optional[float] = None,
         regime_conditioning_enabled: Optional[bool] = None,
@@ -858,6 +859,8 @@ class MLPActor(DirichletActor):
         if not sanitized_hidden_dims:
             sanitized_hidden_dims = list(_DEFAULT_ACTOR_HIDDEN_DIMS)
         self.input_dim = int(input_dim)
+        self.sequence_length = max(1, int(sequence_length))
+        self.flat_dim = int(self.sequence_length * self.input_dim)
         self.num_actions = int(num_actions)
         self.latent_dim = int(sanitized_hidden_dims[-1])
         self.regime_conditioning_enabled = bool(regime_conditioning_enabled)
@@ -865,6 +868,8 @@ class MLPActor(DirichletActor):
             regime_conditioning_mode if regime_conditioning_mode is not None else _DEFAULT_REGIME_CONDITIONING_MODE
         ).lower().strip()
 
+        self.sequence_norm = layers.LayerNormalization(epsilon=1e-6, name=f"{name}_sequence_norm")
+        self.flatten_layer = layers.Reshape((self.flat_dim,), name=f"{name}_flatten")
         self.input_norm = layers.LayerNormalization(epsilon=1e-6, name=f"{name}_input_norm")
         self.hidden_layers: List[Tuple[layers.Dense, layers.Dropout]] = []
         for i, hidden_units in enumerate(sanitized_hidden_dims):
@@ -976,13 +981,27 @@ class MLPActor(DirichletActor):
                 name=f"{name}_mixture_output",
             )
 
-    def call(self, state, training=None):
+    def _prepare_sequence(self, state) -> tf.Tensor:
         sequence = _flatten_structured_sequence_input(state)
         if sequence.shape.rank == 2:
             sequence = tf.expand_dims(sequence, axis=0)
+
+        pad_time = tf.maximum(0, self.sequence_length - tf.shape(sequence)[1])
+        sequence = tf.pad(sequence, [[0, 0], [0, pad_time], [0, 0]])
+        sequence = sequence[:, : self.sequence_length, :]
+
+        pad_feat = tf.maximum(0, self.input_dim - tf.shape(sequence)[2])
+        sequence = tf.pad(sequence, [[0, 0], [0, 0], [0, pad_feat]])
+        sequence = sequence[:, :, : self.input_dim]
+        sequence = tf.ensure_shape(sequence, [None, self.sequence_length, self.input_dim])
+        return sequence
+
+    def call(self, state, training=None):
+        sequence = self._prepare_sequence(state)
         regime_seq = sequence
 
-        x = tf.reshape(sequence, (tf.shape(sequence)[0], -1))
+        sequence = self.sequence_norm(sequence)
+        x = self.flatten_layer(sequence)
         x = self.input_norm(x)
         for dense_layer, dropout_layer in self.hidden_layers:
             x = dense_layer(x)
@@ -2277,6 +2296,7 @@ class MLPCritic(Model):
     def __init__(
         self,
         input_dim: int,
+        sequence_length: int = 60,
         hidden_dims: Optional[List[int]] = None,
         dropout: Optional[float] = None,
         regime_conditioning_enabled: Optional[bool] = None,
@@ -2308,6 +2328,8 @@ class MLPCritic(Model):
         if not sanitized_hidden_dims:
             sanitized_hidden_dims = list(_DEFAULT_CRITIC_HIDDEN_DIMS)
         self.input_dim = int(input_dim)
+        self.sequence_length = max(1, int(sequence_length))
+        self.flat_dim = int(self.sequence_length * self.input_dim)
         self.latent_dim = int(sanitized_hidden_dims[-1])
         self.regime_conditioning_enabled = bool(regime_conditioning_enabled)
         self.regime_conditioning_mode = str(
@@ -2316,6 +2338,8 @@ class MLPCritic(Model):
         self.distributional_critic_enabled = bool(distributional_critic_enabled)
         self.distributional_num_quantiles = max(2, int(distributional_num_quantiles))
 
+        self.sequence_norm = layers.LayerNormalization(epsilon=1e-6, name=f"{name}_sequence_norm")
+        self.flatten_layer = layers.Reshape((self.flat_dim,), name=f"{name}_flatten")
         self.input_norm = layers.LayerNormalization(epsilon=1e-6, name=f"{name}_input_norm")
         self.hidden_layers: List[Tuple[layers.Dense, layers.Dropout]] = []
         for i, hidden_units in enumerate(sanitized_hidden_dims):
@@ -2363,13 +2387,27 @@ class MLPCritic(Model):
             name=f"{name}_output",
         )
 
-    def call(self, state, training=None):
+    def _prepare_sequence(self, state) -> tf.Tensor:
         sequence = _flatten_structured_sequence_input(state)
         if sequence.shape.rank == 2:
             sequence = tf.expand_dims(sequence, axis=0)
+
+        pad_time = tf.maximum(0, self.sequence_length - tf.shape(sequence)[1])
+        sequence = tf.pad(sequence, [[0, 0], [0, pad_time], [0, 0]])
+        sequence = sequence[:, : self.sequence_length, :]
+
+        pad_feat = tf.maximum(0, self.input_dim - tf.shape(sequence)[2])
+        sequence = tf.pad(sequence, [[0, 0], [0, 0], [0, pad_feat]])
+        sequence = sequence[:, :, : self.input_dim]
+        sequence = tf.ensure_shape(sequence, [None, self.sequence_length, self.input_dim])
+        return sequence
+
+    def call(self, state, training=None):
+        sequence = self._prepare_sequence(state)
         regime_seq = sequence
 
-        x = tf.reshape(sequence, (tf.shape(sequence)[0], -1))
+        sequence = self.sequence_norm(sequence)
+        x = self.flatten_layer(sequence)
         x = self.input_norm(x)
         for dense_layer, dropout_layer in self.hidden_layers:
             x = dense_layer(x)
@@ -3053,6 +3091,7 @@ def create_actor_critic(architecture: str,
         actor = MLPActor(
             input_dim=input_dim,
             num_actions=num_actions,
+            sequence_length=int(config.get('sequence_length', 60)),
             hidden_dims=config.get('actor_hidden_dims', _DEFAULT_ACTOR_HIDDEN_DIMS),
             dropout=config.get('mlp_dropout', config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT)),
             dual_head_enabled=dual_head_enabled_cfg,
@@ -3064,6 +3103,7 @@ def create_actor_critic(architecture: str,
         )
         critic = MLPCritic(
             input_dim=input_dim,
+            sequence_length=int(config.get('sequence_length', 60)),
             hidden_dims=config.get('critic_hidden_dims', _DEFAULT_CRITIC_HIDDEN_DIMS),
             dropout=config.get('mlp_dropout', config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT)),
             **regime_kwargs,
