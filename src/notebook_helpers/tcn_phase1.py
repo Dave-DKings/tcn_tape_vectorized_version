@@ -1479,6 +1479,10 @@ def load_training_metadata_into_config(
         "deterministic_validation_stochastic_sanity_episode_length_limit",
         "deterministic_validation_stochastic_sanity_min_mean_sharpe",
         "deterministic_validation_stochastic_sanity_max_sharpe_std",
+        "deterministic_validation_require_spy_outperformance",
+        "deterministic_validation_min_spy_outperformance",
+        "deterministic_validation_require_equal_weight_outperformance",
+        "deterministic_validation_min_equal_weight_outperformance",
         "high_watermark_checkpoint_enabled",
         "high_watermark_sharpe_threshold",
         "high_watermark_max_drawdown_abs_threshold",
@@ -1486,6 +1490,7 @@ def load_training_metadata_into_config(
         "step_sharpe_checkpoint_enabled",
         "step_sharpe_checkpoint_threshold",
         "periodic_checkpoint_every_steps",
+        "training_early_stop_low_advantage_enabled",
     ):
         if key in checkpoint_meta:
             training_params[key] = copy.deepcopy(checkpoint_meta[key])
@@ -3309,14 +3314,31 @@ def run_experiment6_tape(
         start_day = int(getattr(env, "episode_start_day", 0))
         end_day = int(getattr(env, "day", start_day))
         spy_returns = np.array([], dtype=np.float32)
+        equal_weight_returns = np.array([], dtype=np.float32)
         if hasattr(env, "spy_return_array"):
             spy_start = max(0, start_day + 1)
             spy_end = max(spy_start, min(end_day + 1, len(env.spy_return_array)))
             if spy_end > spy_start:
                 spy_returns = np.asarray(env.spy_return_array[spy_start:spy_end], dtype=np.float32)
+        if hasattr(env, "return_matrix"):
+            eq_start = max(0, start_day + 1)
+            eq_end = max(eq_start, min(end_day + 1, len(env.return_matrix)))
+            if eq_end > eq_start:
+                eq_slice = np.asarray(env.return_matrix[eq_start:eq_end], dtype=np.float32)
+                if eq_slice.ndim == 2 and eq_slice.shape[1] > 0:
+                    equal_weight_returns = np.mean(eq_slice, axis=1, dtype=np.float32)
         spy_total_return = float(np.prod(1.0 + spy_returns) - 1.0) if spy_returns.size > 0 else 0.0
+        equal_weight_total_return = (
+            float(np.prod(1.0 + equal_weight_returns) - 1.0)
+            if equal_weight_returns.size > 0
+            else 0.0
+        )
         metrics["spy_total_return"] = spy_total_return
         metrics["spy_outperformance_return"] = float(metrics.get("total_return", 0.0) - spy_total_return)
+        metrics["equal_weight_total_return"] = equal_weight_total_return
+        metrics["equal_weight_outperformance_return"] = float(
+            metrics.get("total_return", 0.0) - equal_weight_total_return
+        )
         metrics["return_skew"] = metrics.get("skewness", metrics.get("return_skew", 0.0))
         return metrics
 
@@ -3667,6 +3689,12 @@ def run_experiment6_tape(
     deterministic_validation_min_spy_outperformance_cfg = float(
         training_params.get("deterministic_validation_min_spy_outperformance", 0.0)
     )
+    deterministic_validation_require_equal_weight_outperformance_cfg = bool(
+        training_params.get("deterministic_validation_require_equal_weight_outperformance", False)
+    )
+    deterministic_validation_min_equal_weight_outperformance_cfg = float(
+        training_params.get("deterministic_validation_min_equal_weight_outperformance", 0.0)
+    )
 
     # Legacy routes disabled by default; deterministic validation is now primary selector.
     high_watermark_checkpoint_enabled_cfg = bool(training_params.get("high_watermark_checkpoint_enabled", False))
@@ -3721,6 +3749,9 @@ def run_experiment6_tape(
     )
     training_early_stop_mean_adv_patience_updates_cfg = int(
         max(1, training_params.get("training_early_stop_mean_adv_patience_updates", 20))
+    )
+    training_early_stop_low_advantage_enabled_cfg = bool(
+        training_params.get("training_early_stop_low_advantage_enabled", False)
     )
 
     deterministic_validation_best_sharpe = -np.inf
@@ -4024,6 +4055,10 @@ def run_experiment6_tape(
         val_ret = float(to_scalar(val_metrics.get("total_return", np.nan)) or np.nan)
         val_spy_ret = float(to_scalar(val_metrics.get("spy_total_return", np.nan)) or np.nan)
         val_spy_outperf = float(to_scalar(val_metrics.get("spy_outperformance_return", np.nan)) or np.nan)
+        val_eq_ret = float(to_scalar(val_metrics.get("equal_weight_total_return", np.nan)) or np.nan)
+        val_eq_outperf = float(
+            to_scalar(val_metrics.get("equal_weight_outperformance_return", np.nan)) or np.nan
+        )
         val_alpha_spread = float(to_scalar(val_metrics.get("validation_alpha_spread", np.nan)) or np.nan)
         val_alpha_std = float(to_scalar(val_metrics.get("validation_alpha_std", np.nan)) or np.nan)
         val_alpha_argmax_uniques = int(to_scalar(val_metrics.get("validation_alpha_argmax_uniques", 0)) or 0)
@@ -4055,6 +4090,12 @@ def run_experiment6_tape(
                 f"spy_return={val_spy_ret*100.0:+.2f}% | "
                 f"outperformance={val_spy_outperf*100.0:+.2f}%"
             )
+        if np.isfinite(val_eq_ret) or np.isfinite(val_eq_outperf):
+            print(
+                "         Equal-weight relative: "
+                f"ew_return={val_eq_ret*100.0:+.2f}% | "
+                f"outperformance={val_eq_outperf*100.0:+.2f}%"
+            )
         if np.isfinite(val_alpha_spread):
             print(
                 "         Alpha diagnostics: "
@@ -4082,6 +4123,19 @@ def run_experiment6_tape(
                 "         [WARN] SPY gate rejected checkpoint "
                 f"(outperformance={val_spy_outperf*100.0:+.2f}%, "
                 f"required>{deterministic_validation_min_spy_outperformance_cfg*100.0:.2f}%)."
+            )
+            return
+        if (
+            deterministic_validation_require_equal_weight_outperformance_cfg
+            and (
+                not np.isfinite(val_eq_outperf)
+                or val_eq_outperf <= deterministic_validation_min_equal_weight_outperformance_cfg
+            )
+        ):
+            print(
+                "         [WARN] Equal-weight gate rejected checkpoint "
+                f"(outperformance={val_eq_outperf*100.0:+.2f}%, "
+                f"required>{deterministic_validation_min_equal_weight_outperformance_cfg*100.0:.2f}%)."
             )
             return
         if val_selection_score <= (deterministic_validation_best_score + deterministic_validation_sharpe_min_delta_cfg):
@@ -4126,6 +4180,12 @@ def run_experiment6_tape(
                 "validation_spy_total_return": float(val_spy_ret) if np.isfinite(val_spy_ret) else None,
                 "validation_spy_outperformance_return": (
                     float(val_spy_outperf) if np.isfinite(val_spy_outperf) else None
+                ),
+                "validation_equal_weight_total_return": (
+                    float(val_eq_ret) if np.isfinite(val_eq_ret) else None
+                ),
+                "validation_equal_weight_outperformance_return": (
+                    float(val_eq_outperf) if np.isfinite(val_eq_outperf) else None
                 ),
                 "validation_max_drawdown_abs": float(val_mdd) if np.isfinite(val_mdd) else None,
                 "validation_alpha_spread": float(val_alpha_spread) if np.isfinite(val_alpha_spread) else None,
@@ -4240,6 +4300,12 @@ def run_experiment6_tape(
             print(
                 "      ↳ SPY outperformance gate: "
                 f"enabled (required>{deterministic_validation_min_spy_outperformance_cfg*100.0:.2f}% "
+                "over the same validation horizon)"
+            )
+        if deterministic_validation_require_equal_weight_outperformance_cfg:
+            print(
+                "      ↳ Equal-weight gate: "
+                f"enabled (required>{deterministic_validation_min_equal_weight_outperformance_cfg*100.0:.2f}% "
                 "over the same validation horizon)"
             )
     else:
@@ -4363,6 +4429,18 @@ def run_experiment6_tape(
         "deterministic_validation_stochastic_sanity_max_sharpe_std": float(
             deterministic_validation_stochastic_sanity_max_sharpe_std_cfg
         ),
+        "deterministic_validation_require_spy_outperformance": bool(
+            deterministic_validation_require_spy_outperformance_cfg
+        ),
+        "deterministic_validation_min_spy_outperformance": float(
+            deterministic_validation_min_spy_outperformance_cfg
+        ),
+        "deterministic_validation_require_equal_weight_outperformance": bool(
+            deterministic_validation_require_equal_weight_outperformance_cfg
+        ),
+        "deterministic_validation_min_equal_weight_outperformance": float(
+            deterministic_validation_min_equal_weight_outperformance_cfg
+        ),
         "tape_checkpoint_threshold_bonus": None,
         "periodic_checkpoint_every_steps": int(periodic_checkpoint_every_steps_cfg),
         "high_watermark_checkpoint_enabled": bool(high_watermark_checkpoint_enabled_cfg),
@@ -4389,6 +4467,7 @@ def run_experiment6_tape(
         "training_early_stop_hard_dd_patience_updates": int(training_early_stop_hard_dd_patience_updates_cfg),
         "training_early_stop_mean_adv_abs_threshold": float(training_early_stop_mean_adv_abs_threshold_cfg),
         "training_early_stop_mean_adv_patience_updates": int(training_early_stop_mean_adv_patience_updates_cfg),
+        "training_early_stop_low_advantage_enabled": bool(training_early_stop_low_advantage_enabled_cfg),
         "saved_checkpoints_for_this_run": [],
     }
 
@@ -5573,7 +5652,10 @@ def run_experiment6_tape(
                     else:
                         training_early_stop_hard_dd_counter = 0
 
-                    if abs(float(mean_advantage_val or 0.0)) <= training_early_stop_mean_adv_abs_threshold_cfg:
+                    if (
+                        training_early_stop_low_advantage_enabled_cfg
+                        and abs(float(mean_advantage_val or 0.0)) <= training_early_stop_mean_adv_abs_threshold_cfg
+                    ):
                         training_early_stop_low_adv_counter += 1
                     else:
                         training_early_stop_low_adv_counter = 0
@@ -5590,6 +5672,8 @@ def run_experiment6_tape(
                             f"(no improvement for {training_early_stop_no_improve_updates} updates)"
                         )
                     elif (
+                        training_early_stop_low_advantage_enabled_cfg
+                        and
                         training_early_stop_low_adv_counter >= training_early_stop_mean_adv_patience_updates_cfg
                         and training_early_stop_no_improve_updates >= max(
                             1, training_early_stop_patience_updates_cfg // 2
@@ -6042,11 +6126,19 @@ def run_experiment6_tape(
         }
     )
 
-    selected_checkpoint_prefix_path = (
-        Path(deterministic_validation_best_path)
-        if deterministic_validation_best_path
-        else checkpoint_prefix_path
-    )
+    selected_checkpoint_prefix_path: Optional[Path] = None
+    selected_checkpoint_source = "none"
+    if deterministic_validation_best_path:
+        selected_checkpoint_prefix_path = Path(deterministic_validation_best_path)
+        selected_checkpoint_source = "deterministic_validation_best"
+    elif deterministic_validation_checkpointing_only_cfg:
+        print(
+            "[WARN] No deterministic-validation checkpoint satisfied the active selection gates. "
+            "Final checkpoint was saved as an artifact only and will not be auto-selected."
+        )
+    else:
+        selected_checkpoint_prefix_path = checkpoint_prefix_path
+        selected_checkpoint_source = "final_high_watermark_style"
     if deterministic_validation_best_path:
         print(
             "🎯 Default selected checkpoint (best deterministic validation): "
@@ -6063,7 +6155,7 @@ def run_experiment6_tape(
                 "   ↳ Selection basis: deterministic validation Sharpe "
                 f"{deterministic_validation_best_sharpe:.3f} at episode {deterministic_validation_best_episode}"
             )
-    else:
+    elif selected_checkpoint_prefix_path is not None:
         print("🎯 Default selected checkpoint: final high-watermark-style checkpoint")
 
     try:
@@ -6093,10 +6185,16 @@ def run_experiment6_tape(
                     f"(Val Sharpe={deterministic_validation_best_sharpe:.3f}); "
                     f"final checkpoint episode {training_episode_count} (Train Sharpe={final_sharpe:.3f})"
                 )
-        else:
+        elif selected_checkpoint_prefix_path is not None:
             checkpoint_description = (
                 f"Final high-watermark-style checkpoint episode {training_episode_count} "
                 f"(Sharpe={final_sharpe:.3f})"
+            )
+        else:
+            checkpoint_description = (
+                "No deterministic-validation checkpoint satisfied the active gates; "
+                f"final checkpoint episode {training_episode_count} was saved as an artifact only "
+                f"(Train Sharpe={final_sharpe:.3f})"
             )
 
         metadata_latest["Checkpointing"].update(
@@ -6120,12 +6218,12 @@ def run_experiment6_tape(
                     else None
                 ),
                 "deterministic_validation_best_checkpoint_prefix": deterministic_validation_best_path,
-                "selected_checkpoint_prefix": str(selected_checkpoint_prefix_path),
-                "selected_checkpoint_source": (
-                    "deterministic_validation_best"
-                    if deterministic_validation_best_path is not None
-                    else "final_high_watermark_style"
+                "selected_checkpoint_prefix": (
+                    str(selected_checkpoint_prefix_path)
+                    if selected_checkpoint_prefix_path is not None
+                    else None
                 ),
+                "selected_checkpoint_source": selected_checkpoint_source,
                 "deterministic_validation_last_metrics": _json_ready(deterministic_validation_last_metrics),
                 "training_early_stop_enabled": bool(training_early_stop_enabled_cfg),
                 "training_early_stop_triggered": bool(training_early_stop_trigger_reason is not None),
@@ -6156,7 +6254,7 @@ def run_experiment6_tape(
         training_episodes_path=str(training_episodes_path),
         training_custom_path=str(training_custom_path),
         training_rows=df_training_rows,
-        checkpoint_path=str(selected_checkpoint_prefix_path),
+        checkpoint_path=str(selected_checkpoint_prefix_path) if selected_checkpoint_prefix_path is not None else "",
         total_timesteps=step,
         total_episodes=training_episode_count,
         training_duration=train_duration,
@@ -6230,6 +6328,12 @@ def evaluate_experiment6_checkpoint(
     """
     Evaluate Experiment 6 checkpoints (final/rare/clip) with deterministic + stochastic tests.
     """
+    if not checkpoint_path_override and not experiment6.checkpoint_path:
+        raise FileNotFoundError(
+            "No selected checkpoint is available for evaluation. "
+            "Deterministic-validation-only training finished without a checkpoint that satisfied "
+            "the active validation gates; pass checkpoint_path_override to inspect a specific artifact."
+        )
     exp_idx = experiment6.exp_idx
     results_root = Path(experiment6.checkpoint_path).parent
     rare_dir = results_root / "rare_models"

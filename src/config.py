@@ -1823,6 +1823,31 @@ RUN13_MLP_OVERRIDES["agent_params"].update(
         "mlp_dropout": 0.10,
     }
 )
+RUN13_MLP_OVERRIDES["training_params"].update(
+    {
+        "deterministic_validation_checkpointing_enabled": True,
+        "deterministic_validation_checkpointing_only": True,
+        "deterministic_validation_eval_every_episodes": 5,
+        "deterministic_validation_mode": "mean",
+        "deterministic_validation_multi_horizon_enabled": True,
+        "deterministic_validation_multi_horizon_limits": [252, 504, 756, 1008],
+        "deterministic_validation_multi_horizon_weights": [0.35, 0.30, 0.20, 0.15],
+        "deterministic_validation_multi_horizon_dd_penalty_coef": 0.25,
+        "deterministic_validation_stochastic_sanity_enabled": True,
+        "deterministic_validation_stochastic_sanity_runs": 3,
+        "deterministic_validation_stochastic_sanity_episode_length_limit": 252,
+        "deterministic_validation_stochastic_sanity_min_mean_sharpe": 0.0,
+        "deterministic_validation_stochastic_sanity_max_sharpe_std": 1.5,
+        "deterministic_validation_require_spy_outperformance": True,
+        "deterministic_validation_min_spy_outperformance": 0.0,
+        "deterministic_validation_require_equal_weight_outperformance": True,
+        "deterministic_validation_min_equal_weight_outperformance": 0.0,
+        "high_watermark_checkpoint_enabled": False,
+        "step_sharpe_checkpoint_enabled": False,
+        "periodic_checkpoint_every_steps": 0,
+        "training_early_stop_low_advantage_enabled": False,
+    }
+)
 
 
 def apply_run9_alpha_overrides(config: dict, overrides: dict = None) -> dict:
@@ -2380,17 +2405,29 @@ def assert_run13_mlp_config(config: dict) -> None:
     assert int(training.get("max_total_timesteps", 0)) == 300_000, (
         "Run13 max_total_timesteps must stay at 300,000"
     )
-    assert not bool(training.get("deterministic_validation_checkpointing_enabled", True)), (
-        "deterministic validation must stay disabled for Run13 compute-efficient mode"
+    assert bool(training.get("deterministic_validation_checkpointing_enabled", False)), (
+        "deterministic validation must stay enabled for Run13 checkpoint selection"
     )
-    assert bool(training.get("high_watermark_checkpoint_enabled", False)), (
-        "high_watermark_checkpoint_enabled must stay on for Run13 checkpoint selection"
+    assert bool(training.get("deterministic_validation_checkpointing_only", False)), (
+        "Run13 must use deterministic validation as the primary checkpoint selector"
     )
-    assert bool(training.get("step_sharpe_checkpoint_enabled", False)), (
-        "step_sharpe_checkpoint_enabled must stay on for Run13 checkpoint capture"
+    assert bool(training.get("deterministic_validation_require_spy_outperformance", False)), (
+        "Run13 deterministic validation must require SPY outperformance"
     )
-    assert int(training.get("periodic_checkpoint_every_steps", 0)) > 0, (
-        "periodic checkpoints must stay enabled for Run13"
+    assert bool(training.get("deterministic_validation_require_equal_weight_outperformance", False)), (
+        "Run13 deterministic validation must require equal-weight outperformance"
+    )
+    assert not bool(training.get("high_watermark_checkpoint_enabled", True)), (
+        "high_watermark_checkpoint_enabled must stay off for Run13 deterministic selection"
+    )
+    assert not bool(training.get("step_sharpe_checkpoint_enabled", True)), (
+        "step_sharpe_checkpoint_enabled must stay off for Run13 deterministic selection"
+    )
+    assert int(training.get("periodic_checkpoint_every_steps", 1)) == 0, (
+        "periodic checkpoints must stay disabled for Run13 deterministic selection"
+    )
+    assert not bool(training.get("training_early_stop_low_advantage_enabled", True)), (
+        "Run13 must keep low-advantage early-stop disabled"
     )
     assert not bool(feature_params.get("actuarial_params", {}).get("enabled", False)), (
         "Run13 actuarial features must stay disabled"
