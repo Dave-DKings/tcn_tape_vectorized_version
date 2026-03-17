@@ -4161,19 +4161,23 @@ def run_experiment6_tape(
                 f"required>{deterministic_validation_min_spy_outperformance_cfg*100.0:.2f}%)."
             )
             return
-        if (
-            deterministic_validation_require_equal_weight_outperformance_cfg
-            and (
-                not np.isfinite(val_eq_outperf)
-                or val_eq_outperf <= deterministic_validation_min_equal_weight_outperformance_cfg
-            )
-        ):
+        _ew_passed = (
+            np.isfinite(val_eq_outperf)
+            and val_eq_outperf > deterministic_validation_min_equal_weight_outperformance_cfg
+        )
+        if deterministic_validation_require_equal_weight_outperformance_cfg and not _ew_passed:
             print(
                 "         [WARN] Equal-weight gate rejected checkpoint "
                 f"(outperformance={val_eq_outperf*100.0:+.2f}%, "
                 f"required>{deterministic_validation_min_equal_weight_outperformance_cfg*100.0:.2f}%)."
             )
             return
+        if not deterministic_validation_require_equal_weight_outperformance_cfg and np.isfinite(val_eq_outperf):
+            _ew_label = "PASS" if _ew_passed else "FAIL"
+            print(
+                f"         [INFO] Equal-weight sanity: {_ew_label} "
+                f"(outperformance={val_eq_outperf*100.0:+.2f}%)"
+            )
         if val_selection_score <= (deterministic_validation_best_score + deterministic_validation_sharpe_min_delta_cfg):
             return
 
