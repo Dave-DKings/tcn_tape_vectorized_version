@@ -383,15 +383,23 @@ class PortfolioEnvTAPE(gym.Env):
         self.dsr_regime_high_pos_mult = float(dsr_regime_cfg.get('high_pos_mult', 1.5))
         self.dsr_regime_high_neg_mult = float(dsr_regime_cfg.get('high_neg_mult', 1.5))
 
-        # Outperformance bonus (asymmetric: reward beating equal-weight, don't punish underperformance)
+        # Benchmark-relative shaping against equal-weight.
         self.outperformance_bonus_enabled = bool(env_params.get('outperformance_bonus_enabled', False))
         self.outperformance_bonus_scalar = float(env_params.get('outperformance_bonus_scalar', 5.0))
+        self.outperformance_bonus_mode = str(
+            env_params.get('outperformance_bonus_mode', 'positive_only')
+        ).strip().lower()
+        self.outperformance_bonus_clip = float(env_params.get('outperformance_bonus_clip', 0.02))
         self._last_equal_weight_return = 0.0
         self._last_outperformance_bonus = 0.0
 
-        # SPY outperformance bonus (asymmetric: reward beating S&P 500)
+        # Benchmark-relative shaping against SPY.
         self.spy_outperformance_bonus_enabled = bool(env_params.get('spy_outperformance_bonus_enabled', False))
         self.spy_outperformance_bonus_scalar = float(env_params.get('spy_outperformance_bonus_scalar', 3.0))
+        self.spy_outperformance_bonus_mode = str(
+            env_params.get('spy_outperformance_bonus_mode', 'positive_only')
+        ).strip().lower()
+        self.spy_outperformance_bonus_clip = float(env_params.get('spy_outperformance_bonus_clip', 0.02))
         self._last_spy_return = 0.0
         self._last_spy_outperformance_bonus = 0.0
 
@@ -1172,6 +1180,39 @@ class PortfolioEnvTAPE(gym.Env):
         potential = calculate_tape_score(metrics=metrics, profile=self.tape_profile)
         potential = np.nan_to_num(float(potential), nan=0.0, posinf=1.0, neginf=0.0)
         return float(np.clip(potential, 0.0, 1.0))
+
+    @staticmethod
+    def _shape_benchmark_outperformance(
+        outperformance: float,
+        scalar: float,
+        mode: str = "positive_only",
+        clip: float = 0.02,
+    ) -> float:
+        """Map benchmark-relative return into a shaping term.
+
+        The default preserves the legacy positive-only bonus. Signed modes allow
+        underperformance to become a penalty, which is useful when benchmark
+        outperformance is part of the actual training objective.
+        """
+        mode_l = str(mode or "positive_only").strip().lower()
+        shaped = float(outperformance)
+        clip_val = max(0.0, float(clip))
+
+        if mode_l in {"positive_only", "positive"}:
+            shaped = max(shaped, 0.0)
+        elif mode_l in {"positive_clipped", "positive_clip"}:
+            shaped = max(shaped, 0.0)
+            if clip_val > 0.0:
+                shaped = float(np.clip(shaped, 0.0, clip_val))
+        elif mode_l in {"signed_clipped", "signed_clip", "symmetric_clipped"}:
+            if clip_val > 0.0:
+                shaped = float(np.clip(shaped, -clip_val, clip_val))
+        elif mode_l in {"signed", "symmetric"}:
+            shaped = float(shaped)
+        else:
+            shaped = max(shaped, 0.0)
+
+        return float(shaped * float(scalar))
     
     def _get_reward(self, portfolio_return: float, transaction_cost: float,
                     old_portfolio_value: float, actual_turnover_this_step: float) -> float:
@@ -1265,21 +1306,29 @@ class PortfolioEnvTAPE(gym.Env):
             # Combine: Base + DSR Guidance + Turnover Proximity Reward
             final_step_reward = base_reward + dsr_component + turnover_reward
 
-            # Outperformance bonus: asymmetric reward for beating equal-weight
+            # Benchmark-relative shaping versus equal-weight.
             outperformance_bonus = 0.0
             if self.outperformance_bonus_enabled:
                 outperformance = portfolio_return - self._last_equal_weight_return
-                if outperformance > 0:
-                    outperformance_bonus = outperformance * self.outperformance_bonus_scalar
+                outperformance_bonus = self._shape_benchmark_outperformance(
+                    outperformance=outperformance,
+                    scalar=self.outperformance_bonus_scalar,
+                    mode=self.outperformance_bonus_mode,
+                    clip=self.outperformance_bonus_clip,
+                )
                 final_step_reward += outperformance_bonus
             self._last_outperformance_bonus = outperformance_bonus
 
-            # SPY outperformance bonus: asymmetric reward for beating S&P 500
+            # Benchmark-relative shaping versus SPY.
             spy_outperformance_bonus = 0.0
             if self.spy_outperformance_bonus_enabled:
                 spy_outperformance = portfolio_return - self._last_spy_return
-                if spy_outperformance > 0:
-                    spy_outperformance_bonus = spy_outperformance * self.spy_outperformance_bonus_scalar
+                spy_outperformance_bonus = self._shape_benchmark_outperformance(
+                    outperformance=spy_outperformance,
+                    scalar=self.spy_outperformance_bonus_scalar,
+                    mode=self.spy_outperformance_bonus_mode,
+                    clip=self.spy_outperformance_bonus_clip,
+                )
                 final_step_reward += spy_outperformance_bonus
             self._last_spy_outperformance_bonus = spy_outperformance_bonus
 

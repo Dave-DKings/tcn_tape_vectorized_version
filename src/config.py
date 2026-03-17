@@ -1823,6 +1823,18 @@ RUN13_MLP_OVERRIDES["agent_params"].update(
         "mlp_dropout": 0.10,
     }
 )
+RUN13_MLP_OVERRIDES["environment_params"].update(
+    {
+        "outperformance_bonus_enabled": True,
+        "outperformance_bonus_scalar": 5.0,
+        "outperformance_bonus_mode": "signed_clipped",
+        "outperformance_bonus_clip": 0.02,
+        "spy_outperformance_bonus_enabled": True,
+        "spy_outperformance_bonus_scalar": 3.0,
+        "spy_outperformance_bonus_mode": "signed_clipped",
+        "spy_outperformance_bonus_clip": 0.02,
+    }
+)
 RUN13_MLP_OVERRIDES["training_params"].update(
     {
         "deterministic_validation_checkpointing_enabled": True,
@@ -2390,6 +2402,18 @@ def assert_run13_mlp_config(config: dict) -> None:
     )
     assert float(env.get("action_realization_penalty_scalar", 999.0)) <= 0.10, (
         "action_realization_penalty_scalar drifted above the relaxed Run13 cap"
+    )
+    assert bool(env.get("outperformance_bonus_enabled", False)), (
+        "Run13 must keep equal-weight benchmark shaping enabled"
+    )
+    assert str(env.get("outperformance_bonus_mode", "")).lower() == "signed_clipped", (
+        "Run13 equal-weight benchmark shaping must stay signed_clipped"
+    )
+    assert bool(env.get("spy_outperformance_bonus_enabled", False)), (
+        "Run13 must keep SPY benchmark shaping enabled"
+    )
+    assert str(env.get("spy_outperformance_bonus_mode", "")).lower() == "signed_clipped", (
+        "Run13 SPY benchmark shaping must stay signed_clipped"
     )
     assert float(dd.get("target", 0.0)) >= 0.27, "drawdown target drifted below the relaxed Run13 floor"
     assert float(dd.get("penalty_coef", 999.0)) <= 0.50, (

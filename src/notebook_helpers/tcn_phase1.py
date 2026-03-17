@@ -1448,6 +1448,14 @@ def load_training_metadata_into_config(
         "tape_terminal_gate_a_enabled",
         "tape_terminal_gate_a_sharpe_threshold",
         "tape_terminal_gate_a_max_drawdown",
+        "outperformance_bonus_enabled",
+        "outperformance_bonus_scalar",
+        "outperformance_bonus_mode",
+        "outperformance_bonus_clip",
+        "spy_outperformance_bonus_enabled",
+        "spy_outperformance_bonus_scalar",
+        "spy_outperformance_bonus_mode",
+        "spy_outperformance_bonus_clip",
         "action_execution_beta",
         "reward_credit_assignment_mode",
         "retroactive_episode_reward_scaling",
@@ -2587,12 +2595,20 @@ def run_experiment6_tape(
         print("   🌊 DSR Regime Scaling: disabled")
 
     if env_params.get("outperformance_bonus_enabled", False):
+        _eq_mode = str(env_params.get("outperformance_bonus_mode", "positive_only")).lower()
+        _eq_clip = env_params.get("outperformance_bonus_clip", None)
         print(
             f"   📈 Outperformance Bonus (1/N): ENABLED | scalar={env_params.get('outperformance_bonus_scalar', 5.0)}"
+            f" | mode={_eq_mode}"
+            f"{f' | clip={float(_eq_clip):.4f}' if _eq_clip is not None else ''}"
         )
     if env_params.get("spy_outperformance_bonus_enabled", False):
+        _spy_mode = str(env_params.get("spy_outperformance_bonus_mode", "positive_only")).lower()
+        _spy_clip = env_params.get("spy_outperformance_bonus_clip", None)
         print(
             f"   📈 Outperformance Bonus (SPY): ENABLED | scalar={env_params.get('spy_outperformance_bonus_scalar', 3.0)}"
+            f" | mode={_spy_mode}"
+            f"{f' | clip={float(_spy_clip):.4f}' if _spy_clip is not None else ''}"
         )
 
     if env_params.get("episode_cvar_enabled", False):
