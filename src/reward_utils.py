@@ -170,20 +170,16 @@ def calculate_sortino_ratio(returns: np.ndarray,
     # Calculate excess returns
     excess_returns = returns - daily_rf
     
-    # Calculate downside deviation (only negative returns)
-    downside_returns = returns[returns < 0]
-    
-    if len(downside_returns) == 0:
-        downside_std = 0.0
-    else:
-        downside_std = np.std(downside_returns, ddof=1)
-    
-    if downside_std == 0:
+    # Downside deviation: RMS of min(r - rf, 0) over ALL observations (MAR = daily rf)
+    downside_diff = np.minimum(excess_returns, 0.0)
+    downside_dev = float(np.sqrt((downside_diff ** 2).mean()))
+
+    if downside_dev < 1e-12:
         return 0.0
-    
+
     # Annualize Sortino Ratio
     mean_excess = np.mean(excess_returns)
-    sortino = (mean_excess / downside_std) * np.sqrt(trading_days_per_year)
+    sortino = (mean_excess / downside_dev) * np.sqrt(trading_days_per_year)
     
     return float(sortino)
 
