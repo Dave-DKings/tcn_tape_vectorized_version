@@ -1821,16 +1821,38 @@ RUN13_MLP_OVERRIDES["agent_params"].update(
         "actor_hidden_dims": [1024, 512, 256],
         "critic_hidden_dims": [1024, 512, 256],
         "mlp_dropout": 0.10,
+        "dirichlet_logit_temperature": 0.80,
+        "dual_head_projection_max_single_position": 0.35,
+        "dual_head_projection_min_cash_position": 0.02,
+    }
+)
+RUN13_MLP_OVERRIDES["agent_params"]["ppo_params"].update(
+    {
+        "risk_aux_mvo_coef": 0.0,
+        "mixture_dirichlet_balance_coef": 0.005,
+        "mixture_dirichlet_entropy_coef": 0.001,
+        "mixture_dirichlet_balance_schedule": [
+            {"threshold": 0, "coef": 0.005},
+            {"threshold": 80_000, "coef": 0.003},
+            {"threshold": 160_000, "coef": 0.0015},
+            {"threshold": 220_000, "coef": 0.0005},
+        ],
+        "mixture_dirichlet_entropy_schedule": [
+            {"threshold": 0, "coef": 0.001},
+            {"threshold": 80_000, "coef": 0.0005},
+            {"threshold": 160_000, "coef": 0.0002},
+            {"threshold": 220_000, "coef": 0.0001},
+        ],
     }
 )
 RUN13_MLP_OVERRIDES["environment_params"].update(
     {
         "outperformance_bonus_enabled": True,
-        "outperformance_bonus_scalar": 5.0,
+        "outperformance_bonus_scalar": 8.0,
         "outperformance_bonus_mode": "signed_clipped",
         "outperformance_bonus_clip": 0.02,
         "spy_outperformance_bonus_enabled": True,
-        "spy_outperformance_bonus_scalar": 3.0,
+        "spy_outperformance_bonus_scalar": 5.0,
         "spy_outperformance_bonus_mode": "signed_clipped",
         "spy_outperformance_bonus_clip": 0.02,
     }
@@ -1840,7 +1862,7 @@ RUN13_MLP_OVERRIDES["training_params"].update(
         "deterministic_validation_checkpointing_enabled": True,
         "deterministic_validation_checkpointing_only": True,
         "deterministic_validation_eval_every_episodes": 5,
-        "deterministic_validation_mode": "mean",
+        "deterministic_validation_mode": "mode",
         "deterministic_validation_multi_horizon_enabled": True,
         "deterministic_validation_multi_horizon_limits": [252, 504, 756, 1008],
         "deterministic_validation_multi_horizon_weights": [0.35, 0.30, 0.20, 0.15],
@@ -1858,6 +1880,13 @@ RUN13_MLP_OVERRIDES["training_params"].update(
         "step_sharpe_checkpoint_enabled": False,
         "periodic_checkpoint_every_steps": 0,
         "training_early_stop_low_advantage_enabled": False,
+        "dirichlet_temperature_schedule": [
+            {"threshold": 0, "temperature": 0.8},
+            {"threshold": 100_000, "temperature": 0.7},
+            {"threshold": 220_000, "temperature": 0.6},
+        ],
+        "max_single_position": 35.00,
+        "min_cash_position": 0.02,
     }
 )
 
@@ -2376,6 +2405,9 @@ def assert_run13_mlp_config(config: dict) -> None:
     assert str(agent.get("mixture_dirichlet_eval_mode", "")).lower() == "top_component_mean", (
         "Run13 mixture eval mode must stay top_component_mean"
     )
+    assert float(agent.get("dirichlet_logit_temperature", 999.0)) <= 0.80, (
+        "Run13 base dirichlet_logit_temperature drifted above the sharper conviction regime"
+    )
     assert float(agent.get("mlp_dropout", 0.0)) > 0.0, "Run13 mlp_dropout must stay configured"
     assert bool(agent.get("actor_hidden_dims", [])), "Run13 actor_hidden_dims must stay configured"
     assert bool(agent.get("critic_hidden_dims", [])), "Run13 critic_hidden_dims must stay configured"
@@ -2385,11 +2417,20 @@ def assert_run13_mlp_config(config: dict) -> None:
     assert float(ppo.get("cvar_advantage_weight", 999.0)) == 0.0, (
         "cvar_advantage_weight must stay off for Run13"
     )
+    assert float(ppo.get("risk_aux_mvo_coef", 999.0)) == 0.0, (
+        "Run13 risk_aux_mvo_coef must stay off"
+    )
     assert float(ppo.get("mixture_dirichlet_balance_coef", 0.0)) > 0.0, (
         "Run13 mixture_dirichlet_balance_coef must stay on"
     )
+    assert float(ppo.get("mixture_dirichlet_balance_coef", 999.0)) <= 0.005, (
+        "Run13 mixture_dirichlet_balance_coef drifted above the sharper specialization cap"
+    )
     assert float(ppo.get("mixture_dirichlet_separation_coef", 0.0)) > 0.0, (
         "Run13 mixture_dirichlet_separation_coef must stay on"
+    )
+    assert float(ppo.get("mixture_dirichlet_entropy_coef", 999.0)) <= 0.001, (
+        "Run13 mixture_dirichlet_entropy_coef drifted above the sharper specialization cap"
     )
     assert float(ppo.get("mixture_component_dispersion_coef", 0.0)) > 0.0, (
         "Run13 mixture_component_dispersion_coef must stay on"
@@ -2406,11 +2447,17 @@ def assert_run13_mlp_config(config: dict) -> None:
     assert bool(env.get("outperformance_bonus_enabled", False)), (
         "Run13 must keep equal-weight benchmark shaping enabled"
     )
+    assert float(env.get("outperformance_bonus_scalar", 0.0)) >= 8.0, (
+        "Run13 equal-weight benchmark shaping scalar drifted below the conviction floor"
+    )
     assert str(env.get("outperformance_bonus_mode", "")).lower() == "signed_clipped", (
         "Run13 equal-weight benchmark shaping must stay signed_clipped"
     )
     assert bool(env.get("spy_outperformance_bonus_enabled", False)), (
         "Run13 must keep SPY benchmark shaping enabled"
+    )
+    assert float(env.get("spy_outperformance_bonus_scalar", 0.0)) >= 5.0, (
+        "Run13 SPY benchmark shaping scalar drifted below the conviction floor"
     )
     assert str(env.get("spy_outperformance_bonus_mode", "")).lower() == "signed_clipped", (
         "Run13 SPY benchmark shaping must stay signed_clipped"
@@ -2435,6 +2482,9 @@ def assert_run13_mlp_config(config: dict) -> None:
     assert bool(training.get("deterministic_validation_checkpointing_only", False)), (
         "Run13 must use deterministic validation as the primary checkpoint selector"
     )
+    assert str(training.get("deterministic_validation_mode", "")).lower() == "mode", (
+        "Run13 deterministic validation must stay in mode evaluation"
+    )
     assert bool(training.get("deterministic_validation_require_spy_outperformance", False)), (
         "Run13 deterministic validation must require SPY outperformance"
     )
@@ -2455,6 +2505,12 @@ def assert_run13_mlp_config(config: dict) -> None:
     )
     assert not bool(feature_params.get("actuarial_params", {}).get("enabled", False)), (
         "Run13 actuarial features must stay disabled"
+    )
+    assert float(training.get("max_single_position", 0.0)) >= 35.0, (
+        "Run13 max_single_position drifted below the frontier-exploration floor"
+    )
+    assert float(training.get("min_cash_position", 999.0)) <= 0.02, (
+        "Run13 min_cash_position drifted above the frontier-exploration cap"
     )
 
     expected_turnover = copy.deepcopy(RUN13_MLP_OVERRIDES["training_params"]["turnover_penalty_curriculum"])

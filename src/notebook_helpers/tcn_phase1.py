@@ -2597,16 +2597,18 @@ def run_experiment6_tape(
     if env_params.get("outperformance_bonus_enabled", False):
         _eq_mode = str(env_params.get("outperformance_bonus_mode", "positive_only")).lower()
         _eq_clip = env_params.get("outperformance_bonus_clip", None)
+        _eq_label = "Benchmark Shaping (1/N)" if "signed" in _eq_mode else "Outperformance Bonus (1/N)"
         print(
-            f"   📈 Outperformance Bonus (1/N): ENABLED | scalar={env_params.get('outperformance_bonus_scalar', 5.0)}"
+            f"   📈 {_eq_label}: ENABLED | scalar={env_params.get('outperformance_bonus_scalar', 5.0)}"
             f" | mode={_eq_mode}"
             f"{f' | clip={float(_eq_clip):.4f}' if _eq_clip is not None else ''}"
         )
     if env_params.get("spy_outperformance_bonus_enabled", False):
         _spy_mode = str(env_params.get("spy_outperformance_bonus_mode", "positive_only")).lower()
         _spy_clip = env_params.get("spy_outperformance_bonus_clip", None)
+        _spy_label = "Benchmark Shaping (SPY)" if "signed" in _spy_mode else "Outperformance Bonus (SPY)"
         print(
-            f"   📈 Outperformance Bonus (SPY): ENABLED | scalar={env_params.get('spy_outperformance_bonus_scalar', 3.0)}"
+            f"   📈 {_spy_label}: ENABLED | scalar={env_params.get('spy_outperformance_bonus_scalar', 3.0)}"
             f" | mode={_spy_mode}"
             f"{f' | clip={float(_spy_clip):.4f}' if _spy_clip is not None else ''}"
         )
@@ -2647,6 +2649,13 @@ def run_experiment6_tape(
             f"   Alpha Regularization: hhi_coef={_ppo_cfg.get('alpha_diversity_coef', 0.0)} | "
             f"dispersion_coef={_ppo_cfg.get('alpha_dispersion_coef', 0.0)} | "
             f"target_std={_ppo_cfg.get('alpha_dispersion_target_std', 0.05)}"
+        )
+
+    if _ppo_cfg.get("use_risk_aux_loss", False):
+        print(
+            f"   Risk Aux: sharpe_coef={_ppo_cfg.get('risk_aux_sharpe_coef', 0.0)} | "
+            f"mvo_coef={_ppo_cfg.get('risk_aux_mvo_coef', 0.0)} | "
+            f"cvar_coef={_ppo_cfg.get('risk_aux_cvar_coef', 0.0)}"
         )
 
     if _ppo_cfg.get("aux_return_pred_enabled", False):
@@ -3193,6 +3202,17 @@ def run_experiment6_tape(
     )
     if isinstance(agent_config.get("ppo_params"), dict):
         print(f"   🧷 Dual-head consistency coef: {agent_config.get('ppo_params', {}).get('dual_head_consistency_coef', 0.0)}")
+        _ppo_agent_cfg = agent_config.get("ppo_params", {})
+        if bool(agent_config.get("mixture_dirichlet_enabled", False)):
+            print(
+                "   🧩 Mixture Regularizers: "
+                f"balance_coef={_ppo_agent_cfg.get('mixture_dirichlet_balance_coef', 0.0)} | "
+                f"separation_coef={_ppo_agent_cfg.get('mixture_dirichlet_separation_coef', 0.0)} | "
+                f"gate_entropy_coef={_ppo_agent_cfg.get('mixture_dirichlet_entropy_coef', 0.0)} | "
+                f"component_dispersion_coef={_ppo_agent_cfg.get('mixture_component_dispersion_coef', 0.0)} | "
+                f"target_std={_ppo_agent_cfg.get('mixture_component_target_std', 0.0)} | "
+                f"min_distance={_ppo_agent_cfg.get('mixture_component_min_distance', 0.0)}"
+            )
     initial_rollout_len = determine_timesteps_per_update(0)
     initial_batch_size = determine_batch_size_ppo(0, initial_rollout_len)
     print(
@@ -5832,7 +5852,7 @@ def run_experiment6_tape(
                             for name, count in sorted(regime_counts.items())
                         )
                         print(f"   🧭 Regime Start Dist (train resets): {regime_dist}")
-                # Warning if alpha seems stuck (TCN not learning asset discrimination).
+                # Warning if alpha seems stuck and the policy is not separating assets.
                 if (
                     update_count > alpha_diversity_warning_after_updates
                     and alpha_std_val < alpha_diversity_warning_std_threshold
@@ -5841,7 +5861,7 @@ def run_experiment6_tape(
                         "   [WARN]  WARNING: "
                         f"Alpha std < {alpha_diversity_warning_std_threshold:.2f} "
                         f"after {update_count} updates. "
-                        f"TCN may not be learning asset discrimination."
+                        f"Policy may not be learning asset discrimination."
                     )
 
             if episode_terminal_info is not None:
@@ -5892,15 +5912,19 @@ def run_experiment6_tape(
                         f"passed={'✅' if _ep_cvar_passed else '❌'} | bonus={_ep_cvar_bonus:.2f}"
                     )
 
-                # Outperformance bonus visibility (1/N + SPY)
+                # Benchmark-shaping visibility (1/N + SPY)
                 _outperf_1n = to_scalar(episode_terminal_info.get("outperformance_bonus", 0.0))
                 _eq_wt_ret = to_scalar(episode_terminal_info.get("equal_weight_return", 0.0))
                 _outperf_spy = to_scalar(episode_terminal_info.get("spy_outperformance_bonus", 0.0))
                 _spy_ret = to_scalar(episode_terminal_info.get("spy_return", 0.0))
                 if abs(_outperf_1n) > 1e-8 or abs(_outperf_spy) > 1e-8:
+                    _eq_mode_label = str(env_params.get("outperformance_bonus_mode", "positive_only")).lower()
+                    _spy_mode_label = str(env_params.get("spy_outperformance_bonus_mode", "positive_only")).lower()
+                    _eq_metric_label = "1/N shaping" if "signed" in _eq_mode_label else "1/N bonus"
+                    _spy_metric_label = "SPY shaping" if "signed" in _spy_mode_label else "SPY bonus"
                     print(
-                        f"   📈 Outperformance: 1/N bonus={_outperf_1n:.3f} (EW ret={_eq_wt_ret:.5f}) | "
-                        f"SPY bonus={_outperf_spy:.3f} (SPY ret={_spy_ret:.5f})"
+                        f"   📈 Benchmark Relative: {_eq_metric_label}={_outperf_1n:.3f} (EW ret={_eq_wt_ret:.5f}) | "
+                        f"{_spy_metric_label}={_outperf_spy:.3f} (SPY ret={_spy_ret:.5f})"
                     )
 
             # Lagrangian CVaR visibility
