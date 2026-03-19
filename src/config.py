@@ -1610,6 +1610,28 @@ RUN10_ALPHA_OVERRIDES["training_params"].update(
 )
 
 
+# ── Run 17: Expanded 20-asset universe with 10yr train / 5yr test ──
+RUN17_EXPANDED_OVERRIDES = copy.deepcopy(RUN10_ALPHA_OVERRIDES)
+RUN17_EXPANDED_OVERRIDES.update(
+    {
+        "TRAIN_TEST_SPLIT_DATE": TRAIN_TEST_SPLIT_DATE_COVID_STRESS,  # "2019-12-31"
+        "ANALYSIS_START_DATE": "2009-01-01",
+        "ASSET_TICKERS": [
+            "MSFT", "AAPL", "NVDA", "GOOGL", "AMZN",
+            "JPM", "BRK-B", "V", "UNH", "JNJ",
+            "PG", "KO", "HD", "CAT", "HON",
+            "XOM", "COP", "NEE", "GLD", "AMT",
+        ],
+        "NUM_ASSETS": 20,
+    }
+)
+RUN17_EXPANDED_OVERRIDES["training_params"].update(
+    {
+        "num_parallel_envs": 8,  # doubled from 4 for 21-dim Dirichlet exploration
+    }
+)
+
+
 RUN11_RELAXED_OVERRIDES = copy.deepcopy(RUN10_ALPHA_OVERRIDES)
 RUN11_RELAXED_OVERRIDES.update(
     {
@@ -2593,6 +2615,124 @@ def build_run13_mlp_config(
     if analysis_end_date is not None:
         config["ANALYSIS_END_DATE"] = analysis_end_date
     assert_run13_mlp_config(config)
+    return config
+
+
+# ── Run 17 helpers ────────────────────────────────────────────────────
+
+
+def apply_run17_expanded_overrides(config: dict, overrides: dict = None) -> dict:
+    """Apply the canonical Run17 expanded-universe recipe in-place."""
+    global TRAIN_TEST_SPLIT_DATE
+    resolved = copy.deepcopy(RUN17_EXPANDED_OVERRIDES if overrides is None else overrides)
+    split_date = resolved.get("TRAIN_TEST_SPLIT_DATE")
+    if split_date:
+        TRAIN_TEST_SPLIT_DATE = split_date
+        config["TRAIN_TEST_SPLIT_DATE"] = split_date
+    _deep_update_config(config, resolved)
+    return config
+
+
+def assert_run17_expanded_config(config: dict) -> None:
+    """Raise if a config expected to match the Run17 expanded-universe recipe drifted."""
+    agent = config.get("agent_params", {})
+    ppo = agent.get("ppo_params", {})
+    env = config.get("environment_params", {})
+    training = config.get("training_params", {})
+    feature_params = config.get("feature_params", {})
+
+    # ── Run17-specific assertions (universe + dates) ──
+    assert str(config.get("TRAIN_TEST_SPLIT_DATE", "")) == str(TRAIN_TEST_SPLIT_DATE_COVID_STRESS), (
+        "Run17 split date must be 2019-12-31 (COVID stress window)"
+    )
+    assert str(config.get("ANALYSIS_START_DATE", "")) == "2009-01-01", (
+        "Run17 analysis start date must be 2009-01-01 for 10-year training"
+    )
+    assert int(config.get("NUM_ASSETS", 0)) == 20, (
+        f"Run17 must have 20 assets, got {config.get('NUM_ASSETS')}"
+    )
+    assert len(config.get("ASSET_TICKERS", [])) == 20, (
+        f"Run17 must have 20 tickers, got {len(config.get('ASSET_TICKERS', []))}"
+    )
+
+    # ── Architecture assertions (inherited from Run10) ──
+    assert bool(agent.get("regime_conditioning_enabled", False)), "regime_conditioning_enabled must stay on"
+    assert str(agent.get("regime_conditioning_mode", "concat")).lower() == "film", "regime_conditioning_mode must be film"
+    assert bool(agent.get("distributional_critic_enabled", False)), "distributional_critic_enabled must stay on"
+    assert float(ppo.get("risk_aux_mvo_coef", 0.0)) >= 0.002, "risk_aux_mvo_coef drifted below the Run10 floor"
+    assert float(ppo.get("risk_aux_cvar_coef", 0.0)) == 0.0, "step-level CVaR aux must stay off"
+    assert not bool(env.get("episode_cvar_enabled", False)), "episode_cvar_enabled must stay off"
+    assert bool(ppo.get("lagrangian_cvar_enabled", False)), "lagrangian_cvar_enabled must stay on"
+    assert not bool(agent.get("fusion_cross_asset_mixer_enabled", True)), (
+        "fusion_cross_asset_mixer_enabled must stay off for the canonical alpha run"
+    )
+    assert not bool(training.get("deterministic_validation_checkpointing_enabled", True)), (
+        "deterministic validation must stay disabled for compute-efficient mode"
+    )
+    assert bool(training.get("high_watermark_checkpoint_enabled", False)), (
+        "high_watermark_checkpoint_enabled must stay on"
+    )
+    assert not bool(training.get("deterministic_validation_checkpointing_only", True)), (
+        "deterministic_validation_checkpointing_only must stay disabled when det-validation is off"
+    )
+    assert int(training.get("periodic_checkpoint_every_steps", 0)) > 0, (
+        "periodic checkpoints must stay enabled"
+    )
+    assert bool(training.get("training_early_stop_enabled", False)), (
+        "training_early_stop_enabled must stay on"
+    )
+    assert float(ppo.get("entropy_coef", 1.0)) <= 0.003, "base entropy must stay in the low-entropy regime"
+    assert float(ppo.get("alpha_dispersion_coef", 0.0)) >= 0.05, "alpha_dispersion_coef drifted below the calibrated floor"
+    assert float(ppo.get("aux_return_pred_coef", 0.0)) >= 0.25, "aux_return_pred_coef drifted below the calibrated floor"
+    assert not bool(feature_params.get("actuarial_params", {}).get("enabled", False)), (
+        "Run17 actuarial features must stay disabled"
+    )
+
+    # ── Curriculum schedule assertions (inherited from Run10) ──
+    expected_turnover = copy.deepcopy(RUN10_ALPHA_OVERRIDES["training_params"]["turnover_penalty_curriculum"])
+    actual_turnover = {
+        int(threshold): float(value)
+        for threshold, value in dict(training.get("turnover_penalty_curriculum", {})).items()
+    }
+    assert actual_turnover == expected_turnover, "turnover_penalty_curriculum drifted from the canonical Run10 schedule"
+
+    expected_beta = copy.deepcopy(RUN10_ALPHA_OVERRIDES["training_params"]["action_execution_beta_curriculum"])
+    actual_beta = {
+        int(threshold): float(value)
+        for threshold, value in dict(training.get("action_execution_beta_curriculum", {})).items()
+    }
+    assert actual_beta == expected_beta, "action_execution_beta_curriculum drifted from the canonical Run10 schedule"
+
+    expected_entropy = copy.deepcopy(RUN10_ALPHA_OVERRIDES["training_params"]["ppo_entropy_coef_schedule"])
+    actual_entropy = copy.deepcopy(training.get("ppo_entropy_coef_schedule", []))
+    assert actual_entropy == expected_entropy, "ppo_entropy_coef_schedule drifted from the canonical Run10 schedule"
+
+    expected_aux_return_coef_schedule = copy.deepcopy(
+        RUN10_ALPHA_OVERRIDES["training_params"]["aux_return_pred_coef_schedule"]
+    )
+    actual_aux_return_coef_schedule = copy.deepcopy(training.get("aux_return_pred_coef_schedule", []))
+    assert actual_aux_return_coef_schedule == expected_aux_return_coef_schedule, (
+        "aux_return_pred_coef_schedule drifted from the canonical Run10 schedule"
+    )
+
+    expected_critic_schedule = copy.deepcopy(RUN10_ALPHA_OVERRIDES["training_params"]["critic_lr_schedule"])
+    actual_critic_schedule = copy.deepcopy(training.get("critic_lr_schedule", []))
+    assert actual_critic_schedule == expected_critic_schedule, "critic_lr_schedule drifted from the canonical Run10 schedule"
+
+
+def build_run17_expanded_config(
+    phase_name: str = "phase1",
+    *,
+    analysis_end_date: str | None = None,
+    overrides: dict | None = None,
+) -> dict:
+    """Return a deep-copied phase config with feature-audit + Run17 expanded-universe overrides."""
+    config = copy.deepcopy(get_active_config(phase_name))
+    enforce_feature_audit_plan(config)
+    apply_run17_expanded_overrides(config, overrides=overrides)
+    if analysis_end_date is not None:
+        config["ANALYSIS_END_DATE"] = analysis_end_date
+    assert_run17_expanded_config(config)
     return config
 
 
