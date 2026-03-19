@@ -517,6 +517,16 @@ class PPOAgentTF:
         """Return the EMA-averaged actor weights (for evaluation/checkpointing)."""
         return self.actor_ema_weights
 
+    def get_film_diagnostics(self, state_batch) -> dict:
+        """Collect lightweight FiLM diagnostics from the actor when available."""
+        actor = getattr(self, "actor", None)
+        if actor is None or not hasattr(actor, "get_film_diagnostics"):
+            return {}
+        try:
+            return dict(actor.get_film_diagnostics(state_batch) or {})
+        except Exception:
+            return {}
+
     def apply_ema_actor_weights(self):
         """Temporarily apply EMA weights to actor for evaluation."""
         if self.actor_ema_weights is None:
@@ -2252,6 +2262,15 @@ class PPOAgentTF:
             # Track risky-asset alpha means only; cash is handled separately in actions
             # and would break ticker-aligned diagnostics if included here.
             'alpha_per_asset': np.zeros(self.num_assets, dtype=np.float64),
+            'film_seq_gamma_delta_abs_mean': 0.0,
+            'film_seq_beta_abs_mean': 0.0,
+            'film_seq_gamma_sat_frac': 0.0,
+            'film_latent_gamma_delta_abs_mean': 0.0,
+            'film_latent_beta_abs_mean': 0.0,
+            'film_latent_gamma_sat_frac': 0.0,
+            'film_regime_gamma_delta_abs_mean': 0.0,
+            'film_regime_beta_abs_mean': 0.0,
+            'film_regime_gamma_sat_frac': 0.0,
             # NEW: PPO ratio statistics
             'ratio_mean': 0.0,
             'ratio_std': 0.0,
@@ -2399,6 +2418,17 @@ class PPOAgentTF:
                 stats['alpha_cap_hit_frac'] += alpha_cap_hit_frac_batch
                 risky_alpha_batch = alpha_batch[..., :self.num_assets]
                 stats['alpha_per_asset'] += np.mean(risky_alpha_batch, axis=0).astype(np.float64)
+                film_diag = self.get_film_diagnostics(batch_states)
+                if film_diag:
+                    stats['film_seq_gamma_delta_abs_mean'] += float(film_diag.get('seq_gamma_delta_abs_mean', 0.0))
+                    stats['film_seq_beta_abs_mean'] += float(film_diag.get('seq_beta_abs_mean', 0.0))
+                    stats['film_seq_gamma_sat_frac'] += float(film_diag.get('seq_gamma_sat_frac', 0.0))
+                    stats['film_latent_gamma_delta_abs_mean'] += float(film_diag.get('latent_gamma_delta_abs_mean', 0.0))
+                    stats['film_latent_beta_abs_mean'] += float(film_diag.get('latent_beta_abs_mean', 0.0))
+                    stats['film_latent_gamma_sat_frac'] += float(film_diag.get('latent_gamma_sat_frac', 0.0))
+                    stats['film_regime_gamma_delta_abs_mean'] += float(film_diag.get('regime_gamma_delta_abs_mean', 0.0))
+                    stats['film_regime_beta_abs_mean'] += float(film_diag.get('regime_beta_abs_mean', 0.0))
+                    stats['film_regime_gamma_sat_frac'] += float(film_diag.get('regime_gamma_sat_frac', 0.0))
                 if self.mixture_dirichlet_enabled:
                     valid_components = np.asarray(batch_mixture_components_old.numpy(), dtype=np.int32)
                     valid_components = valid_components[(valid_components >= 0) & (valid_components < self.mixture_dirichlet_num_components)]
@@ -2454,6 +2484,9 @@ class PPOAgentTF:
                        'policy_loss', 'entropy_loss', 'entropy',
                        'actor_grad_norm', 'critic_grad_norm', 'alpha_min', 'alpha_max', 'alpha_mean', 'alpha_std',
                        'alpha_cap_hit_frac',
+                       'film_seq_gamma_delta_abs_mean', 'film_seq_beta_abs_mean', 'film_seq_gamma_sat_frac',
+                       'film_latent_gamma_delta_abs_mean', 'film_latent_beta_abs_mean', 'film_latent_gamma_sat_frac',
+                       'film_regime_gamma_delta_abs_mean', 'film_regime_beta_abs_mean', 'film_regime_gamma_sat_frac',
                        'ratio_mean', 'ratio_std', 'approx_kl', 'clip_fraction', 'value_clip_fraction']:
                 stats[key] /= num_updates
             stats['alpha_per_asset'] /= num_updates

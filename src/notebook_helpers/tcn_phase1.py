@@ -5848,6 +5848,32 @@ def run_experiment6_tape(
                         f"C{i}={u:.1%}" for i, u in enumerate(mixture_component_usage_val.tolist())
                     )
                     print(f"   🎛️ Mixture Usage: {usage_fmt}")
+                film_seq_gamma_delta = float(update_metrics.get("film_seq_gamma_delta_abs_mean", 0.0) or 0.0)
+                film_seq_beta = float(update_metrics.get("film_seq_beta_abs_mean", 0.0) or 0.0)
+                film_seq_sat = float(update_metrics.get("film_seq_gamma_sat_frac", 0.0) or 0.0)
+                film_latent_gamma_delta = float(update_metrics.get("film_latent_gamma_delta_abs_mean", 0.0) or 0.0)
+                film_latent_beta = float(update_metrics.get("film_latent_beta_abs_mean", 0.0) or 0.0)
+                film_latent_sat = float(update_metrics.get("film_latent_gamma_sat_frac", 0.0) or 0.0)
+                film_regime_gamma_delta = float(update_metrics.get("film_regime_gamma_delta_abs_mean", 0.0) or 0.0)
+                film_regime_beta = float(update_metrics.get("film_regime_beta_abs_mean", 0.0) or 0.0)
+                film_regime_sat = float(update_metrics.get("film_regime_gamma_sat_frac", 0.0) or 0.0)
+                if any(
+                    v > 0.0
+                    for v in (
+                        film_seq_gamma_delta,
+                        film_seq_beta,
+                        film_latent_gamma_delta,
+                        film_latent_beta,
+                        film_regime_gamma_delta,
+                        film_regime_beta,
+                    )
+                ):
+                    print(
+                        "   🧬 FiLM: "
+                        f"seq(dg={film_seq_gamma_delta:.4f}, db={film_seq_beta:.4f}, sat={film_seq_sat:.1%}) | "
+                        f"latent(dg={film_latent_gamma_delta:.4f}, db={film_latent_beta:.4f}, sat={film_latent_sat:.1%}) | "
+                        f"regime(dg={film_regime_gamma_delta:.4f}, db={film_regime_beta:.4f}, sat={film_regime_sat:.1%})"
+                    )
                 if _regime_sampling_enabled:
                     regime_total_samples, regime_counts = _aggregate_regime_sampling_stats(train_envs)
                     if regime_total_samples > 0 and regime_counts:

@@ -486,6 +486,93 @@ def _compute_regime_summary_features(
     )
 
 
+class LearnedRegimeEncoder(layers.Layer):
+    """Encode a sequence into a compact regime embedding for conditioning."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        hidden_dim: int = 64,
+        dropout: float = 0.0,
+        name: str = "regime_encoder",
+    ):
+        super(LearnedRegimeEncoder, self).__init__(name=name)
+        self.embedding_dim = int(embedding_dim)
+        self.hidden_dim = max(16, int(hidden_dim))
+        self.dropout_rate = float(max(0.0, dropout))
+
+        self.input_norm = layers.LayerNormalization(epsilon=1e-6, name=f"{name}_input_norm")
+        self.input_proj = layers.Dense(self.hidden_dim, activation="gelu", name=f"{name}_input_proj")
+        self.conv1 = layers.Conv1D(
+            self.hidden_dim,
+            kernel_size=3,
+            dilation_rate=1,
+            padding="causal",
+            activation="gelu",
+            name=f"{name}_conv1",
+        )
+        self.conv2 = layers.Conv1D(
+            self.hidden_dim,
+            kernel_size=3,
+            dilation_rate=2,
+            padding="causal",
+            activation="gelu",
+            name=f"{name}_conv2",
+        )
+        self.block_dropout = layers.Dropout(self.dropout_rate, name=f"{name}_block_drop")
+        self.attn_norm = layers.LayerNormalization(epsilon=1e-6, name=f"{name}_attn_norm")
+        num_heads = 2 if self.hidden_dim >= 32 else 1
+        self.self_attn = layers.MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=max(8, self.hidden_dim // num_heads),
+            dropout=self.dropout_rate,
+            name=f"{name}_self_attn",
+        )
+        self.attn_dropout = layers.Dropout(self.dropout_rate, name=f"{name}_attn_drop")
+        self.ffn_norm = layers.LayerNormalization(epsilon=1e-6, name=f"{name}_ffn_norm")
+        self.ffn_dense1 = layers.Dense(self.hidden_dim * 2, activation="gelu", name=f"{name}_ffn1")
+        self.ffn_dense2 = layers.Dense(self.hidden_dim, activation=None, name=f"{name}_ffn2")
+        self.ffn_dropout = layers.Dropout(self.dropout_rate, name=f"{name}_ffn_drop")
+        self.pool_norm = layers.LayerNormalization(epsilon=1e-6, name=f"{name}_pool_norm")
+        self.pool_score = layers.Dense(1, activation=None, name=f"{name}_pool_score")
+        self.output_proj = layers.Dense(self.embedding_dim, activation=None, name=f"{name}_output")
+
+    def call(self, sequence, training=None):
+        x = _to_tensor_with_cast(sequence, tf.float32)
+        if x.shape.rank != 3:
+            raise ValueError(f"LearnedRegimeEncoder expects rank-3 sequence, got {x.shape}")
+
+        x = self.input_norm(x)
+        x = self.input_proj(x)
+        residual = x
+        x = self.conv1(x)
+        x = self.block_dropout(x, training=training)
+        x = self.conv2(x)
+        x = self.block_dropout(x, training=training)
+        x = x + residual
+
+        attn_in = self.attn_norm(x)
+        attn_out = self.self_attn(attn_in, attn_in, training=training)
+        attn_out = self.attn_dropout(attn_out, training=training)
+        x = x + attn_out
+
+        ffn_in = self.ffn_norm(x)
+        ffn_out = self.ffn_dense1(ffn_in)
+        ffn_out = self.ffn_dropout(ffn_out, training=training)
+        ffn_out = self.ffn_dense2(ffn_out)
+        ffn_out = self.ffn_dropout(ffn_out, training=training)
+        x = x + ffn_out
+
+        pool_in = self.pool_norm(x)
+        attn_logits = self.pool_score(pool_in)
+        attn_weights = tf.nn.softmax(attn_logits, axis=1)
+        pooled_attn = tf.reduce_sum(attn_weights * x, axis=1)
+        pooled_mean = tf.reduce_mean(x, axis=1)
+        pooled_last = x[:, -1, :]
+        pooled = tf.concat([pooled_attn, pooled_mean, pooled_last], axis=-1)
+        return self.output_proj(pooled)
+
+
 class FiLMLayer(layers.Layer):
     """Feature-wise Linear Modulation (FiLM) layer.
 
@@ -510,31 +597,34 @@ class FiLMLayer(layers.Layer):
         conditioning_dim: int,
         hidden_dim: int = 32,
         dropout: float = 0.0,
+        gamma_limit: float = 0.15,
+        beta_limit: float = 0.10,
         name: str = "film_layer",
     ):
         super(FiLMLayer, self).__init__(name=name)
         self.feature_dim = int(feature_dim)
         self.conditioning_dim = int(conditioning_dim)
+        self.gamma_limit = float(max(0.0, gamma_limit))
+        self.beta_limit = float(max(0.0, beta_limit))
 
         # Conditioning encoder: z => hidden representation
+        self.cond_norm = layers.LayerNormalization(epsilon=1e-6, name=f"{name}_cond_norm")
         self.cond_encoder = tf.keras.Sequential(
             [
-                layers.Dense(hidden_dim, activation="relu", name=f"{name}_cond_h1"),
-                layers.Dense(hidden_dim, activation="relu", name=f"{name}_cond_h2"),
+                layers.Dense(hidden_dim, activation="gelu", name=f"{name}_cond_h1"),
+                layers.Dense(hidden_dim, activation="gelu", name=f"{name}_cond_h2"),
             ],
             name=f"{name}_cond_encoder",
         )
 
-        # γ (scale) head: initialized near 1.0 so FiLM starts as identity
         self.gamma_head = layers.Dense(
             self.feature_dim,
             activation=None,
             kernel_initializer=tf.keras.initializers.Zeros(),
-            bias_initializer=tf.keras.initializers.Ones(),
+            bias_initializer=tf.keras.initializers.Zeros(),
             name=f"{name}_gamma",
         )
 
-        # β (shift) head: initialized at 0 so no shift initially
         self.beta_head = layers.Dense(
             self.feature_dim,
             activation=None,
@@ -556,18 +646,122 @@ class FiLMLayer(layers.Layer):
         Returns:
             Modulated features with same shape as input.
         """
+        conditioning = self.cond_norm(conditioning)
         h = self.cond_encoder(conditioning, training=training)
-        gamma = self.gamma_head(h)  # (batch, feature_dim)
-        beta = self.beta_head(h)    # (batch, feature_dim)
+        gamma = 1.0 + self.gamma_limit * tf.tanh(self.gamma_head(h))
+        beta = self.beta_limit * tf.tanh(self.beta_head(h))
 
         # Expand dims if features is 3D (per-asset): (batch, 1, dim)
         if features.shape.rank == 3:
             gamma = tf.expand_dims(gamma, axis=1)
             beta = tf.expand_dims(beta, axis=1)
 
-        modulated = gamma * features + beta
-        modulated = self.film_dropout(modulated, training=training)
-        return modulated
+        delta = ((gamma - 1.0) * features) + beta
+        delta = self.film_dropout(delta, training=training)
+        return features + delta
+
+    def get_modulation_stats(self, conditioning) -> Dict[str, float]:
+        conditioning = _to_tensor_with_cast(conditioning, tf.float32)
+        conditioning = self.cond_norm(conditioning)
+        h = self.cond_encoder(conditioning, training=False)
+        gamma_delta = self.gamma_limit * tf.tanh(self.gamma_head(h))
+        beta = self.beta_limit * tf.tanh(self.beta_head(h))
+        gamma = 1.0 + gamma_delta
+
+        gamma_np = gamma.numpy()
+        gamma_delta_np = gamma_delta.numpy()
+        beta_np = beta.numpy()
+        return {
+            "gamma_mean": float(np.mean(gamma_np)),
+            "gamma_std": float(np.std(gamma_np)),
+            "gamma_delta_abs_mean": float(np.mean(np.abs(gamma_delta_np))),
+            "gamma_sat_frac": float(np.mean(np.abs(gamma_delta_np) >= (0.95 * self.gamma_limit)))
+            if self.gamma_limit > 0.0 else 0.0,
+            "beta_abs_mean": float(np.mean(np.abs(beta_np))),
+            "beta_std": float(np.std(beta_np)),
+            "beta_sat_frac": float(np.mean(np.abs(beta_np) >= (0.95 * self.beta_limit)))
+            if self.beta_limit > 0.0 else 0.0,
+        }
+
+
+def _build_regime_conditioning_modules(
+    *,
+    name: str,
+    feature_dim: int,
+    hidden_dim: int,
+    dropout: float,
+    mode: str,
+    sequence_film_feature_dim: Optional[int] = None,
+):
+    hidden_dim = max(8, int(hidden_dim))
+    dropout = float(max(0.0, dropout))
+    mode = str(mode).lower().strip()
+    encoder_hidden_dim = max(hidden_dim, min(256, int(feature_dim)))
+    regime_sequence_encoder = LearnedRegimeEncoder(
+        embedding_dim=hidden_dim,
+        hidden_dim=encoder_hidden_dim,
+        dropout=dropout,
+        name=f"{name}_regime_encoder",
+    )
+    regime_sequence_film = None
+    regime_film = None
+    regime_fusion = None
+    regime_dropout = None
+    if mode == "film":
+        regime_film = FiLMLayer(
+            feature_dim=int(feature_dim),
+            conditioning_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            gamma_limit=0.15,
+            beta_limit=0.10,
+            name=f"{name}_regime_film",
+        )
+        if sequence_film_feature_dim is not None and int(sequence_film_feature_dim) > 0:
+            regime_sequence_film = FiLMLayer(
+                feature_dim=int(sequence_film_feature_dim),
+                conditioning_dim=hidden_dim,
+                hidden_dim=max(8, hidden_dim // 2),
+                dropout=0.0,
+                gamma_limit=0.08,
+                beta_limit=0.05,
+                name=f"{name}_regime_sequence_film",
+            )
+    else:
+        regime_fusion = layers.Dense(
+            int(feature_dim),
+            activation="gelu",
+            name=f"{name}_regime_fusion",
+        )
+        regime_dropout = layers.Dropout(dropout)
+
+    return regime_sequence_encoder, regime_sequence_film, regime_film, regime_fusion, regime_dropout
+
+
+def _apply_regime_conditioning(
+    features: tf.Tensor,
+    regime_embedding: tf.Tensor,
+    *,
+    regime_film_layer: Optional[FiLMLayer],
+    regime_fusion: Optional[layers.Layer],
+    regime_dropout: Optional[layers.Dropout],
+    training=None,
+) -> tf.Tensor:
+    if regime_embedding is None:
+        return features
+    if regime_film_layer is not None:
+        return regime_film_layer(features, regime_embedding, training=training)
+    if regime_fusion is None:
+        return features
+
+    cond = regime_embedding
+    if features.shape.rank == 3:
+        cond = tf.expand_dims(cond, axis=1)
+        cond = tf.tile(cond, [1, tf.shape(features)[1], 1])
+    fused = regime_fusion(tf.concat([features, cond], axis=-1), training=training)
+    if regime_dropout is not None:
+        fused = regime_dropout(fused, training=training)
+    return fused
 
 
 # ============================================================================
@@ -881,33 +1075,26 @@ class MLPActor(DirichletActor):
             )
 
         self.regime_encoder = None
+        self.regime_film_layer = None
+        self.regime_sequence_film_layer = None
         self.regime_fusion = None
         self.regime_dropout = None
-        self.regime_film_layer = None
+        self.regime_sequence_encoder = None
         if self.regime_conditioning_enabled:
-            hidden_dim = max(8, int(regime_conditioning_hidden_dim))
-            if self.regime_conditioning_mode == "film":
-                self.regime_film_layer = FiLMLayer(
-                    feature_dim=self.latent_dim,
-                    conditioning_dim=9,
-                    hidden_dim=hidden_dim,
-                    dropout=float(max(0.0, regime_conditioning_dropout)),
-                    name=f"{name}_regime_film",
-                )
-            else:
-                self.regime_encoder = tf.keras.Sequential(
-                    [
-                        layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense1"),
-                        layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense2"),
-                    ],
-                    name=f"{name}_regime_encoder",
-                )
-                self.regime_fusion = layers.Dense(
-                    self.latent_dim,
-                    activation="relu",
-                    name=f"{name}_regime_fusion",
-                )
-                self.regime_dropout = layers.Dropout(float(max(0.0, regime_conditioning_dropout)))
+            (
+                self.regime_sequence_encoder,
+                self.regime_sequence_film_layer,
+                self.regime_film_layer,
+                self.regime_fusion,
+                self.regime_dropout,
+            ) = _build_regime_conditioning_modules(
+                name=name,
+                feature_dim=self.latent_dim,
+                hidden_dim=max(8, int(regime_conditioning_hidden_dim)),
+                dropout=float(max(0.0, regime_conditioning_dropout)),
+                mode=self.regime_conditioning_mode,
+                sequence_film_feature_dim=self.input_dim,
+            )
 
         self.output_layer = layers.Dense(
             self.num_actions,
@@ -999,23 +1186,28 @@ class MLPActor(DirichletActor):
     def call(self, state, training=None):
         sequence = self._prepare_sequence(state)
         regime_seq = sequence
+        regime_embedding = None
+        if self.regime_conditioning_enabled and self.regime_sequence_encoder is not None:
+            regime_embedding = self.regime_sequence_encoder(regime_seq, training=training)
 
         sequence = self.sequence_norm(sequence)
+        if self.regime_sequence_film_layer is not None and regime_embedding is not None:
+            sequence = self.regime_sequence_film_layer(sequence, regime_embedding, training=training)
         x = self.flatten_layer(sequence)
         x = self.input_norm(x)
         for dense_layer, dropout_layer in self.hidden_layers:
             x = dense_layer(x)
             x = dropout_layer(x, training=training)
 
-        if self.regime_conditioning_enabled:
-            regime_summary = _compute_regime_summary_features(regime_seq)
-            if self.regime_film_layer is not None:
-                x = self.regime_film_layer(x, regime_summary, training=training)
-            elif self.regime_encoder is not None and self.regime_fusion is not None:
-                regime_embed = self.regime_encoder(regime_summary, training=training)
-                x = self.regime_fusion(tf.concat([x, regime_embed], axis=-1), training=training)
-                if self.regime_dropout is not None:
-                    x = self.regime_dropout(x, training=training)
+        if self.regime_conditioning_enabled and regime_embedding is not None:
+            x = _apply_regime_conditioning(
+                x,
+                regime_embedding,
+                regime_film_layer=self.regime_film_layer,
+                regime_fusion=self.regime_fusion,
+                regime_dropout=self.regime_dropout,
+                training=training,
+            )
 
         logits = self.output_layer(x, training=training)
         projection_logits = self.projection_layer(x, training=training) if self.projection_layer is not None else None
@@ -1050,6 +1242,20 @@ class MLPActor(DirichletActor):
             aux_return_preds=aux_preds,
         )
 
+    def get_film_diagnostics(self, state) -> Dict[str, float]:
+        if not self.regime_conditioning_enabled or self.regime_sequence_encoder is None:
+            return {}
+        sequence = self._prepare_sequence(state)
+        regime_embedding = self.regime_sequence_encoder(sequence, training=False)
+        diagnostics: Dict[str, float] = {}
+        if self.regime_sequence_film_layer is not None:
+            for key, value in self.regime_sequence_film_layer.get_modulation_stats(regime_embedding).items():
+                diagnostics[f"seq_{key}"] = value
+        if self.regime_film_layer is not None:
+            for key, value in self.regime_film_layer.get_modulation_stats(regime_embedding).items():
+                diagnostics[f"latent_{key}"] = value
+        return diagnostics
+
 
 class TCNActor(DirichletActor):
     """
@@ -1075,6 +1281,7 @@ class TCNActor(DirichletActor):
         regime_conditioning_enabled: Optional[bool] = None,
         regime_conditioning_hidden_dim: Optional[int] = None,
         regime_conditioning_dropout: Optional[float] = None,
+        regime_conditioning_mode: Optional[str] = None,
         name: str = "tcn_actor",
         epsilon_start: float = 0.5,
         epsilon_min: float = 0.1,
@@ -1133,6 +1340,9 @@ class TCNActor(DirichletActor):
         self.num_actions = num_actions
         self.recurrent_memory_enabled = bool(recurrent_memory_enabled)
         self.regime_conditioning_enabled = bool(regime_conditioning_enabled)
+        self.regime_conditioning_mode = str(
+            regime_conditioning_mode if regime_conditioning_mode is not None else _DEFAULT_REGIME_CONDITIONING_MODE
+        ).lower().strip()
         
         # Build TCN blocks
         self.tcn_blocks = []
@@ -1159,23 +1369,24 @@ class TCNActor(DirichletActor):
         # Global pooling
         self.global_pool = layers.GlobalAveragePooling1D()
         self.regime_encoder = None
+        self.regime_sequence_encoder = None
         self.regime_fusion = None
         self.regime_dropout = None
+        self.regime_film_layer = None
         if self.regime_conditioning_enabled:
-            hidden_dim = max(8, int(regime_conditioning_hidden_dim))
-            self.regime_encoder = tf.keras.Sequential(
-                [
-                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense1"),
-                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense2"),
-                ],
-                name=f"{name}_regime_encoder",
+            (
+                self.regime_sequence_encoder,
+                _,
+                self.regime_film_layer,
+                self.regime_fusion,
+                self.regime_dropout,
+            ) = _build_regime_conditioning_modules(
+                name=name,
+                feature_dim=int(tcn_filters[-1]),
+                hidden_dim=max(8, int(regime_conditioning_hidden_dim)),
+                dropout=float(max(0.0, regime_conditioning_dropout)),
+                mode=self.regime_conditioning_mode,
             )
-            self.regime_fusion = layers.Dense(
-                int(tcn_filters[-1]),
-                activation="relu",
-                name=f"{name}_regime_fusion",
-            )
-            self.regime_dropout = layers.Dropout(float(max(0.0, regime_conditioning_dropout)))
         
         # Output layer
         self.output_layer = layers.Dense(
@@ -1210,12 +1421,16 @@ class TCNActor(DirichletActor):
         # Aggregate sequence
         x = self.global_pool(x)  # (batch, tcn_filters[-1])
 
-        if self.regime_encoder is not None and self.regime_fusion is not None:
-            regime_summary = _compute_regime_summary_features(regime_seq)
-            regime_embed = self.regime_encoder(regime_summary, training=training)
-            x = self.regime_fusion(tf.concat([x, regime_embed], axis=-1), training=training)
-            if self.regime_dropout is not None:
-                x = self.regime_dropout(x, training=training)
+        if self.regime_conditioning_enabled and self.regime_sequence_encoder is not None:
+            regime_embedding = self.regime_sequence_encoder(regime_seq, training=training)
+            x = _apply_regime_conditioning(
+                x,
+                regime_embedding,
+                regime_film_layer=self.regime_film_layer,
+                regime_fusion=self.regime_fusion,
+                regime_dropout=self.regime_dropout,
+                training=training,
+            )
 
         # Output
         logits = self.output_layer(x, training=training)
@@ -1248,6 +1463,7 @@ class TCNAttentionActor(DirichletActor):
         regime_conditioning_enabled: Optional[bool] = None,
         regime_conditioning_hidden_dim: Optional[int] = None,
         regime_conditioning_dropout: Optional[float] = None,
+        regime_conditioning_mode: Optional[str] = None,
         name: str = "tcn_attention_actor",
         epsilon_start: float = 0.5,
         epsilon_min: float = 0.1,
@@ -1310,6 +1526,9 @@ class TCNAttentionActor(DirichletActor):
         self.num_actions = num_actions
         self.recurrent_memory_enabled = bool(recurrent_memory_enabled)
         self.regime_conditioning_enabled = bool(regime_conditioning_enabled)
+        self.regime_conditioning_mode = str(
+            regime_conditioning_mode if regime_conditioning_mode is not None else _DEFAULT_REGIME_CONDITIONING_MODE
+        ).lower().strip()
         
         # TCN blocks
         self.tcn_blocks = []
@@ -1347,23 +1566,24 @@ class TCNAttentionActor(DirichletActor):
         # Global pooling
         self.global_pool = layers.GlobalAveragePooling1D()
         self.regime_encoder = None
+        self.regime_sequence_encoder = None
         self.regime_fusion = None
         self.regime_dropout = None
+        self.regime_film_layer = None
         if self.regime_conditioning_enabled:
-            hidden_dim = max(8, int(regime_conditioning_hidden_dim))
-            self.regime_encoder = tf.keras.Sequential(
-                [
-                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense1"),
-                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense2"),
-                ],
-                name=f"{name}_regime_encoder",
+            (
+                self.regime_sequence_encoder,
+                _,
+                self.regime_film_layer,
+                self.regime_fusion,
+                self.regime_dropout,
+            ) = _build_regime_conditioning_modules(
+                name=name,
+                feature_dim=int(attention_dim),
+                hidden_dim=max(8, int(regime_conditioning_hidden_dim)),
+                dropout=float(max(0.0, regime_conditioning_dropout)),
+                mode=self.regime_conditioning_mode,
             )
-            self.regime_fusion = layers.Dense(
-                int(attention_dim),
-                activation="relu",
-                name=f"{name}_regime_fusion",
-            )
-            self.regime_dropout = layers.Dropout(float(max(0.0, regime_conditioning_dropout)))
         
         # Output layer
         self.output_layer = layers.Dense(
@@ -1402,12 +1622,16 @@ class TCNAttentionActor(DirichletActor):
         # Aggregate sequence
         x = self.global_pool(x)  # (batch, attention_dim)
 
-        if self.regime_encoder is not None and self.regime_fusion is not None:
-            regime_summary = _compute_regime_summary_features(regime_seq)
-            regime_embed = self.regime_encoder(regime_summary, training=training)
-            x = self.regime_fusion(tf.concat([x, regime_embed], axis=-1), training=training)
-            if self.regime_dropout is not None:
-                x = self.regime_dropout(x, training=training)
+        if self.regime_conditioning_enabled and self.regime_sequence_encoder is not None:
+            regime_embedding = self.regime_sequence_encoder(regime_seq, training=training)
+            x = _apply_regime_conditioning(
+                x,
+                regime_embedding,
+                regime_film_layer=self.regime_film_layer,
+                regime_fusion=self.regime_fusion,
+                regime_dropout=self.regime_dropout,
+                training=training,
+            )
 
         # Output
         logits = self.output_layer(x, training=training)
@@ -1680,40 +1904,27 @@ class TCNFusionActor(DirichletActor):
         # Gate layer for legacy path (used when context cross-attn is disabled)
         self.gate_layer = layers.Dense(self.fusion_embed_dim, activation="sigmoid", name=f"{name}_gate")
         self.regime_encoder = None
+        self.regime_sequence_encoder = None
         self.regime_fusion = None
         self.regime_dropout = None
         self.regime_film_layer = None
         self.regime_conditioning_mode = 'concat'
         if self.regime_conditioning_enabled:
-            hidden_dim = max(8, int(regime_conditioning_hidden_dim))
             rc_mode = str(regime_conditioning_mode) if regime_conditioning_mode else _DEFAULT_REGIME_CONDITIONING_MODE
-            self.regime_conditioning_mode = rc_mode
-            if rc_mode == 'film':
-                # FiLM modulation: regime => γ, β that scale/shift feature channels
-                # Conditioning dim = regime summary feature width (5 base + 4 augmented = 9)
-                self.regime_film_layer = FiLMLayer(
-                    feature_dim=self.fusion_embed_dim,
-                    conditioning_dim=9,  # _compute_regime_summary_features output width
-                    hidden_dim=hidden_dim,
-                    dropout=float(max(0.0, regime_conditioning_dropout)),
-                    name=f"{name}_regime_film",
-                )
-            else:
-                # Legacy concat mode: concat regime_embed with features, project back
-                self.regime_encoder = tf.keras.Sequential(
-                    [
-                        layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense1"),
-                        layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense2"),
-                    ],
-                    name=f"{name}_regime_encoder",
-                )
-                # For per-asset path, regime is broadcast to each asset embedding
-                self.regime_fusion = layers.Dense(
-                    self.fusion_embed_dim,
-                    activation="relu",
-                    name=f"{name}_regime_fusion",
-                )
-                self.regime_dropout = layers.Dropout(float(max(0.0, regime_conditioning_dropout)))
+            self.regime_conditioning_mode = str(rc_mode).lower().strip()
+            (
+                self.regime_sequence_encoder,
+                _,
+                self.regime_film_layer,
+                self.regime_fusion,
+                self.regime_dropout,
+            ) = _build_regime_conditioning_modules(
+                name=name,
+                feature_dim=self.fusion_embed_dim,
+                hidden_dim=max(8, int(regime_conditioning_hidden_dim)),
+                dropout=float(max(0.0, regime_conditioning_dropout)),
+                mode=self.regime_conditioning_mode,
+            )
 
         # Market-relative FiLM: condition on each asset's relative strength vs peers
         # Conditioning signal = (asset_tcn_output - market_mean) + identity_embed
@@ -1913,7 +2124,28 @@ class TCNFusionActor(DirichletActor):
         context = context[:, :, :target_dim]
         return context
 
+    def _build_regime_sequence(self, state) -> tf.Tensor:
+        if isinstance(state, dict):
+            structured_assets = self._align_asset_tensor(state.get("asset"))
+            batch = tf.shape(structured_assets)[0]
+            timesteps = tf.shape(structured_assets)[1]
+            context_seq = self._align_context_tensor(
+                state.get("context"),
+                batch=batch,
+                timesteps=timesteps,
+                fallback=tf.zeros((batch, timesteps, self.per_asset_dim), dtype=structured_assets.dtype),
+            )
+            asset_flat_for_regime = tf.reshape(
+                structured_assets,
+                (batch, timesteps, self.num_assets * self.per_asset_dim),
+            )
+            return tf.concat([asset_flat_for_regime, context_seq], axis=-1)
+
+        x = self._align_feature_dim(state)
+        return x
+
     def call(self, state, training=None):
+        regime_seq = self._build_regime_sequence(state)
         if isinstance(state, dict):
             structured_assets = self._align_asset_tensor(state.get("asset"))
             batch = tf.shape(structured_assets)[0]
@@ -1931,7 +2163,6 @@ class TCNFusionActor(DirichletActor):
                 structured_assets,
                 (batch, timesteps, self.num_assets * self.per_asset_dim),
             )
-            regime_seq = tf.concat([asset_flat_for_regime, context_seq], axis=-1)
         else:
             x = self._align_feature_dim(state)
             batch = tf.shape(x)[0]
@@ -1953,7 +2184,6 @@ class TCNFusionActor(DirichletActor):
                     timesteps=timesteps,
                     fallback=x_local,
                 )
-            regime_seq = x
 
         # --- Per-asset TCN encoding (shared weights) ---
         for block in self.asset_tcn_blocks:
@@ -2010,28 +2240,28 @@ class TCNFusionActor(DirichletActor):
 
         # --- Regime conditioning ---
         if self.regime_conditioning_enabled:
-            regime_summary = _compute_regime_summary_features(regime_seq)
-            if self.regime_film_layer is not None:
-                # FiLM: multiplicative modulation γ*features + β
+            regime_embedding = None
+            if self.regime_sequence_encoder is not None:
+                regime_embedding = self.regime_sequence_encoder(regime_seq, training=training)
+            if regime_embedding is not None:
                 if self.per_asset_alpha_head_enabled:
-                    x_assets = self.regime_film_layer(x_assets, regime_summary, training=training)
-                else:
-                    fused = self.regime_film_layer(fused, regime_summary, training=training)
-            elif self.regime_encoder is not None and self.regime_fusion is not None:
-                # Legacy concat mode
-                regime_embed = self.regime_encoder(regime_summary, training=training)
-                if self.per_asset_alpha_head_enabled:
-                    regime_per_asset = tf.expand_dims(regime_embed, axis=1)
-                    regime_per_asset = tf.tile(regime_per_asset, [1, self.num_assets, 1])
-                    x_assets = self.regime_fusion(
-                        tf.concat([x_assets, regime_per_asset], axis=-1), training=training
+                    x_assets = _apply_regime_conditioning(
+                        x_assets,
+                        regime_embedding,
+                        regime_film_layer=self.regime_film_layer,
+                        regime_fusion=self.regime_fusion,
+                        regime_dropout=self.regime_dropout,
+                        training=training,
                     )
-                    if self.regime_dropout is not None:
-                        x_assets = self.regime_dropout(x_assets, training=training)
                 else:
-                    fused = self.regime_fusion(tf.concat([fused, regime_embed], axis=-1), training=training)
-                    if self.regime_dropout is not None:
-                        fused = self.regime_dropout(fused, training=training)
+                    fused = _apply_regime_conditioning(
+                        fused,
+                        regime_embedding,
+                        regime_film_layer=self.regime_film_layer,
+                        regime_fusion=self.regime_fusion,
+                        regime_dropout=self.regime_dropout,
+                        training=training,
+                    )
 
         # --- Market-relative FiLM: condition on relative strength vs peers ---
         if self.asset_film_layer is not None:
@@ -2142,6 +2372,18 @@ class TCNFusionActor(DirichletActor):
             aux_return_preds=aux_preds,
         )
 
+    def get_film_diagnostics(self, state) -> Dict[str, float]:
+        diagnostics: Dict[str, float] = {}
+        if self.regime_conditioning_enabled and self.regime_sequence_encoder is not None:
+            regime_seq = self._build_regime_sequence(state)
+            regime_embedding = self.regime_sequence_encoder(regime_seq, training=False)
+            if self.regime_film_layer is not None:
+                for key, value in self.regime_film_layer.get_modulation_stats(regime_embedding).items():
+                    diagnostics[f"regime_{key}"] = value
+        if self.asset_film_layer is not None:
+            diagnostics["asset_film_enabled"] = 1.0
+        return diagnostics
+
 
 # ============================================================================
 # CRITIC NETWORKS
@@ -2167,6 +2409,7 @@ class TCNCritic(Model):
                  regime_conditioning_enabled: Optional[bool] = None,
                  regime_conditioning_hidden_dim: Optional[int] = None,
                  regime_conditioning_dropout: Optional[float] = None,
+                 regime_conditioning_mode: Optional[str] = None,
                  distributional_critic_enabled: Optional[bool] = None,
                  distributional_num_quantiles: Optional[int] = None,
                  name: str = "tcn_critic"):
@@ -2201,6 +2444,9 @@ class TCNCritic(Model):
         self.input_dim = input_dim
         self.recurrent_memory_enabled = bool(recurrent_memory_enabled)
         self.regime_conditioning_enabled = bool(regime_conditioning_enabled)
+        self.regime_conditioning_mode = str(
+            regime_conditioning_mode if regime_conditioning_mode is not None else _DEFAULT_REGIME_CONDITIONING_MODE
+        ).lower().strip()
         self.distributional_critic_enabled = bool(distributional_critic_enabled)
         self.distributional_num_quantiles = max(2, int(distributional_num_quantiles))
         
@@ -2229,23 +2475,24 @@ class TCNCritic(Model):
         # Global pooling
         self.global_pool = layers.GlobalAveragePooling1D()
         self.regime_encoder = None
+        self.regime_sequence_encoder = None
         self.regime_fusion = None
         self.regime_dropout = None
+        self.regime_film_layer = None
         if self.regime_conditioning_enabled:
-            hidden_dim = max(8, int(regime_conditioning_hidden_dim))
-            self.regime_encoder = tf.keras.Sequential(
-                [
-                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense1"),
-                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense2"),
-                ],
-                name=f"{name}_regime_encoder",
+            (
+                self.regime_sequence_encoder,
+                _,
+                self.regime_film_layer,
+                self.regime_fusion,
+                self.regime_dropout,
+            ) = _build_regime_conditioning_modules(
+                name=name,
+                feature_dim=int(tcn_filters[-1]),
+                hidden_dim=max(8, int(regime_conditioning_hidden_dim)),
+                dropout=float(max(0.0, regime_conditioning_dropout)),
+                mode=self.regime_conditioning_mode,
             )
-            self.regime_fusion = layers.Dense(
-                int(tcn_filters[-1]),
-                activation="relu",
-                name=f"{name}_regime_fusion",
-            )
-            self.regime_dropout = layers.Dropout(float(max(0.0, regime_conditioning_dropout)))
 
         output_units = self.distributional_num_quantiles if self.distributional_critic_enabled else 1
 
@@ -2276,12 +2523,16 @@ class TCNCritic(Model):
         regime_seq = x
 
         x = self.global_pool(x)
-        if self.regime_encoder is not None and self.regime_fusion is not None:
-            regime_summary = _compute_regime_summary_features(regime_seq)
-            regime_embed = self.regime_encoder(regime_summary, training=training)
-            x = self.regime_fusion(tf.concat([x, regime_embed], axis=-1), training=training)
-            if self.regime_dropout is not None:
-                x = self.regime_dropout(x, training=training)
+        if self.regime_conditioning_enabled and self.regime_sequence_encoder is not None:
+            regime_embedding = self.regime_sequence_encoder(regime_seq, training=training)
+            x = _apply_regime_conditioning(
+                x,
+                regime_embedding,
+                regime_film_layer=self.regime_film_layer,
+                regime_fusion=self.regime_fusion,
+                regime_dropout=self.regime_dropout,
+                training=training,
+            )
         value = self.output_layer(x, training=training)
 
         return value
@@ -2351,33 +2602,26 @@ class MLPCritic(Model):
             )
 
         self.regime_encoder = None
+        self.regime_film_layer = None
+        self.regime_sequence_film_layer = None
         self.regime_fusion = None
         self.regime_dropout = None
-        self.regime_film_layer = None
+        self.regime_sequence_encoder = None
         if self.regime_conditioning_enabled:
-            hidden_dim = max(8, int(regime_conditioning_hidden_dim))
-            if self.regime_conditioning_mode == "film":
-                self.regime_film_layer = FiLMLayer(
-                    feature_dim=self.latent_dim,
-                    conditioning_dim=9,
-                    hidden_dim=hidden_dim,
-                    dropout=float(max(0.0, regime_conditioning_dropout)),
-                    name=f"{name}_regime_film",
-                )
-            else:
-                self.regime_encoder = tf.keras.Sequential(
-                    [
-                        layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense1"),
-                        layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense2"),
-                    ],
-                    name=f"{name}_regime_encoder",
-                )
-                self.regime_fusion = layers.Dense(
-                    self.latent_dim,
-                    activation="relu",
-                    name=f"{name}_regime_fusion",
-                )
-                self.regime_dropout = layers.Dropout(float(max(0.0, regime_conditioning_dropout)))
+            (
+                self.regime_sequence_encoder,
+                self.regime_sequence_film_layer,
+                self.regime_film_layer,
+                self.regime_fusion,
+                self.regime_dropout,
+            ) = _build_regime_conditioning_modules(
+                name=name,
+                feature_dim=self.latent_dim,
+                hidden_dim=max(8, int(regime_conditioning_hidden_dim)),
+                dropout=float(max(0.0, regime_conditioning_dropout)),
+                mode=self.regime_conditioning_mode,
+                sequence_film_feature_dim=self.input_dim,
+            )
 
         output_units = self.distributional_num_quantiles if self.distributional_critic_enabled else 1
         self.output_layer = layers.Dense(
@@ -2405,23 +2649,28 @@ class MLPCritic(Model):
     def call(self, state, training=None):
         sequence = self._prepare_sequence(state)
         regime_seq = sequence
+        regime_embedding = None
+        if self.regime_conditioning_enabled and self.regime_sequence_encoder is not None:
+            regime_embedding = self.regime_sequence_encoder(regime_seq, training=training)
 
         sequence = self.sequence_norm(sequence)
+        if self.regime_sequence_film_layer is not None and regime_embedding is not None:
+            sequence = self.regime_sequence_film_layer(sequence, regime_embedding, training=training)
         x = self.flatten_layer(sequence)
         x = self.input_norm(x)
         for dense_layer, dropout_layer in self.hidden_layers:
             x = dense_layer(x)
             x = dropout_layer(x, training=training)
 
-        if self.regime_conditioning_enabled:
-            regime_summary = _compute_regime_summary_features(regime_seq)
-            if self.regime_film_layer is not None:
-                x = self.regime_film_layer(x, regime_summary, training=training)
-            elif self.regime_encoder is not None and self.regime_fusion is not None:
-                regime_embed = self.regime_encoder(regime_summary, training=training)
-                x = self.regime_fusion(tf.concat([x, regime_embed], axis=-1), training=training)
-                if self.regime_dropout is not None:
-                    x = self.regime_dropout(x, training=training)
+        if self.regime_conditioning_enabled and regime_embedding is not None:
+            x = _apply_regime_conditioning(
+                x,
+                regime_embedding,
+                regime_film_layer=self.regime_film_layer,
+                regime_fusion=self.regime_fusion,
+                regime_dropout=self.regime_dropout,
+                training=training,
+            )
 
         return self.output_layer(x, training=training)
 
@@ -2448,6 +2697,7 @@ class TCNAttentionCritic(Model):
                  regime_conditioning_enabled: Optional[bool] = None,
                  regime_conditioning_hidden_dim: Optional[int] = None,
                  regime_conditioning_dropout: Optional[float] = None,
+                 regime_conditioning_mode: Optional[str] = None,
                  distributional_critic_enabled: Optional[bool] = None,
                  distributional_num_quantiles: Optional[int] = None,
                  name: str = "tcn_attention_critic"):
@@ -2486,6 +2736,9 @@ class TCNAttentionCritic(Model):
         self.input_dim = input_dim
         self.recurrent_memory_enabled = bool(recurrent_memory_enabled)
         self.regime_conditioning_enabled = bool(regime_conditioning_enabled)
+        self.regime_conditioning_mode = str(
+            regime_conditioning_mode if regime_conditioning_mode is not None else _DEFAULT_REGIME_CONDITIONING_MODE
+        ).lower().strip()
         self.distributional_critic_enabled = bool(distributional_critic_enabled)
         self.distributional_num_quantiles = max(2, int(distributional_num_quantiles))
         
@@ -2525,23 +2778,24 @@ class TCNAttentionCritic(Model):
         # Global pooling
         self.global_pool = layers.GlobalAveragePooling1D()
         self.regime_encoder = None
+        self.regime_sequence_encoder = None
         self.regime_fusion = None
         self.regime_dropout = None
+        self.regime_film_layer = None
         if self.regime_conditioning_enabled:
-            hidden_dim = max(8, int(regime_conditioning_hidden_dim))
-            self.regime_encoder = tf.keras.Sequential(
-                [
-                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense1"),
-                    layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense2"),
-                ],
-                name=f"{name}_regime_encoder",
+            (
+                self.regime_sequence_encoder,
+                _,
+                self.regime_film_layer,
+                self.regime_fusion,
+                self.regime_dropout,
+            ) = _build_regime_conditioning_modules(
+                name=name,
+                feature_dim=int(attention_dim),
+                hidden_dim=max(8, int(regime_conditioning_hidden_dim)),
+                dropout=float(max(0.0, regime_conditioning_dropout)),
+                mode=self.regime_conditioning_mode,
             )
-            self.regime_fusion = layers.Dense(
-                int(attention_dim),
-                activation="relu",
-                name=f"{name}_regime_fusion",
-            )
-            self.regime_dropout = layers.Dropout(float(max(0.0, regime_conditioning_dropout)))
 
         output_units = self.distributional_num_quantiles if self.distributional_critic_enabled else 1
 
@@ -2572,12 +2826,16 @@ class TCNAttentionCritic(Model):
             x = self.memory_layer(x, training=training)
         regime_seq = x
         x = self.global_pool(x)
-        if self.regime_encoder is not None and self.regime_fusion is not None:
-            regime_summary = _compute_regime_summary_features(regime_seq)
-            regime_embed = self.regime_encoder(regime_summary, training=training)
-            x = self.regime_fusion(tf.concat([x, regime_embed], axis=-1), training=training)
-            if self.regime_dropout is not None:
-                x = self.regime_dropout(x, training=training)
+        if self.regime_conditioning_enabled and self.regime_sequence_encoder is not None:
+            regime_embedding = self.regime_sequence_encoder(regime_seq, training=training)
+            x = _apply_regime_conditioning(
+                x,
+                regime_embedding,
+                regime_film_layer=self.regime_film_layer,
+                regime_fusion=self.regime_fusion,
+                regime_dropout=self.regime_dropout,
+                training=training,
+            )
 
         value = self.output_layer(x, training=training)
         
@@ -2792,36 +3050,27 @@ class TCNFusionCritic(Model):
         self.global_dropout = layers.Dropout(fusion_dropout)
         self.gate_layer = layers.Dense(self.fusion_embed_dim, activation="sigmoid", name=f"{name}_gate")
         self.regime_encoder = None
+        self.regime_sequence_encoder = None
         self.regime_fusion = None
         self.regime_dropout = None
         self.regime_film_layer = None
         self.regime_conditioning_mode = 'concat'
         if self.regime_conditioning_enabled:
-            hidden_dim = max(8, int(regime_conditioning_hidden_dim))
             rc_mode = str(regime_conditioning_mode) if regime_conditioning_mode else _DEFAULT_REGIME_CONDITIONING_MODE
-            self.regime_conditioning_mode = rc_mode
-            if rc_mode == 'film':
-                self.regime_film_layer = FiLMLayer(
-                    feature_dim=self.fusion_embed_dim,
-                    conditioning_dim=9,
-                    hidden_dim=hidden_dim,
-                    dropout=float(max(0.0, regime_conditioning_dropout)),
-                    name=f"{name}_regime_film",
-                )
-            else:
-                self.regime_encoder = tf.keras.Sequential(
-                    [
-                        layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense1"),
-                        layers.Dense(hidden_dim, activation="relu", name=f"{name}_regime_dense2"),
-                    ],
-                    name=f"{name}_regime_encoder",
-                )
-                self.regime_fusion = layers.Dense(
-                    self.fusion_embed_dim,
-                    activation="relu",
-                    name=f"{name}_regime_fusion",
-                )
-                self.regime_dropout = layers.Dropout(float(max(0.0, regime_conditioning_dropout)))
+            self.regime_conditioning_mode = str(rc_mode).lower().strip()
+            (
+                self.regime_sequence_encoder,
+                _,
+                self.regime_film_layer,
+                self.regime_fusion,
+                self.regime_dropout,
+            ) = _build_regime_conditioning_modules(
+                name=name,
+                feature_dim=self.fusion_embed_dim,
+                hidden_dim=max(8, int(regime_conditioning_hidden_dim)),
+                dropout=float(max(0.0, regime_conditioning_dropout)),
+                mode=self.regime_conditioning_mode,
+            )
 
         output_units = self.distributional_num_quantiles if self.distributional_critic_enabled else 1
         self.output_layer = layers.Dense(output_units, activation=None, kernel_initializer="orthogonal", name=f"{name}_output")
@@ -2968,16 +3217,18 @@ class TCNFusionCritic(Model):
 
         # --- Regime conditioning ---
         if self.regime_conditioning_enabled:
-            regime_summary = _compute_regime_summary_features(regime_seq)
-            if self.regime_film_layer is not None:
-                # FiLM: multiplicative modulation
-                fused = self.regime_film_layer(fused, regime_summary, training=training)
-            elif self.regime_encoder is not None and self.regime_fusion is not None:
-                # Legacy concat mode
-                regime_embed = self.regime_encoder(regime_summary, training=training)
-                fused = self.regime_fusion(tf.concat([fused, regime_embed], axis=-1), training=training)
-                if self.regime_dropout is not None:
-                    fused = self.regime_dropout(fused, training=training)
+            regime_embedding = None
+            if self.regime_sequence_encoder is not None:
+                regime_embedding = self.regime_sequence_encoder(regime_seq, training=training)
+            if regime_embedding is not None:
+                fused = _apply_regime_conditioning(
+                    fused,
+                    regime_embedding,
+                    regime_film_layer=self.regime_film_layer,
+                    regime_fusion=self.regime_fusion,
+                    regime_dropout=self.regime_dropout,
+                    training=training,
+                )
 
         return self.output_layer(fused, training=training)
 
