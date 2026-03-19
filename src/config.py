@@ -1746,6 +1746,123 @@ RUN17_EXPANDED_OVERRIDES["environment_params"].update(
 )
 
 
+def _scale_threshold_value(threshold: int, scale: float, *, quantum: int = 1_000) -> int:
+    scaled = int(round(float(threshold) * float(scale)))
+    if threshold > 0 and scaled <= 0:
+        scaled = max(1, quantum)
+    if quantum > 1:
+        scaled = int(round(scaled / float(quantum))) * int(quantum)
+    return max(0, scaled)
+
+
+def _scale_threshold_schedule(entries: list, scale: float, *, quantum: int = 1_000) -> list:
+    if not isinstance(entries, list):
+        return []
+    scaled_entries = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        new_entry = copy.deepcopy(entry)
+        new_entry["threshold"] = _scale_threshold_value(int(entry.get("threshold", 0)), scale, quantum=quantum)
+        scaled_entries.append(new_entry)
+
+    # Later entries should override earlier ones if thresholds collide after scaling.
+    deduped = {}
+    for entry in scaled_entries:
+        deduped[int(entry["threshold"])] = entry
+    return [deduped[key] for key in sorted(deduped.keys())]
+
+
+def _scale_threshold_mapping(mapping: dict, scale: float, *, quantum: int = 1_000) -> dict:
+    if not isinstance(mapping, dict):
+        return {}
+    scaled = {}
+    for threshold, value in mapping.items():
+        scaled_threshold = _scale_threshold_value(int(threshold), scale, quantum=quantum)
+        scaled[scaled_threshold] = copy.deepcopy(value)
+    return {key: scaled[key] for key in sorted(scaled.keys())}
+
+
+RUN17_TEST_OVERRIDES = copy.deepcopy(RUN17_EXPANDED_OVERRIDES)
+_RUN17_TEST_TIMESTEPS = 100_000
+_RUN17_TEST_SCALE = float(_RUN17_TEST_TIMESTEPS) / float(
+    RUN17_EXPANDED_OVERRIDES["training_params"]["max_total_timesteps"]
+)
+RUN17_TEST_OVERRIDES["training_params"].update(
+    {
+        "max_total_timesteps": _RUN17_TEST_TIMESTEPS,
+        "timesteps_per_ppo_update_schedule": _scale_threshold_schedule(
+            RUN17_EXPANDED_OVERRIDES["training_params"]["timesteps_per_ppo_update_schedule"],
+            _RUN17_TEST_SCALE,
+        ),
+        "batch_size_ppo_schedule": _scale_threshold_schedule(
+            RUN17_EXPANDED_OVERRIDES["training_params"]["batch_size_ppo_schedule"],
+            _RUN17_TEST_SCALE,
+        ),
+        "actor_lr_schedule": _scale_threshold_schedule(
+            RUN17_EXPANDED_OVERRIDES["training_params"]["actor_lr_schedule"],
+            _RUN17_TEST_SCALE,
+        ),
+        "critic_lr_schedule": _scale_threshold_schedule(
+            RUN17_EXPANDED_OVERRIDES["training_params"]["critic_lr_schedule"],
+            _RUN17_TEST_SCALE,
+        ),
+        "ppo_gamma_schedule": _scale_threshold_schedule(
+            RUN17_EXPANDED_OVERRIDES["training_params"]["ppo_gamma_schedule"],
+            _RUN17_TEST_SCALE,
+        ),
+        "ppo_gae_lambda_schedule": _scale_threshold_schedule(
+            RUN17_EXPANDED_OVERRIDES["training_params"]["ppo_gae_lambda_schedule"],
+            _RUN17_TEST_SCALE,
+        ),
+        "ppo_entropy_coef_schedule": _scale_threshold_schedule(
+            RUN17_EXPANDED_OVERRIDES["training_params"]["ppo_entropy_coef_schedule"],
+            _RUN17_TEST_SCALE,
+        ),
+        "aux_return_pred_coef_schedule": _scale_threshold_schedule(
+            RUN17_EXPANDED_OVERRIDES["training_params"]["aux_return_pred_coef_schedule"],
+            _RUN17_TEST_SCALE,
+        ),
+        "dirichlet_temperature_schedule": _scale_threshold_schedule(
+            RUN17_EXPANDED_OVERRIDES["training_params"]["dirichlet_temperature_schedule"],
+            _RUN17_TEST_SCALE,
+        ),
+        "episode_length_curriculum_schedule": _scale_threshold_schedule(
+            RUN17_EXPANDED_OVERRIDES["training_params"]["episode_length_curriculum_schedule"],
+            _RUN17_TEST_SCALE,
+        ),
+        "action_execution_beta_schedule": _scale_threshold_schedule(
+            RUN17_EXPANDED_OVERRIDES["training_params"]["action_execution_beta_schedule"],
+            _RUN17_TEST_SCALE,
+        ),
+        "action_execution_beta_curriculum": _scale_threshold_mapping(
+            RUN17_EXPANDED_OVERRIDES["training_params"]["action_execution_beta_curriculum"],
+            _RUN17_TEST_SCALE,
+        ),
+        "turnover_penalty_curriculum": _scale_threshold_mapping(
+            RUN17_EXPANDED_OVERRIDES["training_params"]["turnover_penalty_curriculum"],
+            _RUN17_TEST_SCALE,
+        ),
+        "reward_component_schedule": _scale_threshold_schedule(
+            RUN17_EXPANDED_OVERRIDES["training_params"]["reward_component_schedule"],
+            _RUN17_TEST_SCALE,
+        ),
+        "periodic_checkpoint_every_steps": _scale_threshold_value(
+            RUN17_EXPANDED_OVERRIDES["training_params"]["periodic_checkpoint_every_steps"],
+            _RUN17_TEST_SCALE,
+            quantum=1_000,
+        ),
+        "episode_length_curriculum_overlap_steps": _scale_threshold_value(
+            RUN17_EXPANDED_OVERRIDES["training_params"].get("episode_length_curriculum_overlap_steps", 10_000),
+            _RUN17_TEST_SCALE,
+            quantum=1_000,
+        ),
+        # Keep the test run on a fixed 100k horizon for fair alpha-generator A/B comparisons.
+        "training_early_stop_warmup_steps": _RUN17_TEST_TIMESTEPS,
+    }
+)
+
+
 RUN11_RELAXED_OVERRIDES = copy.deepcopy(RUN10_ALPHA_OVERRIDES)
 RUN11_RELAXED_OVERRIDES.update(
     {
@@ -2927,6 +3044,160 @@ def build_run17_expanded_config(
     if analysis_end_date is not None:
         config["ANALYSIS_END_DATE"] = analysis_end_date
     assert_run17_expanded_config(config)
+    return config
+
+
+def apply_run17_test_overrides(config: dict, overrides: dict = None) -> dict:
+    """Apply the canonical 100k-timestep Run17 test recipe in-place."""
+    global TRAIN_TEST_SPLIT_DATE
+    resolved = copy.deepcopy(RUN17_TEST_OVERRIDES if overrides is None else overrides)
+    split_date = resolved.get("TRAIN_TEST_SPLIT_DATE")
+    if split_date:
+        TRAIN_TEST_SPLIT_DATE = split_date
+        config["TRAIN_TEST_SPLIT_DATE"] = split_date
+    _deep_update_config(config, resolved)
+    return config
+
+
+def assert_run17_test_config(config: dict) -> None:
+    """Raise if a config expected to match the Run17 100k test recipe drifted."""
+    agent = config.get("agent_params", {})
+    ppo = agent.get("ppo_params", {})
+    env = config.get("environment_params", {})
+    training = config.get("training_params", {})
+    feature_params = config.get("feature_params", {})
+
+    assert str(config.get("TRAIN_TEST_SPLIT_DATE", "")) == str(TRAIN_TEST_SPLIT_DATE_COVID_STRESS), (
+        "Run17_test split date must be 2019-12-31 (COVID stress window)"
+    )
+    assert str(config.get("ANALYSIS_START_DATE", "")) == "2009-01-01", (
+        "Run17_test analysis start date must be 2009-01-01"
+    )
+    assert int(config.get("NUM_ASSETS", 0)) == 20, (
+        f"Run17_test must start from the canonical 20-asset config, got {config.get('NUM_ASSETS')}"
+    )
+    assert len(config.get("ASSET_TICKERS", [])) == 20, (
+        f"Run17_test must start from 20 tickers, got {len(config.get('ASSET_TICKERS', []))}"
+    )
+    assert int(training.get("max_total_timesteps", 0)) == _RUN17_TEST_TIMESTEPS, (
+        f"Run17_test max_total_timesteps must stay at {_RUN17_TEST_TIMESTEPS}"
+    )
+
+    assert bool(agent.get("regime_conditioning_enabled", False)), "regime_conditioning_enabled must stay on"
+    assert str(agent.get("regime_conditioning_mode", "concat")).lower() == "film", "regime_conditioning_mode must be film"
+    assert bool(agent.get("distributional_critic_enabled", False)), "distributional_critic_enabled must stay on"
+    assert float(ppo.get("risk_aux_mvo_coef", 1.0)) == 0.0, "risk_aux_mvo_coef must stay off for Run17_test"
+    assert float(ppo.get("risk_aux_cvar_coef", 0.0)) == 0.0, "step-level CVaR aux must stay off"
+    assert not bool(env.get("episode_cvar_enabled", False)), "episode_cvar_enabled must stay off"
+    assert bool(ppo.get("lagrangian_cvar_enabled", False)), "lagrangian_cvar_enabled must stay on"
+    assert not bool(agent.get("fusion_cross_asset_mixer_enabled", True)), (
+        "fusion_cross_asset_mixer_enabled must stay off for the canonical alpha test"
+    )
+    assert not bool(training.get("deterministic_validation_checkpointing_enabled", True)), (
+        "deterministic validation must stay disabled for compute-efficient test mode"
+    )
+    assert bool(training.get("high_watermark_checkpoint_enabled", False)), "high_watermark_checkpoint_enabled must stay on"
+    assert not bool(training.get("deterministic_validation_checkpointing_only", True)), (
+        "deterministic_validation_checkpointing_only must stay disabled when det-validation is off"
+    )
+    assert int(training.get("periodic_checkpoint_every_steps", 0)) > 0, "periodic checkpoints must stay enabled"
+    assert not bool(training.get("step_sharpe_checkpoint_enabled", True)), (
+        "step_sharpe_checkpoint_enabled must stay off for Run17_test"
+    )
+    assert bool(training.get("training_early_stop_enabled", False)), "training_early_stop_enabled must stay on"
+    assert float(training.get("training_early_stop_warmup_steps", 0)) == float(_RUN17_TEST_TIMESTEPS), (
+        "training_early_stop_warmup_steps must pin the 100k fixed-horizon test"
+    )
+    assert float(ppo.get("entropy_coef", 1.0)) <= 0.0015, "base entropy must stay in the sharpened low-entropy regime"
+    assert float(ppo.get("alpha_diversity_coef", 1.0)) <= 0.002, "alpha_diversity_coef drifted above the anti-collapse ceiling"
+    assert float(ppo.get("alpha_dispersion_coef", 0.0)) >= 0.10, "alpha_dispersion_coef drifted below the large-universe floor"
+    assert float(ppo.get("alpha_dispersion_target_std", 0.0)) >= 0.15, (
+        "alpha_dispersion_target_std drifted below the large-universe floor"
+    )
+    assert float(ppo.get("aux_return_pred_coef", 0.0)) >= 0.25, "aux_return_pred_coef drifted below the calibrated floor"
+    assert not bool(feature_params.get("actuarial_params", {}).get("enabled", False)), (
+        "Run17_test actuarial features must stay disabled"
+    )
+
+    assert float(env.get("target_turnover", 0.0)) == 0.35, "target_turnover must stay at the aligned Run17_test ceiling"
+    assert float(env.get("turnover_penalty_scalar", 1.0)) == 0.05, (
+        "environment turnover_penalty_scalar must stay at the aligned Run17_test bootstrap level"
+    )
+    assert float(env.get("action_execution_beta", 0.0)) == 0.55, (
+        "environment action_execution_beta must stay at the aligned Run17_test bootstrap value"
+    )
+    assert float(env.get("action_realization_penalty_scalar", 1.0)) == 0.0, (
+        "action_realization_penalty_scalar must stay off for Run17_test"
+    )
+
+    dsr_regime = env.get("dsr_regime_scaling", {}) if isinstance(env.get("dsr_regime_scaling", {}), dict) else {}
+    assert bool(dsr_regime.get("enabled", False)), "Run17_test DSR regime scaling must stay enabled"
+    assert float(dsr_regime.get("low_pos_mult", 0.0)) == 0.8
+    assert float(dsr_regime.get("low_neg_mult", 0.0)) == 0.9
+    assert float(dsr_regime.get("mid_pos_mult", 0.0)) == 1.0
+    assert float(dsr_regime.get("mid_neg_mult", 0.0)) == 1.0
+    assert float(dsr_regime.get("high_pos_mult", 0.0)) == 1.25
+    assert float(dsr_regime.get("high_neg_mult", 0.0)) == 1.25
+    assert bool(env.get("outperformance_bonus_enabled", False))
+    assert float(env.get("outperformance_bonus_scalar", 0.0)) == 6.0
+    assert str(env.get("outperformance_bonus_mode", "")).lower() == "signed_clipped"
+    assert float(env.get("outperformance_bonus_clip", 0.0)) == 0.02
+    assert bool(env.get("spy_outperformance_bonus_enabled", False))
+    assert float(env.get("spy_outperformance_bonus_scalar", 0.0)) == 1.5
+    assert str(env.get("spy_outperformance_bonus_mode", "")).lower() == "signed_clipped"
+    assert float(env.get("spy_outperformance_bonus_clip", 0.0)) == 0.01
+
+    expected_turnover = copy.deepcopy(RUN17_TEST_OVERRIDES["training_params"]["turnover_penalty_curriculum"])
+    actual_turnover = {
+        int(threshold): float(value)
+        for threshold, value in dict(training.get("turnover_penalty_curriculum", {})).items()
+    }
+    assert actual_turnover == expected_turnover, "turnover_penalty_curriculum drifted from the canonical Run17_test schedule"
+
+    expected_beta = copy.deepcopy(RUN17_TEST_OVERRIDES["training_params"]["action_execution_beta_curriculum"])
+    actual_beta = {
+        int(threshold): float(value)
+        for threshold, value in dict(training.get("action_execution_beta_curriculum", {})).items()
+    }
+    assert actual_beta == expected_beta, "action_execution_beta_curriculum drifted from the canonical Run17_test schedule"
+    assert float(training.get("evaluation_action_execution_beta", 0.0)) == 1.0
+    assert float(training.get("evaluation_turnover_penalty_scalar", 0.0)) == 0.40
+
+    for key in [
+        "timesteps_per_ppo_update_schedule",
+        "batch_size_ppo_schedule",
+        "actor_lr_schedule",
+        "critic_lr_schedule",
+        "ppo_gamma_schedule",
+        "ppo_gae_lambda_schedule",
+        "ppo_entropy_coef_schedule",
+        "aux_return_pred_coef_schedule",
+        "dirichlet_temperature_schedule",
+        "episode_length_curriculum_schedule",
+        "reward_component_schedule",
+    ]:
+        expected = copy.deepcopy(RUN17_TEST_OVERRIDES["training_params"][key])
+        actual = copy.deepcopy(training.get(key, []))
+        assert actual == expected, f"{key} drifted from the canonical Run17_test schedule"
+
+    assert int(training.get("episode_length_curriculum_overlap_steps", 0)) == int(
+        RUN17_TEST_OVERRIDES["training_params"]["episode_length_curriculum_overlap_steps"]
+    ), "episode_length_curriculum_overlap_steps drifted from the canonical Run17_test schedule"
+
+
+def build_run17_test_config(
+    phase_name: str = "phase1",
+    *,
+    analysis_end_date: str | None = None,
+    overrides: dict | None = None,
+) -> dict:
+    """Return a deep-copied phase config with the canonical 100k-timestep Run17 test overrides."""
+    config = copy.deepcopy(get_active_config(phase_name))
+    enforce_feature_audit_plan(config)
+    apply_run17_test_overrides(config, overrides=overrides)
+    if analysis_end_date is not None:
+        config["ANALYSIS_END_DATE"] = analysis_end_date
+    assert_run17_test_config(config)
     return config
 
 
