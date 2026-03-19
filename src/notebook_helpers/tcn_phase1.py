@@ -2641,11 +2641,17 @@ def run_experiment6_tape(
     # === SOTA-FIX feature init logging ===
     _dsr_regime_cfg = env_params.get("dsr_regime_scaling", {})
     if _dsr_regime_cfg.get("enabled", False):
+        _low_pos = float(_dsr_regime_cfg.get("low_pos_mult", 1.0))
+        _low_neg = float(_dsr_regime_cfg.get("low_neg_mult", 1.0))
+        _mid_pos = float(_dsr_regime_cfg.get("mid_pos_mult", 1.0))
+        _mid_neg = float(_dsr_regime_cfg.get("mid_neg_mult", 1.0))
+        _high_pos = float(_dsr_regime_cfg.get("high_pos_mult", 1.0))
+        _high_neg = float(_dsr_regime_cfg.get("high_neg_mult", 1.0))
         print(
             f"   🌊 DSR Regime Scaling: ENABLED | "
-            f"low_mult={_dsr_regime_cfg.get('low_mult', 0.3)} (vol<{_dsr_regime_cfg.get('low_vol_threshold', 0.12)}) | "
-            f"mid_mult={_dsr_regime_cfg.get('mid_mult', 1.0)} | "
-            f"high_mult={_dsr_regime_cfg.get('high_mult', 1.5)} (vol>{_dsr_regime_cfg.get('high_vol_threshold', 0.25)})"
+            f"low=+{_low_pos:.2f}/-{_low_neg:.2f} (vol<{_dsr_regime_cfg.get('low_vol_threshold', 0.12)}) | "
+            f"mid=+{_mid_pos:.2f}/-{_mid_neg:.2f} | "
+            f"high=+{_high_pos:.2f}/-{_high_neg:.2f} (vol>{_dsr_regime_cfg.get('high_vol_threshold', 0.25)})"
         )
     else:
         print("   🌊 DSR Regime Scaling: disabled")
@@ -5930,7 +5936,7 @@ def run_experiment6_tape(
                         _top3 = " | ".join(f"{t}={a:.2f}" for t, a in _ranked[:3])
                         _bot3 = " | ".join(f"{t}={a:.2f}" for t, a in _ranked[-3:])
                         print(f"   🏷️ Alpha Per-Asset  TOP: {_top3}  BOT: {_bot3}")
-                if mixture_component_usage_val is not None:
+                if bool(getattr(agent, "mixture_dirichlet_enabled", False)) and mixture_component_usage_val is not None:
                     usage_fmt = " | ".join(
                         f"C{i}={u:.1%}" for i, u in enumerate(mixture_component_usage_val.tolist())
                     )

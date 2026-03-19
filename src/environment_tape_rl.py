@@ -1625,6 +1625,7 @@ class PortfolioEnvTAPE(gym.Env):
                     reward = terminal_bonus
                     tape_bonus_final = float(terminal_bonus)
                 else:
+                    reward = 0.0
                     tape_bonus_final = 0.0
                     tape_bonus_raw_final = 0.0
                     tape_bonus_core_final = 0.0
