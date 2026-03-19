@@ -2771,7 +2771,9 @@ def assert_run17_expanded_config(config: dict) -> None:
     assert bool(agent.get("regime_conditioning_enabled", False)), "regime_conditioning_enabled must stay on"
     assert str(agent.get("regime_conditioning_mode", "concat")).lower() == "film", "regime_conditioning_mode must be film"
     assert bool(agent.get("distributional_critic_enabled", False)), "distributional_critic_enabled must stay on"
-    assert float(ppo.get("risk_aux_mvo_coef", 0.0)) >= 0.002, "risk_aux_mvo_coef drifted below the Run10 floor"
+    assert float(ppo.get("risk_aux_mvo_coef", 1.0)) == 0.0, (
+        "risk_aux_mvo_coef must stay off for Run17"
+    )
     assert float(ppo.get("risk_aux_cvar_coef", 0.0)) == 0.0, "step-level CVaR aux must stay off"
     assert not bool(env.get("episode_cvar_enabled", False)), "episode_cvar_enabled must stay off"
     assert bool(ppo.get("lagrangian_cvar_enabled", False)), "lagrangian_cvar_enabled must stay on"
