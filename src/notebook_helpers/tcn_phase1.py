@@ -3042,6 +3042,19 @@ def run_experiment6_tape(
     agent_config["ppo_params"]["gae_lambda"] = float(initial_ppo_gae_lambda)
 
     print(f"\n🤖 Creating {arch_upper} agent with Dirichlet distribution for Exp {exp_idx}...")
+
+    def _clear_tf_runtime_state() -> None:
+        try:
+            tf.keras.backend.clear_session()
+        except Exception:
+            pass
+        try:
+            import gc as _gc
+
+            _gc.collect()
+        except Exception:
+            pass
+
     def _create_agent_instance():
         return agent_cls(
             state_dim=n_features,
@@ -3049,33 +3062,51 @@ def run_experiment6_tape(
             config=agent_config,
         )
 
+    def _classify_agent_init_error(exc: Exception) -> Optional[str]:
+        message = str(exc)
+        if isinstance(exc, tf.errors.ResourceExhaustedError):
+            return "oom"
+        if isinstance(exc, tf.errors.InternalError):
+            upper_message = message.upper()
+            if "CUDA_ERROR_INVALID_HANDLE" in upper_message:
+                return "invalid_handle"
+            if "OUT OF MEMORY" in upper_message or "CUDASETDEVICE() ON GPU:0 FAILED" in upper_message:
+                return "oom"
+        return None
+
+    _clear_tf_runtime_state()
     try:
         agent = _create_agent_instance()
     except Exception as exc:
-        is_cuda_invalid_handle = (
-            isinstance(exc, tf.errors.InternalError)
-            and "CUDA_ERROR_INVALID_HANDLE" in str(exc)
-        )
-        if not is_cuda_invalid_handle:
+        init_error_kind = _classify_agent_init_error(exc)
+        if init_error_kind is None:
             raise
-        print(
-            "   [WARN] CUDA context error during agent creation "
-            "(CUDA_ERROR_INVALID_HANDLE). Clearing TF session and retrying once..."
-        )
-        try:
-            tf.keras.backend.clear_session()
-            import gc as _gc
-
-            _gc.collect()
-        except Exception:
-            pass
+        if init_error_kind == "invalid_handle":
+            print(
+                "   [WARN] CUDA context error during agent creation "
+                "(CUDA_ERROR_INVALID_HANDLE). Clearing TF session and retrying once..."
+            )
+        else:
+            print(
+                "   [WARN] GPU memory/context error during agent creation "
+                "(TensorFlow OOM or cudaSetDevice failure). Clearing TF session and retrying once..."
+            )
+        _clear_tf_runtime_state()
         try:
             agent = _create_agent_instance()
         except Exception as retry_exc:
-            raise RuntimeError(
-                "Agent initialization failed due to CUDA context error (CUDA_ERROR_INVALID_HANDLE). "
-                "Restart the runtime/kernel, rerun setup cells, and retry training."
-            ) from retry_exc
+            retry_kind = _classify_agent_init_error(retry_exc)
+            if retry_kind == "oom":
+                raise RuntimeError(
+                    "Agent initialization failed due to GPU memory exhaustion. "
+                    "Clear the Colab runtime, rerun setup cells, or reduce model size / batch / parallelism before retrying training."
+                ) from retry_exc
+            if retry_kind == "invalid_handle":
+                raise RuntimeError(
+                    "Agent initialization failed due to CUDA context error (CUDA_ERROR_INVALID_HANDLE). "
+                    "Restart the runtime/kernel, rerun setup cells, and retry training."
+                ) from retry_exc
+            raise
     print(f"[OK] Agent created: {agent.__class__.__name__}")
     print(f"   [RAND] Dirichlet Distribution: ENABLED")
 
