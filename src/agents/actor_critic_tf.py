@@ -634,6 +634,7 @@ class FiLMLayer(layers.Layer):
         )
 
         self.film_dropout = layers.Dropout(float(max(0.0, dropout)))
+        self._last_modulation_stats: Dict[str, float] = {}
 
     def call(self, features, conditioning, training=None):
         """Apply FiLM modulation.
@@ -648,8 +649,9 @@ class FiLMLayer(layers.Layer):
         """
         conditioning = self.cond_norm(conditioning)
         h = self.cond_encoder(conditioning, training=training)
-        gamma = 1.0 + self.gamma_limit * tf.tanh(self.gamma_head(h))
+        gamma_delta = self.gamma_limit * tf.tanh(self.gamma_head(h))
         beta = self.beta_limit * tf.tanh(self.beta_head(h))
+        gamma = 1.0 + gamma_delta
 
         # Expand dims if features is 3D (per-asset): (batch, 1, dim)
         if features.shape.rank == 3:
@@ -658,6 +660,23 @@ class FiLMLayer(layers.Layer):
 
         delta = ((gamma - 1.0) * features) + beta
         delta = self.film_dropout(delta, training=training)
+        if tf.executing_eagerly():
+            try:
+                gamma_delta_np = gamma_delta.numpy()
+                beta_np = beta.numpy() if beta.shape.rank == 2 else tf.squeeze(beta, axis=1).numpy()
+                self._last_modulation_stats = {
+                    "gamma_mean": float(np.mean(1.0 + gamma_delta_np)),
+                    "gamma_std": float(np.std(1.0 + gamma_delta_np)),
+                    "gamma_delta_abs_mean": float(np.mean(np.abs(gamma_delta_np))),
+                    "gamma_sat_frac": float(np.mean(np.abs(gamma_delta_np) >= (0.95 * self.gamma_limit)))
+                    if self.gamma_limit > 0.0 else 0.0,
+                    "beta_abs_mean": float(np.mean(np.abs(beta_np))),
+                    "beta_std": float(np.std(beta_np)),
+                    "beta_sat_frac": float(np.mean(np.abs(beta_np) >= (0.95 * self.beta_limit)))
+                    if self.beta_limit > 0.0 else 0.0,
+                }
+            except Exception:
+                self._last_modulation_stats = {}
         return features + delta
 
     def get_modulation_stats(self, conditioning) -> Dict[str, float]:
@@ -683,6 +702,9 @@ class FiLMLayer(layers.Layer):
             if self.beta_limit > 0.0 else 0.0,
         }
 
+    def get_last_modulation_stats(self) -> Dict[str, float]:
+        return dict(self._last_modulation_stats)
+
 
 def _build_regime_conditioning_modules(
     *,
@@ -692,6 +714,10 @@ def _build_regime_conditioning_modules(
     dropout: float,
     mode: str,
     sequence_film_feature_dim: Optional[int] = None,
+    latent_gamma_limit: float = 0.15,
+    latent_beta_limit: float = 0.10,
+    sequence_gamma_limit: float = 0.08,
+    sequence_beta_limit: float = 0.05,
 ):
     hidden_dim = max(8, int(hidden_dim))
     dropout = float(max(0.0, dropout))
@@ -713,8 +739,8 @@ def _build_regime_conditioning_modules(
             conditioning_dim=hidden_dim,
             hidden_dim=hidden_dim,
             dropout=dropout,
-            gamma_limit=0.15,
-            beta_limit=0.10,
+            gamma_limit=float(max(0.0, latent_gamma_limit)),
+            beta_limit=float(max(0.0, latent_beta_limit)),
             name=f"{name}_regime_film",
         )
         if sequence_film_feature_dim is not None and int(sequence_film_feature_dim) > 0:
@@ -723,8 +749,8 @@ def _build_regime_conditioning_modules(
                 conditioning_dim=hidden_dim,
                 hidden_dim=max(8, hidden_dim // 2),
                 dropout=0.0,
-                gamma_limit=0.08,
-                beta_limit=0.05,
+                gamma_limit=float(max(0.0, sequence_gamma_limit)),
+                beta_limit=float(max(0.0, sequence_beta_limit)),
                 name=f"{name}_regime_sequence_film",
             )
     else:
@@ -762,6 +788,26 @@ def _apply_regime_conditioning(
     if regime_dropout is not None:
         fused = regime_dropout(fused, training=training)
     return fused
+
+
+def _prefix_modulation_stats(prefix: str, stats: Dict[str, float]) -> Dict[str, float]:
+    if not stats:
+        return {}
+    return {f"{prefix}_{key}": float(value) for key, value in stats.items()}
+
+
+def _merge_modulation_stats(*stats_dicts: Dict[str, float]) -> Dict[str, float]:
+    valid_stats = [stats for stats in stats_dicts if stats]
+    if not valid_stats:
+        return {}
+
+    merged: Dict[str, float] = {}
+    all_keys = set().union(*(stats.keys() for stats in valid_stats))
+    for key in all_keys:
+        values = [float(stats[key]) for stats in valid_stats if key in stats]
+        if values:
+            merged[key] = float(np.mean(values))
+    return merged
 
 
 # ============================================================================
@@ -1905,6 +1951,8 @@ class TCNFusionActor(DirichletActor):
         self.gate_layer = layers.Dense(self.fusion_embed_dim, activation="sigmoid", name=f"{name}_gate")
         self.regime_encoder = None
         self.regime_sequence_encoder = None
+        self.regime_sequence_film_layer = None
+        self.regime_context_sequence_film_layer = None
         self.regime_fusion = None
         self.regime_dropout = None
         self.regime_film_layer = None
@@ -1914,7 +1962,7 @@ class TCNFusionActor(DirichletActor):
             self.regime_conditioning_mode = str(rc_mode).lower().strip()
             (
                 self.regime_sequence_encoder,
-                _,
+                self.regime_sequence_film_layer,
                 self.regime_film_layer,
                 self.regime_fusion,
                 self.regime_dropout,
@@ -1924,7 +1972,22 @@ class TCNFusionActor(DirichletActor):
                 hidden_dim=max(8, int(regime_conditioning_hidden_dim)),
                 dropout=float(max(0.0, regime_conditioning_dropout)),
                 mode=self.regime_conditioning_mode,
+                sequence_film_feature_dim=self.per_asset_dim,
+                latent_gamma_limit=0.25,
+                latent_beta_limit=0.15,
+                sequence_gamma_limit=0.12,
+                sequence_beta_limit=0.08,
             )
+            if self.regime_conditioning_mode == "film" and self.global_feature_dim > 0:
+                self.regime_context_sequence_film_layer = FiLMLayer(
+                    feature_dim=self.global_feature_dim,
+                    conditioning_dim=max(8, int(regime_conditioning_hidden_dim)),
+                    hidden_dim=max(8, int(regime_conditioning_hidden_dim // 2) or 8),
+                    dropout=0.0,
+                    gamma_limit=0.12,
+                    beta_limit=0.08,
+                    name=f"{name}_regime_context_sequence_film",
+                )
 
         # Market-relative FiLM: condition on each asset's relative strength vs peers
         # Conditioning signal = (asset_tcn_output - market_mean) + identity_embed
@@ -2145,7 +2208,6 @@ class TCNFusionActor(DirichletActor):
         return x
 
     def call(self, state, training=None):
-        regime_seq = self._build_regime_sequence(state)
         if isinstance(state, dict):
             structured_assets = self._align_asset_tensor(state.get("asset"))
             batch = tf.shape(structured_assets)[0]
@@ -2184,6 +2246,17 @@ class TCNFusionActor(DirichletActor):
                     timesteps=timesteps,
                     fallback=x_local,
                 )
+
+        regime_embedding = None
+        if self.regime_conditioning_enabled and self.regime_sequence_encoder is not None:
+            regime_seq = self._build_regime_sequence(state)
+            regime_embedding = self.regime_sequence_encoder(regime_seq, training=training)
+
+        if regime_embedding is not None and self.regime_sequence_film_layer is not None:
+            asset_regime_embedding = tf.repeat(regime_embedding, repeats=self.num_assets, axis=0)
+            x_assets = self.regime_sequence_film_layer(x_assets, asset_regime_embedding, training=training)
+        if regime_embedding is not None and self.regime_context_sequence_film_layer is not None:
+            context_seq = self.regime_context_sequence_film_layer(context_seq, regime_embedding, training=training)
 
         # --- Per-asset TCN encoding (shared weights) ---
         for block in self.asset_tcn_blocks:
@@ -2239,29 +2312,25 @@ class TCNFusionActor(DirichletActor):
             fused = gate * asset_context + (1.0 - gate) * global_context
 
         # --- Regime conditioning ---
-        if self.regime_conditioning_enabled:
-            regime_embedding = None
-            if self.regime_sequence_encoder is not None:
-                regime_embedding = self.regime_sequence_encoder(regime_seq, training=training)
-            if regime_embedding is not None:
-                if self.per_asset_alpha_head_enabled:
-                    x_assets = _apply_regime_conditioning(
-                        x_assets,
-                        regime_embedding,
-                        regime_film_layer=self.regime_film_layer,
-                        regime_fusion=self.regime_fusion,
-                        regime_dropout=self.regime_dropout,
-                        training=training,
-                    )
-                else:
-                    fused = _apply_regime_conditioning(
-                        fused,
-                        regime_embedding,
-                        regime_film_layer=self.regime_film_layer,
-                        regime_fusion=self.regime_fusion,
-                        regime_dropout=self.regime_dropout,
-                        training=training,
-                    )
+        if regime_embedding is not None:
+            if self.per_asset_alpha_head_enabled:
+                x_assets = _apply_regime_conditioning(
+                    x_assets,
+                    regime_embedding,
+                    regime_film_layer=self.regime_film_layer,
+                    regime_fusion=self.regime_fusion,
+                    regime_dropout=self.regime_dropout,
+                    training=training,
+                )
+            else:
+                fused = _apply_regime_conditioning(
+                    fused,
+                    regime_embedding,
+                    regime_film_layer=self.regime_film_layer,
+                    regime_fusion=self.regime_fusion,
+                    regime_dropout=self.regime_dropout,
+                    training=training,
+                )
 
         # --- Market-relative FiLM: condition on relative strength vs peers ---
         if self.asset_film_layer is not None:
@@ -2374,14 +2443,33 @@ class TCNFusionActor(DirichletActor):
 
     def get_film_diagnostics(self, state) -> Dict[str, float]:
         diagnostics: Dict[str, float] = {}
-        if self.regime_conditioning_enabled and self.regime_sequence_encoder is not None:
-            regime_seq = self._build_regime_sequence(state)
-            regime_embedding = self.regime_sequence_encoder(regime_seq, training=False)
-            if self.regime_film_layer is not None:
-                for key, value in self.regime_film_layer.get_modulation_stats(regime_embedding).items():
-                    diagnostics[f"regime_{key}"] = value
-        if self.asset_film_layer is not None:
-            diagnostics["asset_film_enabled"] = 1.0
+        need_refresh = False
+        for film_layer in (
+            self.regime_sequence_film_layer,
+            self.regime_context_sequence_film_layer,
+            self.regime_film_layer,
+            self.asset_film_layer,
+        ):
+            if film_layer is not None and not film_layer.get_last_modulation_stats():
+                need_refresh = True
+                break
+        if need_refresh:
+            try:
+                _ = self(state, training=False)
+            except Exception:
+                return diagnostics
+
+        seq_stats = _merge_modulation_stats(
+            self.regime_sequence_film_layer.get_last_modulation_stats()
+            if self.regime_sequence_film_layer is not None else {},
+            self.regime_context_sequence_film_layer.get_last_modulation_stats()
+            if self.regime_context_sequence_film_layer is not None else {},
+        )
+        diagnostics.update(_prefix_modulation_stats("seq", seq_stats))
+        latent_stats = self.regime_film_layer.get_last_modulation_stats() if self.regime_film_layer is not None else {}
+        diagnostics.update(_prefix_modulation_stats("latent", latent_stats))
+        asset_stats = self.asset_film_layer.get_last_modulation_stats() if self.asset_film_layer is not None else {}
+        diagnostics.update(_prefix_modulation_stats("asset", asset_stats))
         return diagnostics
 
 
@@ -3051,6 +3139,8 @@ class TCNFusionCritic(Model):
         self.gate_layer = layers.Dense(self.fusion_embed_dim, activation="sigmoid", name=f"{name}_gate")
         self.regime_encoder = None
         self.regime_sequence_encoder = None
+        self.regime_sequence_film_layer = None
+        self.regime_context_sequence_film_layer = None
         self.regime_fusion = None
         self.regime_dropout = None
         self.regime_film_layer = None
@@ -3060,7 +3150,7 @@ class TCNFusionCritic(Model):
             self.regime_conditioning_mode = str(rc_mode).lower().strip()
             (
                 self.regime_sequence_encoder,
-                _,
+                self.regime_sequence_film_layer,
                 self.regime_film_layer,
                 self.regime_fusion,
                 self.regime_dropout,
@@ -3070,7 +3160,22 @@ class TCNFusionCritic(Model):
                 hidden_dim=max(8, int(regime_conditioning_hidden_dim)),
                 dropout=float(max(0.0, regime_conditioning_dropout)),
                 mode=self.regime_conditioning_mode,
+                sequence_film_feature_dim=self.per_asset_dim,
+                latent_gamma_limit=0.25,
+                latent_beta_limit=0.15,
+                sequence_gamma_limit=0.12,
+                sequence_beta_limit=0.08,
             )
+            if self.regime_conditioning_mode == "film" and self.global_feature_dim > 0:
+                self.regime_context_sequence_film_layer = FiLMLayer(
+                    feature_dim=self.global_feature_dim,
+                    conditioning_dim=max(8, int(regime_conditioning_hidden_dim)),
+                    hidden_dim=max(8, int(regime_conditioning_hidden_dim // 2) or 8),
+                    dropout=0.0,
+                    gamma_limit=0.12,
+                    beta_limit=0.08,
+                    name=f"{name}_regime_context_sequence_film",
+                )
 
         output_units = self.distributional_num_quantiles if self.distributional_critic_enabled else 1
         self.output_layer = layers.Dense(output_units, activation=None, kernel_initializer="orthogonal", name=f"{name}_output")
@@ -3169,6 +3274,15 @@ class TCNFusionCritic(Model):
                 )
             regime_seq = x
 
+        regime_embedding = None
+        if self.regime_conditioning_enabled and self.regime_sequence_encoder is not None:
+            regime_embedding = self.regime_sequence_encoder(regime_seq, training=training)
+        if regime_embedding is not None and self.regime_sequence_film_layer is not None:
+            asset_regime_embedding = tf.repeat(regime_embedding, repeats=self.num_assets, axis=0)
+            x_assets = self.regime_sequence_film_layer(x_assets, asset_regime_embedding, training=training)
+        if regime_embedding is not None and self.regime_context_sequence_film_layer is not None:
+            context_seq = self.regime_context_sequence_film_layer(context_seq, regime_embedding, training=training)
+
         # --- Per-asset TCN encoding (shared weights) ---
         for block in self.asset_tcn_blocks:
             x_assets = block(x_assets, training=training)
@@ -3216,19 +3330,15 @@ class TCNFusionCritic(Model):
             fused = gate * asset_context + (1.0 - gate) * global_context
 
         # --- Regime conditioning ---
-        if self.regime_conditioning_enabled:
-            regime_embedding = None
-            if self.regime_sequence_encoder is not None:
-                regime_embedding = self.regime_sequence_encoder(regime_seq, training=training)
-            if regime_embedding is not None:
-                fused = _apply_regime_conditioning(
-                    fused,
-                    regime_embedding,
-                    regime_film_layer=self.regime_film_layer,
-                    regime_fusion=self.regime_fusion,
-                    regime_dropout=self.regime_dropout,
-                    training=training,
-                )
+        if regime_embedding is not None:
+            fused = _apply_regime_conditioning(
+                fused,
+                regime_embedding,
+                regime_film_layer=self.regime_film_layer,
+                regime_fusion=self.regime_fusion,
+                regime_dropout=self.regime_dropout,
+                training=training,
+            )
 
         return self.output_layer(fused, training=training)
 

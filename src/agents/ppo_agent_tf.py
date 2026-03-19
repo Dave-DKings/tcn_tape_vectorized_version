@@ -2271,6 +2271,9 @@ class PPOAgentTF:
             'film_regime_gamma_delta_abs_mean': 0.0,
             'film_regime_beta_abs_mean': 0.0,
             'film_regime_gamma_sat_frac': 0.0,
+            'film_asset_gamma_delta_abs_mean': 0.0,
+            'film_asset_beta_abs_mean': 0.0,
+            'film_asset_gamma_sat_frac': 0.0,
             # NEW: PPO ratio statistics
             'ratio_mean': 0.0,
             'ratio_std': 0.0,
@@ -2429,6 +2432,9 @@ class PPOAgentTF:
                     stats['film_regime_gamma_delta_abs_mean'] += float(film_diag.get('regime_gamma_delta_abs_mean', 0.0))
                     stats['film_regime_beta_abs_mean'] += float(film_diag.get('regime_beta_abs_mean', 0.0))
                     stats['film_regime_gamma_sat_frac'] += float(film_diag.get('regime_gamma_sat_frac', 0.0))
+                    stats['film_asset_gamma_delta_abs_mean'] += float(film_diag.get('asset_gamma_delta_abs_mean', 0.0))
+                    stats['film_asset_beta_abs_mean'] += float(film_diag.get('asset_beta_abs_mean', 0.0))
+                    stats['film_asset_gamma_sat_frac'] += float(film_diag.get('asset_gamma_sat_frac', 0.0))
                 if self.mixture_dirichlet_enabled:
                     valid_components = np.asarray(batch_mixture_components_old.numpy(), dtype=np.int32)
                     valid_components = valid_components[(valid_components >= 0) & (valid_components < self.mixture_dirichlet_num_components)]
@@ -2487,6 +2493,7 @@ class PPOAgentTF:
                        'film_seq_gamma_delta_abs_mean', 'film_seq_beta_abs_mean', 'film_seq_gamma_sat_frac',
                        'film_latent_gamma_delta_abs_mean', 'film_latent_beta_abs_mean', 'film_latent_gamma_sat_frac',
                        'film_regime_gamma_delta_abs_mean', 'film_regime_beta_abs_mean', 'film_regime_gamma_sat_frac',
+                       'film_asset_gamma_delta_abs_mean', 'film_asset_beta_abs_mean', 'film_asset_gamma_sat_frac',
                        'ratio_mean', 'ratio_std', 'approx_kl', 'clip_fraction', 'value_clip_fraction']:
                 stats[key] /= num_updates
             stats['alpha_per_asset'] /= num_updates

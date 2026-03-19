@@ -2528,6 +2528,50 @@ def run_experiment6_tape(
                 return float(np.clip(beta_value, 0.0, 1.0))
         return train_action_execution_beta_default
 
+    raw_reward_component_schedule = training_params.get("reward_component_schedule", [])
+    reward_component_schedule: List[Dict[str, Any]] = []
+    if isinstance(raw_reward_component_schedule, list):
+        for entry in raw_reward_component_schedule:
+            if not isinstance(entry, dict):
+                continue
+            reward_component_schedule.append(
+                {
+                    "threshold": int(entry.get("threshold", 0)),
+                    "phase": str(entry.get("phase", f"phase_{len(reward_component_schedule)}")),
+                    "enable_base_reward": bool(entry.get("enable_base_reward", True)),
+                    "enable_dsr_reward": bool(entry.get("enable_dsr_reward", True)),
+                    "enable_turnover_penalty": bool(entry.get("enable_turnover_penalty", True)),
+                    "enable_benchmark_shaping": bool(entry.get("enable_benchmark_shaping", True)),
+                    "enable_terminal_tape_bonus": bool(entry.get("enable_terminal_tape_bonus", True)),
+                }
+            )
+    if not reward_component_schedule:
+        reward_component_schedule = [
+            {
+                "threshold": 0,
+                "phase": "full_objective",
+                "enable_base_reward": True,
+                "enable_dsr_reward": True,
+                "enable_turnover_penalty": True,
+                "enable_benchmark_shaping": True,
+                "enable_terminal_tape_bonus": True,
+            }
+        ]
+    reward_component_schedule = sorted(reward_component_schedule, key=lambda entry: int(entry["threshold"]))
+    if reward_component_schedule[0]["threshold"] != 0:
+        phase0 = copy.deepcopy(reward_component_schedule[0])
+        phase0["threshold"] = 0
+        reward_component_schedule.insert(0, phase0)
+
+    def get_current_reward_component_flags(current_timestep: int) -> Dict[str, Any]:
+        current = reward_component_schedule[0]
+        for entry in reward_component_schedule:
+            if current_timestep >= int(entry["threshold"]):
+                current = entry
+            else:
+                break
+        return copy.deepcopy(current)
+
     update_log_interval = int(training_params.get("update_log_interval", 1))
     alpha_diversity_log_interval = max(1, int(training_params.get("alpha_diversity_log_interval", 10)))
     alpha_diversity_warning_after_updates = int(
@@ -2561,6 +2605,18 @@ def run_experiment6_tape(
         f"(beta={action_execution_beta_display}, w_exec=(1-β)w_prev + βw_raw)"
     )
     print(f"      ↳ Schedule: {action_execution_schedule_pretty}")
+    print(f"   🧭 Reward Component Curriculum:")
+    for entry in reward_component_schedule:
+        print(
+            "      "
+            f"{int(entry['threshold']):,}+ steps: "
+            f"{entry['phase']} | "
+            f"base={bool(entry['enable_base_reward'])} "
+            f"dsr={bool(entry['enable_dsr_reward'])} "
+            f"turnover={bool(entry['enable_turnover_penalty'])} "
+            f"benchmark={bool(entry['enable_benchmark_shaping'])} "
+            f"terminal={bool(entry['enable_terminal_tape_bonus'])}"
+        )
     print(f"   ⚡ Parallel rollout envs: {num_parallel_envs}")
     if parallel_rollout_enabled:
         print("      ↳ Vectorized rollout collection enabled")
@@ -2796,6 +2852,7 @@ def run_experiment6_tape(
         print("   [WARN] volatility_regime unavailable after preparation; sampling will fall back to uniform starts.")
 
     def _create_train_env() -> PortfolioEnvTAPE:
+        initial_reward_flags = get_current_reward_component_flags(0)
         env_obj = PortfolioEnvTAPE(
             config=config,
             data_processor=data_processor,
@@ -2818,7 +2875,11 @@ def run_experiment6_tape(
             target_turnover=target_turnover_cfg,
             turnover_target_band=turnover_band_cfg,
             action_execution_beta=get_current_action_execution_beta(0),
-            enable_base_reward=True,
+            enable_base_reward=bool(initial_reward_flags.get("enable_base_reward", True)),
+            enable_dsr_reward=bool(initial_reward_flags.get("enable_dsr_reward", True)),
+            enable_turnover_penalty=bool(initial_reward_flags.get("enable_turnover_penalty", True)),
+            enable_benchmark_shaping=bool(initial_reward_flags.get("enable_benchmark_shaping", True)),
+            enable_terminal_tape_bonus=bool(initial_reward_flags.get("enable_terminal_tape_bonus", True)),
             turnover_penalty_scalar=train_turnover_default,
             gamma=gamma_cfg,
             episode_length_limit=episode_horizon_start,
@@ -4737,6 +4798,7 @@ def run_experiment6_tape(
             "target_turnover": target_turnover_cfg,
             "turnover_target_band": turnover_band_cfg,
             "action_execution_beta": train_action_execution_beta_default,
+            "reward_component_schedule": copy.deepcopy(reward_component_schedule),
             "tape_terminal_scalar": tape_terminal_scalar,
             "tape_terminal_clip": tape_terminal_clip,
             "tape_terminal_bonus_mode": tape_terminal_bonus_mode,
@@ -4796,6 +4858,7 @@ def run_experiment6_tape(
     last_tape_bonus_clipped = False
     current_turnover_scalar = get_current_turnover_scalar(0)
     current_action_execution_beta = get_current_action_execution_beta(0)
+    current_reward_component_flags = get_current_reward_component_flags(0)
 
     episode_terminal_info = None
     metrics_for_update = None
@@ -5446,6 +5509,30 @@ def run_experiment6_tape(
                 "(w_exec=(1-β)w_prev + βw_raw)"
             )
 
+        new_reward_component_flags = get_current_reward_component_flags(step)
+        if new_reward_component_flags != current_reward_component_flags:
+            current_reward_component_flags = new_reward_component_flags
+            for train_env in train_envs:
+                train_env.set_reward_component_flags(
+                    enable_base_reward=bool(current_reward_component_flags.get("enable_base_reward", True)),
+                    enable_dsr_reward=bool(current_reward_component_flags.get("enable_dsr_reward", True)),
+                    enable_turnover_penalty=bool(current_reward_component_flags.get("enable_turnover_penalty", True)),
+                    enable_benchmark_shaping=bool(current_reward_component_flags.get("enable_benchmark_shaping", True)),
+                    enable_terminal_tape_bonus=bool(
+                        current_reward_component_flags.get("enable_terminal_tape_bonus", True)
+                    ),
+                )
+            print(f"\n🧭 REWARD PHASE UPDATE at {step:,} steps:")
+            print(
+                "   "
+                f"{current_reward_component_flags.get('phase', 'unknown')} | "
+                f"base={bool(current_reward_component_flags.get('enable_base_reward', True))} "
+                f"dsr={bool(current_reward_component_flags.get('enable_dsr_reward', True))} "
+                f"turnover={bool(current_reward_component_flags.get('enable_turnover_penalty', True))} "
+                f"benchmark={bool(current_reward_component_flags.get('enable_benchmark_shaping', True))} "
+                f"terminal={bool(current_reward_component_flags.get('enable_terminal_tape_bonus', True))}"
+            )
+
         if use_episode_length_curriculum:
             new_episode_limit = determine_episode_limit(step, env_train.total_days)
             if new_episode_limit != current_episode_limit:
@@ -5857,23 +5944,28 @@ def run_experiment6_tape(
                 film_regime_gamma_delta = float(update_metrics.get("film_regime_gamma_delta_abs_mean", 0.0) or 0.0)
                 film_regime_beta = float(update_metrics.get("film_regime_beta_abs_mean", 0.0) or 0.0)
                 film_regime_sat = float(update_metrics.get("film_regime_gamma_sat_frac", 0.0) or 0.0)
-                if any(
-                    v > 0.0
-                    for v in (
-                        film_seq_gamma_delta,
-                        film_seq_beta,
-                        film_latent_gamma_delta,
-                        film_latent_beta,
-                        film_regime_gamma_delta,
-                        film_regime_beta,
+                film_asset_gamma_delta = float(update_metrics.get("film_asset_gamma_delta_abs_mean", 0.0) or 0.0)
+                film_asset_beta = float(update_metrics.get("film_asset_beta_abs_mean", 0.0) or 0.0)
+                film_asset_sat = float(update_metrics.get("film_asset_gamma_sat_frac", 0.0) or 0.0)
+                film_parts = []
+                if any(v > 0.0 for v in (film_seq_gamma_delta, film_seq_beta)):
+                    film_parts.append(
+                        f"seq(dg={film_seq_gamma_delta:.4f}, db={film_seq_beta:.4f}, sat={film_seq_sat:.1%})"
                     )
-                ):
-                    print(
-                        "   🧬 FiLM: "
-                        f"seq(dg={film_seq_gamma_delta:.4f}, db={film_seq_beta:.4f}, sat={film_seq_sat:.1%}) | "
-                        f"latent(dg={film_latent_gamma_delta:.4f}, db={film_latent_beta:.4f}, sat={film_latent_sat:.1%}) | "
+                if any(v > 0.0 for v in (film_latent_gamma_delta, film_latent_beta)):
+                    film_parts.append(
+                        f"latent(dg={film_latent_gamma_delta:.4f}, db={film_latent_beta:.4f}, sat={film_latent_sat:.1%})"
+                    )
+                if any(v > 0.0 for v in (film_regime_gamma_delta, film_regime_beta)):
+                    film_parts.append(
                         f"regime(dg={film_regime_gamma_delta:.4f}, db={film_regime_beta:.4f}, sat={film_regime_sat:.1%})"
                     )
+                if any(v > 0.0 for v in (film_asset_gamma_delta, film_asset_beta)):
+                    film_parts.append(
+                        f"asset(dg={film_asset_gamma_delta:.4f}, db={film_asset_beta:.4f}, sat={film_asset_sat:.1%})"
+                    )
+                if film_parts:
+                    print("   🧬 FiLM: " + " | ".join(film_parts))
                 if _regime_sampling_enabled:
                     regime_total_samples, regime_counts = _aggregate_regime_sampling_stats(train_envs)
                     if regime_total_samples > 0 and regime_counts:

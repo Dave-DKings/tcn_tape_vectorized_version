@@ -1625,9 +1625,116 @@ RUN17_EXPANDED_OVERRIDES.update(
         "NUM_ASSETS": 20,
     }
 )
+RUN17_EXPANDED_OVERRIDES["agent_params"].update(
+    {
+        # Wider Dirichlet range is needed once the action simplex expands to 20 assets + cash.
+        "dirichlet_alpha_cap": 50.0,
+        "dirichlet_exp_tanh_scale": 5.0,
+    }
+)
+RUN17_EXPANDED_OVERRIDES["agent_params"]["ppo_params"].update(
+    {
+        # Reduce forces toward near-uniform allocations and push harder for cross-sectional spread.
+        "entropy_coef": 0.0015,
+        "risk_aux_mvo_coef": 0.0,
+        "alpha_diversity_coef": 0.002,
+        "alpha_dispersion_coef": 0.10,
+        "alpha_dispersion_target_std": 0.15,
+        "lagrangian_cvar_penalty_scale": 0.0,
+    }
+)
 RUN17_EXPANDED_OVERRIDES["training_params"].update(
     {
         "num_parallel_envs": 8,  # doubled from 4 for 21-dim Dirichlet exploration
+        "ppo_entropy_coef_schedule": [
+            {"threshold": 0, "entropy_coef": 0.0015},
+            {"threshold": 100_000, "entropy_coef": 0.0015},
+            {"threshold": 250_000, "entropy_coef": 0.0010},
+            {"threshold": 400_000, "entropy_coef": 0.0005},
+        ],
+        "action_execution_beta_schedule": [
+            {"threshold": 0, "beta": 0.55},
+            {"threshold": 100_000, "beta": 0.70},
+            {"threshold": 200_000, "beta": 0.85},
+            {"threshold": 300_000, "beta": 1.00},
+        ],
+        "action_execution_beta_curriculum": {
+            0: 0.55,
+            100_000: 0.70,
+            200_000: 0.85,
+            300_000: 1.00,
+        },
+        "evaluation_action_execution_beta": 1.00,
+        "turnover_penalty_curriculum": {
+            0: 0.05,
+            100_000: 0.10,
+            200_000: 0.20,
+            300_000: 0.30,
+            400_000: 0.40,
+        },
+        "evaluation_turnover_penalty_scalar": 0.40,
+        "reward_component_schedule": [
+            {
+                "threshold": 0,
+                "phase": "A_return_only",
+                "enable_base_reward": True,
+                "enable_dsr_reward": False,
+                "enable_turnover_penalty": False,
+                "enable_benchmark_shaping": False,
+                "enable_terminal_tape_bonus": False,
+            },
+            {
+                "threshold": 150_000,
+                "phase": "B_add_risk",
+                "enable_base_reward": True,
+                "enable_dsr_reward": True,
+                "enable_turnover_penalty": False,
+                "enable_benchmark_shaping": True,
+                "enable_terminal_tape_bonus": False,
+            },
+            {
+                "threshold": 300_000,
+                "phase": "C_full_tape",
+                "enable_base_reward": True,
+                "enable_dsr_reward": True,
+                "enable_turnover_penalty": True,
+                "enable_benchmark_shaping": True,
+                "enable_terminal_tape_bonus": True,
+            },
+        ],
+        "training_early_stop_warmup_steps": 200_000,
+        "training_early_stop_min_delta": 0.005,
+        "training_early_stop_patience_updates": 40,
+        # Keep step-triggered artifacts off so training does not spam low-information checkpoints.
+        "step_sharpe_checkpoint_enabled": False,
+    }
+)
+RUN17_EXPANDED_OVERRIDES["environment_params"].update(
+    {
+        "target_turnover": 0.35,
+        "turnover_penalty_scalar": 0.05,
+        "action_execution_beta": 0.55,
+        "action_realization_penalty_scalar": 0.0,
+        "dsr_regime_scaling": {
+            "enabled": True,
+            "vol_window": 21,
+            "low_vol_threshold": 0.12,
+            "high_vol_threshold": 0.25,
+            "low_pos_mult": 0.8,
+            "low_neg_mult": 0.9,
+            "mid_pos_mult": 1.0,
+            "mid_neg_mult": 1.0,
+            "high_pos_mult": 1.25,
+            "high_neg_mult": 1.25,
+        },
+        "outperformance_bonus_enabled": True,
+        "outperformance_bonus_scalar": 6.0,
+        "outperformance_bonus_mode": "signed_clipped",
+        "outperformance_bonus_clip": 0.02,
+        "spy_outperformance_bonus_enabled": True,
+        "spy_outperformance_bonus_scalar": 1.5,
+        "spy_outperformance_bonus_mode": "signed_clipped",
+        "spy_outperformance_bonus_clip": 0.01,
     }
 )
 
@@ -2011,10 +2118,15 @@ def assert_run10_alpha_config(config: dict) -> None:
     assert bool(agent.get("regime_conditioning_enabled", False)), "regime_conditioning_enabled must stay on"
     assert str(agent.get("regime_conditioning_mode", "concat")).lower() == "film", "regime_conditioning_mode must be film"
     assert bool(agent.get("distributional_critic_enabled", False)), "distributional_critic_enabled must stay on"
-    assert float(ppo.get("risk_aux_mvo_coef", 0.0)) >= 0.002, "risk_aux_mvo_coef drifted below the Run10 floor"
+    assert float(agent.get("dirichlet_alpha_cap", 0.0)) >= 40.0, "dirichlet_alpha_cap drifted below the large-universe floor"
+    assert float(agent.get("dirichlet_exp_tanh_scale", 0.0)) >= 5.0, "dirichlet_exp_tanh_scale drifted below the large-universe floor"
+    assert float(ppo.get("risk_aux_mvo_coef", 1.0)) == 0.0, "risk_aux_mvo_coef must stay off for Run17"
     assert float(ppo.get("risk_aux_cvar_coef", 0.0)) == 0.0, "step-level CVaR aux must stay off"
     assert not bool(env.get("episode_cvar_enabled", False)), "episode_cvar_enabled must stay off"
     assert bool(ppo.get("lagrangian_cvar_enabled", False)), "lagrangian_cvar_enabled must stay on"
+    assert float(ppo.get("lagrangian_cvar_penalty_scale", 1.0)) == 0.0, (
+        "lagrangian_cvar_penalty_scale must stay off for Run17"
+    )
     assert not bool(agent.get("fusion_cross_asset_mixer_enabled", True)), (
         "fusion_cross_asset_mixer_enabled must stay off for the canonical alpha run"
     )
@@ -2678,34 +2790,107 @@ def assert_run17_expanded_config(config: dict) -> None:
     assert int(training.get("periodic_checkpoint_every_steps", 0)) > 0, (
         "periodic checkpoints must stay enabled"
     )
+    assert not bool(training.get("step_sharpe_checkpoint_enabled", True)), (
+        "step_sharpe_checkpoint_enabled must stay off for Run17"
+    )
     assert bool(training.get("training_early_stop_enabled", False)), (
         "training_early_stop_enabled must stay on"
     )
-    assert float(ppo.get("entropy_coef", 1.0)) <= 0.003, "base entropy must stay in the low-entropy regime"
-    assert float(ppo.get("alpha_dispersion_coef", 0.0)) >= 0.05, "alpha_dispersion_coef drifted below the calibrated floor"
+    assert float(ppo.get("entropy_coef", 1.0)) <= 0.0015, "base entropy must stay in the sharpened low-entropy regime"
+    assert float(ppo.get("alpha_diversity_coef", 1.0)) <= 0.002, "alpha_diversity_coef drifted above the anti-collapse ceiling"
+    assert float(ppo.get("alpha_dispersion_coef", 0.0)) >= 0.10, "alpha_dispersion_coef drifted below the large-universe floor"
+    assert float(ppo.get("alpha_dispersion_target_std", 0.0)) >= 0.15, (
+        "alpha_dispersion_target_std drifted below the large-universe floor"
+    )
     assert float(ppo.get("aux_return_pred_coef", 0.0)) >= 0.25, "aux_return_pred_coef drifted below the calibrated floor"
     assert not bool(feature_params.get("actuarial_params", {}).get("enabled", False)), (
         "Run17 actuarial features must stay disabled"
     )
 
-    # ── Curriculum schedule assertions (inherited from Run10) ──
-    expected_turnover = copy.deepcopy(RUN10_ALPHA_OVERRIDES["training_params"]["turnover_penalty_curriculum"])
+    # ── Curriculum schedule assertions (canonical Run17) ──
+    assert float(env.get("target_turnover", 0.0)) == 0.35, "target_turnover must stay at the aligned Run17 ceiling"
+    assert float(env.get("turnover_penalty_scalar", 1.0)) == 0.05, (
+        "environment turnover_penalty_scalar must stay at the aligned Run17 bootstrap level"
+    )
+    assert float(env.get("action_execution_beta", 0.0)) == 0.55, (
+        "environment action_execution_beta must stay at the aligned Run17 bootstrap value"
+    )
+    assert float(env.get("action_realization_penalty_scalar", 1.0)) == 0.0, (
+        "action_realization_penalty_scalar must stay off for Run17"
+    )
+    dsr_regime = env.get("dsr_regime_scaling", {}) if isinstance(env.get("dsr_regime_scaling", {}), dict) else {}
+    assert bool(dsr_regime.get("enabled", False)), "Run17 DSR regime scaling must stay enabled"
+    assert float(dsr_regime.get("low_pos_mult", 0.0)) == 0.8, (
+        "Run17 low-vol positive DSR multiplier must stay at 0.8"
+    )
+    assert float(dsr_regime.get("low_neg_mult", 0.0)) == 0.9, (
+        "Run17 low-vol negative DSR multiplier must stay at 0.9"
+    )
+    assert float(dsr_regime.get("mid_pos_mult", 0.0)) == 1.0, (
+        "Run17 mid-vol positive DSR multiplier must stay at 1.0"
+    )
+    assert float(dsr_regime.get("mid_neg_mult", 0.0)) == 1.0, (
+        "Run17 mid-vol negative DSR multiplier must stay at 1.0"
+    )
+    assert float(dsr_regime.get("high_pos_mult", 0.0)) == 1.25, (
+        "Run17 high-vol positive DSR multiplier must stay at 1.25"
+    )
+    assert float(dsr_regime.get("high_neg_mult", 0.0)) == 1.25, (
+        "Run17 high-vol negative DSR multiplier must stay at 1.25"
+    )
+    assert bool(env.get("outperformance_bonus_enabled", False)), (
+        "Run17 must keep equal-weight benchmark shaping enabled"
+    )
+    assert float(env.get("outperformance_bonus_scalar", 0.0)) == 6.0, (
+        "Run17 equal-weight benchmark shaping scalar must stay at 6.0"
+    )
+    assert str(env.get("outperformance_bonus_mode", "")).lower() == "signed_clipped", (
+        "Run17 equal-weight benchmark shaping must stay signed_clipped"
+    )
+    assert float(env.get("outperformance_bonus_clip", 0.0)) == 0.02, (
+        "Run17 equal-weight benchmark shaping clip must stay at 0.02"
+    )
+    assert bool(env.get("spy_outperformance_bonus_enabled", False)), (
+        "Run17 must keep SPY benchmark shaping enabled"
+    )
+    assert float(env.get("spy_outperformance_bonus_scalar", 0.0)) == 1.5, (
+        "Run17 SPY benchmark shaping scalar must stay at 1.5"
+    )
+    assert str(env.get("spy_outperformance_bonus_mode", "")).lower() == "signed_clipped", (
+        "Run17 SPY benchmark shaping must stay signed_clipped"
+    )
+    assert float(env.get("spy_outperformance_bonus_clip", 0.0)) == 0.01, (
+        "Run17 SPY benchmark shaping clip must stay at 0.01"
+    )
+
+    expected_turnover = copy.deepcopy(RUN17_EXPANDED_OVERRIDES["training_params"]["turnover_penalty_curriculum"])
     actual_turnover = {
         int(threshold): float(value)
         for threshold, value in dict(training.get("turnover_penalty_curriculum", {})).items()
     }
-    assert actual_turnover == expected_turnover, "turnover_penalty_curriculum drifted from the canonical Run10 schedule"
+    assert actual_turnover == expected_turnover, "turnover_penalty_curriculum drifted from the canonical Run17 schedule"
 
-    expected_beta = copy.deepcopy(RUN10_ALPHA_OVERRIDES["training_params"]["action_execution_beta_curriculum"])
+    expected_beta = copy.deepcopy(RUN17_EXPANDED_OVERRIDES["training_params"]["action_execution_beta_curriculum"])
     actual_beta = {
         int(threshold): float(value)
         for threshold, value in dict(training.get("action_execution_beta_curriculum", {})).items()
     }
-    assert actual_beta == expected_beta, "action_execution_beta_curriculum drifted from the canonical Run10 schedule"
+    assert actual_beta == expected_beta, "action_execution_beta_curriculum drifted from the canonical Run17 schedule"
+    assert float(training.get("evaluation_action_execution_beta", 0.0)) == 1.0, (
+        "evaluation_action_execution_beta must stay at 1.0 for unsmoothed evaluation"
+    )
+    assert float(training.get("evaluation_turnover_penalty_scalar", 0.0)) == 0.40, (
+        "evaluation_turnover_penalty_scalar must stay aligned with the late Run17 curriculum"
+    )
 
-    expected_entropy = copy.deepcopy(RUN10_ALPHA_OVERRIDES["training_params"]["ppo_entropy_coef_schedule"])
+    expected_entropy = copy.deepcopy(RUN17_EXPANDED_OVERRIDES["training_params"]["ppo_entropy_coef_schedule"])
     actual_entropy = copy.deepcopy(training.get("ppo_entropy_coef_schedule", []))
-    assert actual_entropy == expected_entropy, "ppo_entropy_coef_schedule drifted from the canonical Run10 schedule"
+    assert actual_entropy == expected_entropy, "ppo_entropy_coef_schedule drifted from the canonical Run17 schedule"
+    expected_reward_schedule = copy.deepcopy(RUN17_EXPANDED_OVERRIDES["training_params"]["reward_component_schedule"])
+    actual_reward_schedule = copy.deepcopy(training.get("reward_component_schedule", []))
+    assert actual_reward_schedule == expected_reward_schedule, (
+        "reward_component_schedule drifted from the canonical Run17 schedule"
+    )
 
     expected_aux_return_coef_schedule = copy.deepcopy(
         RUN10_ALPHA_OVERRIDES["training_params"]["aux_return_pred_coef_schedule"]

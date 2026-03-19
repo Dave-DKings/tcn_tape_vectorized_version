@@ -122,6 +122,10 @@ class PortfolioEnvTAPE(gym.Env):
                  action_execution_beta: float = 1.0,
                  gamma: float = 0.99,
                  enable_base_reward: bool = True,
+                 enable_dsr_reward: bool = True,
+                 enable_turnover_penalty: bool = True,
+                 enable_benchmark_shaping: bool = True,
+                 enable_terminal_tape_bonus: bool = True,
                  drawdown_constraint: Optional[Dict[str, Any]] = None):
         """
         Initialize the TAPE-style Portfolio Environment with optional TAPE reward system.
@@ -200,6 +204,11 @@ class PortfolioEnvTAPE(gym.Env):
             gamma: Discount factor for PBRS (Potential-Based Reward Shaping) (default: 0.99)
                 - Used in DSR formula: R_shaped = R + gamma * P(s') - P(s)
                 - Only used when reward_system='tape'
+            enable_base_reward: Whether to include the base return term in the step reward.
+            enable_dsr_reward: Whether to include the DSR/PBRS term in the step reward.
+            enable_turnover_penalty: Whether to include the turnover ceiling penalty.
+            enable_benchmark_shaping: Whether to include equal-weight / SPY relative shaping.
+            enable_terminal_tape_bonus: Whether to replace the final-step reward with terminal TAPE bonus.
         """
         super().__init__()
         
@@ -256,8 +265,12 @@ class PortfolioEnvTAPE(gym.Env):
             self.turnover_penalty_scalar = turnover_penalty_scalar
             self.turnover_target_band = float(max(0.0, turnover_target_band))
             self.gamma = gamma
-            # Toggle for Component 1 (Base Reward)
-            self.enable_base_reward = enable_base_reward
+            # Runtime gating for staged reward curricula.
+            self.enable_base_reward = bool(enable_base_reward)
+            self.enable_dsr_reward = bool(enable_dsr_reward)
+            self.enable_turnover_penalty = bool(enable_turnover_penalty)
+            self.enable_benchmark_shaping = bool(enable_benchmark_shaping)
+            self.enable_terminal_tape_bonus = bool(enable_terminal_tape_bonus)
             # Clip terminal bonus to keep reward scale aligned with daily rewards
             if self.tape_terminal_clip is not None:
                 self.tape_terminal_clip = float(self.tape_terminal_clip)
@@ -288,7 +301,12 @@ class PortfolioEnvTAPE(gym.Env):
                     f"(Sharpe <= {self.tape_terminal_gate_a_sharpe_threshold:.3f} "
                     f"or MDD >= {self.tape_terminal_gate_a_max_drawdown*100:.2f}% -> force non-positive bonus)"
                 )
-            logger.info(f"   Component 1 enabled: {self.enable_base_reward}")
+            logger.info(
+                "   Reward component flags: "
+                f"base={self.enable_base_reward}, dsr={self.enable_dsr_reward}, "
+                f"turnover={self.enable_turnover_penalty}, benchmark={self.enable_benchmark_shaping}, "
+                f"terminal={self.enable_terminal_tape_bonus}"
+            )
         else:
             self.tape_profile = None
             self.tape_terminal_scalar = None
@@ -306,6 +324,11 @@ class PortfolioEnvTAPE(gym.Env):
             self.turnover_target_band = None
             self.gamma = None
             self.tape_terminal_clip = None
+            self.enable_base_reward = True
+            self.enable_dsr_reward = False
+            self.enable_turnover_penalty = False
+            self.enable_benchmark_shaping = False
+            self.enable_terminal_tape_bonus = False
         
         # Terminal reward metric (only used for 'simple' reward system)
         self.terminal_reward_metric = terminal_reward_metric.lower()
@@ -1145,6 +1168,27 @@ class PortfolioEnvTAPE(gym.Env):
         """Set execution inertia coefficient used for action smoothing."""
         self.action_execution_beta = float(np.clip(beta, 0.0, 1.0))
 
+    def set_reward_component_flags(
+        self,
+        *,
+        enable_base_reward: Optional[bool] = None,
+        enable_dsr_reward: Optional[bool] = None,
+        enable_turnover_penalty: Optional[bool] = None,
+        enable_benchmark_shaping: Optional[bool] = None,
+        enable_terminal_tape_bonus: Optional[bool] = None,
+    ) -> None:
+        """Update runtime reward-component gates without rebuilding the environment."""
+        if enable_base_reward is not None:
+            self.enable_base_reward = bool(enable_base_reward)
+        if enable_dsr_reward is not None:
+            self.enable_dsr_reward = bool(enable_dsr_reward)
+        if enable_turnover_penalty is not None:
+            self.enable_turnover_penalty = bool(enable_turnover_penalty)
+        if enable_benchmark_shaping is not None:
+            self.enable_benchmark_shaping = bool(enable_benchmark_shaping)
+        if enable_terminal_tape_bonus is not None:
+            self.enable_terminal_tape_bonus = bool(enable_terminal_tape_bonus)
+
     def _compute_intra_step_tape_potential(self) -> Optional[float]:
         """
         Compute a rolling potential proxy used for intra-step TAPE delta shaping.
@@ -1260,7 +1304,7 @@ class PortfolioEnvTAPE(gym.Env):
             self.dsr_history.append(portfolio_return)
             dsr_component = 0.0
             
-            if len(self.dsr_history) >= self.dsr_window:
+            if self.enable_dsr_reward and len(self.dsr_history) >= self.dsr_window:
                 # Buffer is full - calculate current Sharpe ratio
                 returns_arr = np.array(self.dsr_history)
                 current_sharpe = calculate_sharpe_ratio_dsr(returns_arr, trading_days_per_year=252)
@@ -1275,7 +1319,7 @@ class PortfolioEnvTAPE(gym.Env):
                 dsr_component = np.nan_to_num(dsr_component, nan=0.0, posinf=10.0, neginf=-10.0)
 
             # Regime-conditional DSR scaling (asymmetric: separate multipliers for reward vs penalty)
-            if self.dsr_regime_scaling_enabled:
+            if self.enable_dsr_reward and self.dsr_regime_scaling_enabled:
                 pos_mult, neg_mult = self._get_dsr_regime_multiplier()
                 if dsr_component >= 0:
                     dsr_component *= pos_mult
@@ -1289,7 +1333,7 @@ class PortfolioEnvTAPE(gym.Env):
             # Never reward trading — transaction costs in the base return already
             # make the agent want to trade less. This is a safety rail for churning.
             
-            if self.target_turnover_per_step > 0:
+            if self.enable_turnover_penalty and self.target_turnover_per_step > 0:
                 if actual_turnover_this_step > self.target_turnover_per_step:
                     # Proportional penalty for exceeding ceiling
                     excess_ratio = (actual_turnover_this_step - self.target_turnover_per_step) / max(self.target_turnover_per_step, 1e-8)
@@ -1308,7 +1352,7 @@ class PortfolioEnvTAPE(gym.Env):
 
             # Benchmark-relative shaping versus equal-weight.
             outperformance_bonus = 0.0
-            if self.outperformance_bonus_enabled:
+            if self.enable_benchmark_shaping and self.outperformance_bonus_enabled:
                 outperformance = portfolio_return - self._last_equal_weight_return
                 outperformance_bonus = self._shape_benchmark_outperformance(
                     outperformance=outperformance,
@@ -1321,7 +1365,7 @@ class PortfolioEnvTAPE(gym.Env):
 
             # Benchmark-relative shaping versus SPY.
             spy_outperformance_bonus = 0.0
-            if self.spy_outperformance_bonus_enabled:
+            if self.enable_benchmark_shaping and self.spy_outperformance_bonus_enabled:
                 spy_outperformance = portfolio_return - self._last_spy_return
                 spy_outperformance_bonus = self._shape_benchmark_outperformance(
                     outperformance=spy_outperformance,
@@ -1576,36 +1620,43 @@ class PortfolioEnvTAPE(gym.Env):
                             f"to {terminal_bonus:.2f} (clip ±{self.tape_terminal_clip})"
                         )
 
-                # Set terminal reward (no step reward on final step, only bonus)
-                reward = terminal_bonus
-                tape_bonus_final = float(terminal_bonus)
+                # Set terminal reward (no step reward on final step, only bonus) when enabled.
+                if self.enable_terminal_tape_bonus:
+                    reward = terminal_bonus
+                    tape_bonus_final = float(terminal_bonus)
+                else:
+                    tape_bonus_final = 0.0
+                    tape_bonus_raw_final = 0.0
+                    tape_bonus_core_final = 0.0
+                    terminal_bonus = 0.0
 
-                logger.info(f"🎯 TAPE Terminal Bonus")
-                logger.info(
-                    f"   Mode={self.tape_terminal_bonus_mode}, baseline={self.tape_terminal_baseline:.2f}, "
-                    f"TAPE Score={tape_score:.4f}, core={tape_bonus_core_final:.2f}, final={terminal_bonus:.2f}"
-                )
-                if self.episode_cvar_enabled and episode_cvar_passed is not None:
+                if self.enable_terminal_tape_bonus:
+                    logger.info(f"🎯 TAPE Terminal Bonus")
                     logger.info(
-                        f"   Episode CVaR: regime={episode_cvar_regime}, "
-                        f"vol={episode_cvar_vol_ann:.3f}, CVaR={episode_cvar_value:.5f}, "
-                        f"threshold={episode_cvar_threshold:.5f}, passed={episode_cvar_passed}, "
-                        f"bonus={episode_cvar_bonus:.2f}"
+                        f"   Mode={self.tape_terminal_bonus_mode}, baseline={self.tape_terminal_baseline:.2f}, "
+                        f"TAPE Score={tape_score:.4f}, core={tape_bonus_core_final:.2f}, final={terminal_bonus:.2f}"
                     )
-                if tape_neutral_band_applied:
-                    logger.info(
-                        "   Neutral band applied: "
-                        f"|score-baseline| <= {self.tape_terminal_neutral_band_halfwidth:.3f} -> bonus=0"
-                    )
-                if tape_gate_a_triggered:
-                    logger.info(
-                        "   Gate A triggered: forcing non-positive terminal bonus "
-                        f"(Sharpe={gate_sharpe:.3f}, MDD={gate_mdd_abs*100:.2f}%)"
-                    )
-                logger.info(f"   Metrics: Sharpe={episode_metrics.get('sharpe_ratio', 0):.3f}, "
-                          f"Sortino={episode_metrics.get('sortino_ratio', 0):.3f}, "
-                          f"MDD={episode_metrics.get('max_drawdown', 0)*100:.2f}%, "
-                          f"Turnover={episode_metrics.get('turnover', 0)*100:.2f}%, "
+                    if self.episode_cvar_enabled and episode_cvar_passed is not None:
+                        logger.info(
+                            f"   Episode CVaR: regime={episode_cvar_regime}, "
+                            f"vol={episode_cvar_vol_ann:.3f}, CVaR={episode_cvar_value:.5f}, "
+                            f"threshold={episode_cvar_threshold:.5f}, passed={episode_cvar_passed}, "
+                            f"bonus={episode_cvar_bonus:.2f}"
+                        )
+                    if tape_neutral_band_applied:
+                        logger.info(
+                            "   Neutral band applied: "
+                            f"|score-baseline| <= {self.tape_terminal_neutral_band_halfwidth:.3f} -> bonus=0"
+                        )
+                    if tape_gate_a_triggered:
+                        logger.info(
+                            "   Gate A triggered: forcing non-positive terminal bonus "
+                            f"(Sharpe={gate_sharpe:.3f}, MDD={gate_mdd_abs*100:.2f}%)"
+                        )
+                    logger.info(f"   Metrics: Sharpe={episode_metrics.get('sharpe_ratio', 0):.3f}, "
+                              f"Sortino={episode_metrics.get('sortino_ratio', 0):.3f}, "
+                              f"MDD={episode_metrics.get('max_drawdown', 0)*100:.2f}%, "
+                              f"Turnover={episode_metrics.get('turnover', 0)*100:.2f}%, "
                           f"Skew={episode_metrics.get('skewness', 0):.3f}")
                 
                 # Set info values for logging (no retrospective scaling)
@@ -2066,6 +2117,11 @@ class PortfolioEnvTAPE(gym.Env):
             'cash_weight_projected': cash_weight_projected,
             'cash_weight_final': cash_weight_final,
             'cash_weight_forced_gap': cash_weight_forced_gap,
+            'reward_flag_base': bool(self.enable_base_reward),
+            'reward_flag_dsr': bool(self.enable_dsr_reward),
+            'reward_flag_turnover': bool(self.enable_turnover_penalty),
+            'reward_flag_benchmark': bool(self.enable_benchmark_shaping),
+            'reward_flag_terminal': bool(self.enable_terminal_tape_bonus),
         }
         
         return observation, reward, terminated, False, info
