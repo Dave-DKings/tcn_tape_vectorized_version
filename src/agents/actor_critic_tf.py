@@ -839,6 +839,9 @@ class DirichletActor(Model):
     ):
         # Extract custom params before passing kwargs to Keras Layer
         self._exp_tanh_scale = float(kwargs.pop('exp_tanh_scale', 2.5))
+        self._softplus_alpha_floor = float(kwargs.pop('softplus_alpha_floor', 0.0))
+        self._softplus_alpha_scale = float(max(kwargs.pop('softplus_alpha_scale', 1.0), 1e-6))
+        self._cross_sectional_standardize = bool(kwargs.pop('cross_sectional_standardize', False))
         super(DirichletActor, self).__init__(name=name, **kwargs)
         self._epsilon_max_value = float(epsilon_start)
         self._epsilon_min_value = float(epsilon_min)
@@ -965,6 +968,16 @@ class DirichletActor(Model):
             # scale=2.5 -> range [0.08, 12.2], scale=3.5 -> range [0.03, 33.1]
             exp_tanh_scale = getattr(self, '_exp_tanh_scale', 2.5)
             alpha = tf.exp(tf.nn.tanh(scaled_logits) * exp_tanh_scale) + eps
+        elif activation in {"cross_softplus", "cross_sectional_softplus", "cs_softplus"}:
+            centered_logits = scaled_logits - tf.reduce_mean(scaled_logits, axis=-1, keepdims=True)
+            if self._cross_sectional_standardize:
+                centered_scale = tf.math.reduce_std(centered_logits, axis=-1, keepdims=True)
+                centered_logits = centered_logits / tf.maximum(centered_scale, tf.cast(1e-6, centered_logits.dtype))
+            alpha = (
+                tf.cast(self._softplus_alpha_floor, centered_logits.dtype)
+                + tf.nn.softplus(centered_logits * tf.cast(self._softplus_alpha_scale, centered_logits.dtype))
+                + eps
+            )
         else:
             # Default / legacy: softplus + adaptive epsilon
             alpha = tf.nn.softplus(scaled_logits) + eps
@@ -3363,6 +3376,10 @@ def _resolve_dirichlet_epsilon_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
         "epsilon_min": epsilon_min,
         "alpha_activation": alpha_activation,
         "exp_clip": exp_clip,
+        "exp_tanh_scale": float(config.get("dirichlet_exp_tanh_scale", 2.5)),
+        "softplus_alpha_floor": float(config.get("dirichlet_softplus_alpha_floor", 0.0)),
+        "softplus_alpha_scale": float(config.get("dirichlet_softplus_alpha_scale", 1.0)),
+        "cross_sectional_standardize": bool(config.get("dirichlet_cross_sectional_standardize", False)),
         # New parameters
         "logit_temperature": float(config.get("dirichlet_logit_temperature", 1.0)),
         "alpha_cap": float(config.get("dirichlet_alpha_cap", 100.0)) if "dirichlet_alpha_cap" in config else None,
@@ -3458,7 +3475,6 @@ def create_actor_critic(architecture: str,
             dual_head_enabled=dual_head_enabled_cfg,
             **mixture_kwargs,
             aux_return_enabled=aux_return_enabled_cfg,
-            exp_tanh_scale=float(config.get('dirichlet_exp_tanh_scale', 2.5)),
             **regime_kwargs,
             **epsilon_kwargs,
         )

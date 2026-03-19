@@ -576,6 +576,10 @@ PHASE1_CONFIG = {
         "dirichlet_alpha_activation": "exp_tanh",   # PERF-FIX #4c: exp(tanh(x)*scale) — better diversity than softplus
         "dirichlet_exp_clip": (-5.0, 3.0),
         "dirichlet_logit_temperature": 0.5,           # PERF-FIX #4a: sharper allocation (was 1.0)
+        "dirichlet_exp_tanh_scale": 2.5,
+        "dirichlet_softplus_alpha_floor": 0.0,
+        "dirichlet_softplus_alpha_scale": 1.0,
+        "dirichlet_cross_sectional_standardize": False,
         # Optional adaptive temperature controller:
         # temperature = clip(base + slope * |logit|, t_min, t_max)
         # Larger |logit| -> larger temperature -> flatter alpha map.
@@ -1328,6 +1332,9 @@ RUN9_ALPHA_OVERRIDES = {
         "dirichlet_logit_temperature": 1.2,
         "dirichlet_alpha_cap": 16.0,
         "dirichlet_exp_tanh_scale": 3.5,
+        "dirichlet_softplus_alpha_floor": 0.0,
+        "dirichlet_softplus_alpha_scale": 1.0,
+        "dirichlet_cross_sectional_standardize": False,
         "dirichlet_epsilon": {"max": 0.2, "min": 0.02},
         "ppo_params": {
             "num_ppo_epochs": 3,

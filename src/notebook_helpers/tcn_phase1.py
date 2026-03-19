@@ -588,6 +588,10 @@ def _extract_effective_agent_params(
         "dirichlet_epsilon",
         "dirichlet_exp_clip",
         "dirichlet_logit_temperature",
+        "dirichlet_exp_tanh_scale",
+        "dirichlet_softplus_alpha_floor",
+        "dirichlet_softplus_alpha_scale",
+        "dirichlet_cross_sectional_standardize",
         "dirichlet_adaptive_temperature_enabled",
         "dirichlet_adaptive_temperature_base",
         "dirichlet_adaptive_temperature_slope",
@@ -1575,6 +1579,10 @@ def load_training_metadata_into_config(
             "   Dirichlet controls: "
             f"activation={agent_params.get('dirichlet_alpha_activation')} | "
             f"temperature={agent_params.get('dirichlet_logit_temperature', agent_params.get('logit_temperature', 1.0))} | "
+            f"exp_tanh_scale={agent_params.get('dirichlet_exp_tanh_scale', 2.5)} | "
+            f"softplus_floor={agent_params.get('dirichlet_softplus_alpha_floor', 0.0)} | "
+            f"softplus_scale={agent_params.get('dirichlet_softplus_alpha_scale', 1.0)} | "
+            f"cross_std={bool(agent_params.get('dirichlet_cross_sectional_standardize', False))} | "
             f"adaptive_temp={bool(agent_params.get('dirichlet_adaptive_temperature_enabled', False))} | "
             f"adaptive_base={agent_params.get('dirichlet_adaptive_temperature_base', agent_params.get('dirichlet_logit_temperature', 1.0))} | "
             f"adaptive_slope={agent_params.get('dirichlet_adaptive_temperature_slope', 0.0)} | "
@@ -4631,6 +4639,12 @@ def run_experiment6_tape(
             "dirichlet_exp_clip": copy.deepcopy(agent_config.get("dirichlet_exp_clip")),
             "dirichlet_logit_temperature": copy.deepcopy(
                 agent_config.get("dirichlet_logit_temperature", agent_config.get("logit_temperature"))
+            ),
+            "dirichlet_exp_tanh_scale": copy.deepcopy(agent_config.get("dirichlet_exp_tanh_scale", 2.5)),
+            "dirichlet_softplus_alpha_floor": copy.deepcopy(agent_config.get("dirichlet_softplus_alpha_floor", 0.0)),
+            "dirichlet_softplus_alpha_scale": copy.deepcopy(agent_config.get("dirichlet_softplus_alpha_scale", 1.0)),
+            "dirichlet_cross_sectional_standardize": bool(
+                agent_config.get("dirichlet_cross_sectional_standardize", False)
             ),
             "dirichlet_adaptive_temperature_enabled": bool(
                 agent_config.get("dirichlet_adaptive_temperature_enabled", False)
