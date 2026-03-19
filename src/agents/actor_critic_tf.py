@@ -1069,6 +1069,9 @@ class MLPActor(DirichletActor):
         mixture_dirichlet_component_hidden_dims: Optional[List[int]] = None,
         aux_return_enabled: bool = False,
         exp_tanh_scale: float = 2.5,
+        softplus_alpha_floor: float = 0.0,
+        softplus_alpha_scale: float = 1.0,
+        cross_sectional_standardize: bool = False,
     ):
         if hidden_dims is None:
             hidden_dims = _DEFAULT_ACTOR_HIDDEN_DIMS
@@ -1106,6 +1109,9 @@ class MLPActor(DirichletActor):
             adaptive_temperature_max=adaptive_temperature_max,
             dual_head_enabled=bool(dual_head_enabled),
             exp_tanh_scale=exp_tanh_scale,
+            softplus_alpha_floor=softplus_alpha_floor,
+            softplus_alpha_scale=softplus_alpha_scale,
+            cross_sectional_standardize=cross_sectional_standardize,
         )
 
         sanitized_hidden_dims = [int(x) for x in (hidden_dims or []) if int(x) > 0]
@@ -1354,6 +1360,10 @@ class TCNActor(DirichletActor):
         adaptive_temperature_min: float = 0.8,
         adaptive_temperature_max: float = 2.5,
         dual_head_enabled: Optional[bool] = None,
+        exp_tanh_scale: float = 2.5,
+        softplus_alpha_floor: float = 0.0,
+        softplus_alpha_scale: float = 1.0,
+        cross_sectional_standardize: bool = False,
     ):
         # Apply config defaults
         if tcn_filters is None:
@@ -1393,6 +1403,10 @@ class TCNActor(DirichletActor):
             adaptive_temperature_min=adaptive_temperature_min,
             adaptive_temperature_max=adaptive_temperature_max,
             dual_head_enabled=bool(dual_head_enabled),
+            exp_tanh_scale=exp_tanh_scale,
+            softplus_alpha_floor=softplus_alpha_floor,
+            softplus_alpha_scale=softplus_alpha_scale,
+            cross_sectional_standardize=cross_sectional_standardize,
         )
         
         self.input_dim = input_dim
@@ -1536,6 +1550,10 @@ class TCNAttentionActor(DirichletActor):
         adaptive_temperature_min: float = 0.8,
         adaptive_temperature_max: float = 2.5,
         dual_head_enabled: Optional[bool] = None,
+        exp_tanh_scale: float = 2.5,
+        softplus_alpha_floor: float = 0.0,
+        softplus_alpha_scale: float = 1.0,
+        cross_sectional_standardize: bool = False,
     ):
         # Apply config defaults
         if tcn_filters is None:
@@ -1579,6 +1597,10 @@ class TCNAttentionActor(DirichletActor):
             adaptive_temperature_min=adaptive_temperature_min,
             adaptive_temperature_max=adaptive_temperature_max,
             dual_head_enabled=bool(dual_head_enabled),
+            exp_tanh_scale=exp_tanh_scale,
+            softplus_alpha_floor=softplus_alpha_floor,
+            softplus_alpha_scale=softplus_alpha_scale,
+            cross_sectional_standardize=cross_sectional_standardize,
         )
         
         self.input_dim = input_dim
@@ -1760,6 +1782,9 @@ class TCNFusionActor(DirichletActor):
         mixture_dirichlet_component_hidden_dims: Optional[List[int]] = None,
         aux_return_enabled: bool = False,
         exp_tanh_scale: float = 2.5,
+        softplus_alpha_floor: float = 0.0,
+        softplus_alpha_scale: float = 1.0,
+        cross_sectional_standardize: bool = False,
     ):
         if tcn_filters is None:
             tcn_filters = _DEFAULT_TCN_FILTERS
@@ -1835,6 +1860,9 @@ class TCNFusionActor(DirichletActor):
             adaptive_temperature_max=adaptive_temperature_max,
             dual_head_enabled=bool(dual_head_enabled),
             exp_tanh_scale=exp_tanh_scale,
+            softplus_alpha_floor=softplus_alpha_floor,
+            softplus_alpha_scale=softplus_alpha_scale,
+            cross_sectional_standardize=cross_sectional_standardize,
         )
 
         self.input_dim = int(input_dim)
