@@ -72,7 +72,13 @@ TEMPORAL_FORECAST_PARAMS = {
 DYNAMIC_COVARIANCE_PARAMS = {
     "covariance_window_length": 60, "feature_extraction_methods": ["eigenvalues"],
     # Keep only active covariance channels.
-    "num_eigenvalues": min(2, NUM_ASSETS)
+    "num_eigenvalues": min(2, NUM_ASSETS),
+    "num_loading_components": min(2, NUM_ASSETS),
+    "include_explained_variance_ratios": True,
+    "include_trace": True,
+    "include_effective_rank": True,
+    "include_pairwise_correlation_stats": True,
+    "include_pc_loadings": True,
 }
 
 ACTUARIAL_PARAMS = {
@@ -150,6 +156,14 @@ PHASE12_AUDIT_ACTIVE_FEATURES_NON_ACTUARIAL = [
     # Covariance
     "Covariance_Eigenvalue_0",
     "Covariance_Eigenvalue_1",
+    "Covariance_ExplainedVarRatio_0",
+    "Covariance_ExplainedVarRatio_1",
+    "Covariance_Trace",
+    "Covariance_EffectiveRank",
+    "Covariance_MeanPairwiseCorr",
+    "Covariance_CorrDispersion",
+    "Covariance_PC1_Loading",
+    "Covariance_PC2_Loading",
     # Yield-curve / rates / inflation / credit / implied vol
     "YieldCurve_Spread",
     "YieldCurve_Inverted_Flag",
@@ -272,6 +286,11 @@ PHASE12_GLOBAL_FEATURE_COLUMNS = [
 
 PHASE12_GLOBAL_FEATURE_PREFIXES = [
     "Covariance_Eigenvalue_",
+    "Covariance_ExplainedVarRatio_",
+    "Covariance_Trace",
+    "Covariance_EffectiveRank",
+    "Covariance_MeanPairwiseCorr",
+    "Covariance_CorrDispersion",
     "YieldCurve_",
     "SOFR_",
     "DGS10_",
@@ -1863,6 +1882,262 @@ RUN17_TEST_OVERRIDES["training_params"].update(
 )
 
 
+# ── Run 18: Canonical 10-asset scaled TAPE recipe with softened transitions ──
+RUN18_OVERRIDES = copy.deepcopy(RUN17_EXPANDED_OVERRIDES)
+RUN18_ACTIVE_FEATURE_ALLOWLIST = [
+    "LogReturn_1d",
+    "LogReturn_5d",
+    "LogReturn_21d",
+    "RollingVolatility_21d",
+    "DownsideSemiVar_21d",
+    "MACDh_12_26_9",
+    "RSI_14",
+    "ADX_14",
+    "NATR_14",
+    "Candle_BodyToRange",
+    "Candle_CloseLocation",
+    "Regime_Breadth_Positive",
+    "CrossSectional_ZScore_LogReturn_1d",
+    "AlphaRet_1d",
+    "AlphaRet_5d",
+    "AlphaRet_20d",
+    "AlphaRet_5d_Z",
+    "AlphaRet_20d_Z",
+    "Residual_Momentum_21",
+    "ShortTerm_Reversal_5",
+    "VolOfVol_63",
+    "Beta_to_Market",
+    "BuyProb_Regime",
+    "BuyEdge_Regime",
+    "Covariance_Eigenvalue_0",
+    "Covariance_Eigenvalue_1",
+    "Covariance_ExplainedVarRatio_0",
+    "Covariance_ExplainedVarRatio_1",
+    "Covariance_Trace",
+    "Covariance_EffectiveRank",
+    "Covariance_MeanPairwiseCorr",
+    "Covariance_CorrDispersion",
+    "Covariance_PC1_Loading",
+    "Covariance_PC2_Loading",
+    "YieldCurve_Spread",
+    "YieldCurve_Inverted_Flag",
+    "SOFR_diff",
+    "DGS10_level",
+    "DGS10_diff",
+    "T10Y2Y_level",
+    "TIPS10Y_level",
+    "TIPS10Y_diff",
+    "BreakevenInf10Y_level",
+    "BreakevenInf10Y_diff",
+    "IG_Credit_zscore",
+    "HY_Credit_diff",
+    "HY_Credit_zscore",
+    "VIX_zscore",
+]
+RUN18_OVERRIDES.update(
+    {
+        "TRAIN_TEST_SPLIT_DATE": TRAIN_TEST_SPLIT_DATE_COVID_STRESS,
+        "ANALYSIS_START_DATE": "2009-01-01",
+        "ASSET_TICKERS": ["NVDA", "MSFT", "AMZN", "JPM", "BRK-B", "CAT", "XOM", "NEE", "GLD", "KO"],
+        "NUM_ASSETS": 10,
+        "EQUAL_WEIGHT_CASH_ALLOCATION": 1.0 / 11.0,
+    }
+)
+RUN18_OVERRIDES["feature_params"].update(
+    {
+        "dynamic_covariance": {
+            **copy.deepcopy(RUN17_EXPANDED_OVERRIDES["feature_params"]["dynamic_covariance"]),
+            "num_eigenvalues": 2,
+            "num_loading_components": 2,
+        },
+        "feature_selection": {
+            **copy.deepcopy(RUN17_EXPANDED_OVERRIDES["feature_params"]["feature_selection"]),
+            "enforce_allowlist": True,
+            "allowlist_apply_to_phase2": False,
+            "active_features_allowlist": copy.deepcopy(RUN18_ACTIVE_FEATURE_ALLOWLIST),
+            "feature_audit_expected_non_actuarial_count": len(RUN18_ACTIVE_FEATURE_ALLOWLIST),
+            "feature_audit_expected_total_count": len(RUN18_ACTIVE_FEATURE_ALLOWLIST),
+        },
+    }
+)
+RUN18_OVERRIDES["agent_params"].update(
+    {
+        "num_assets": 10,
+        "tcn_filters": [64, 96, 128],
+        "tcn_dilations": [1, 2, 4],
+        "tcn_kernel_size": 5,
+        "dirichlet_alpha_activation": "cross_softplus",
+        "dirichlet_softplus_alpha_floor": 0.75,
+        "dirichlet_softplus_alpha_scale": 2.5,
+        "dirichlet_cross_sectional_standardize": True,
+    }
+)
+RUN18_OVERRIDES["agent_params"]["ppo_params"].update(
+    {
+        "entropy_coef": 0.0007,
+        "risk_aux_mvo_coef": 0.0,
+        "alpha_diversity_coef": 0.0,
+        "alpha_dispersion_coef": 0.20,
+        "alpha_dispersion_target_std": 0.20,
+        "lagrangian_cvar_enabled": False,
+        "lagrangian_cvar_penalty_scale": 0.0,
+    }
+)
+RUN18_OVERRIDES["training_params"].update(
+    {
+        "max_total_timesteps": 500_000,
+        "ppo_entropy_coef_schedule": [
+            {"threshold": 0, "entropy_coef": 0.0007},
+            {"threshold": 150_000, "entropy_coef": 0.0005},
+            {"threshold": 300_000, "entropy_coef": 0.0003},
+            {"threshold": 425_000, "entropy_coef": 0.0001},
+        ],
+        "action_execution_beta_schedule": [
+            {"threshold": 0, "beta": 0.55},
+            {"threshold": 150_000, "beta": 0.65},
+            {"threshold": 300_000, "beta": 0.80},
+            {"threshold": 425_000, "beta": 0.95},
+            {"threshold": 475_000, "beta": 1.00},
+        ],
+        "action_execution_beta_curriculum": {
+            0: 0.55,
+            150_000: 0.65,
+            300_000: 0.80,
+            425_000: 0.95,
+            475_000: 1.00,
+        },
+        "evaluation_action_execution_beta": 1.00,
+        "turnover_penalty_curriculum": {
+            0: 0.00,
+            200_000: 0.05,
+            325_000: 0.10,
+            400_000: 0.20,
+            475_000: 0.30,
+        },
+        "evaluation_turnover_penalty_scalar": 0.30,
+        "reward_component_schedule": [
+            {
+                "threshold": 0,
+                "phase": "A_return_only",
+                "enable_base_reward": True,
+                "enable_dsr_reward": False,
+                "enable_turnover_penalty": False,
+                "enable_benchmark_shaping": False,
+                "enable_terminal_tape_bonus": False,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 0.0,
+                "turnover_penalty_weight": 0.0,
+                "benchmark_shaping_weight": 0.0,
+                "terminal_tape_bonus_weight": 0.0,
+            },
+            {
+                "threshold": 200_000,
+                "phase": "B_ramp_1",
+                "enable_base_reward": True,
+                "enable_dsr_reward": True,
+                "enable_turnover_penalty": False,
+                "enable_benchmark_shaping": True,
+                "enable_terminal_tape_bonus": False,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 0.25,
+                "turnover_penalty_weight": 0.0,
+                "benchmark_shaping_weight": 0.20,
+                "terminal_tape_bonus_weight": 0.0,
+            },
+            {
+                "threshold": 240_000,
+                "phase": "B_ramp_2",
+                "enable_base_reward": True,
+                "enable_dsr_reward": True,
+                "enable_turnover_penalty": False,
+                "enable_benchmark_shaping": True,
+                "enable_terminal_tape_bonus": False,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 0.55,
+                "turnover_penalty_weight": 0.0,
+                "benchmark_shaping_weight": 0.45,
+                "terminal_tape_bonus_weight": 0.0,
+            },
+            {
+                "threshold": 280_000,
+                "phase": "B_full",
+                "enable_base_reward": True,
+                "enable_dsr_reward": True,
+                "enable_turnover_penalty": False,
+                "enable_benchmark_shaping": True,
+                "enable_terminal_tape_bonus": False,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 1.0,
+                "turnover_penalty_weight": 0.0,
+                "benchmark_shaping_weight": 0.75,
+                "terminal_tape_bonus_weight": 0.0,
+            },
+            {
+                "threshold": 375_000,
+                "phase": "C_ramp_1",
+                "enable_base_reward": True,
+                "enable_dsr_reward": True,
+                "enable_turnover_penalty": True,
+                "enable_benchmark_shaping": True,
+                "enable_terminal_tape_bonus": True,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 1.0,
+                "turnover_penalty_weight": 0.20,
+                "benchmark_shaping_weight": 0.90,
+                "terminal_tape_bonus_weight": 0.20,
+            },
+            {
+                "threshold": 410_000,
+                "phase": "C_ramp_2",
+                "enable_base_reward": True,
+                "enable_dsr_reward": True,
+                "enable_turnover_penalty": True,
+                "enable_benchmark_shaping": True,
+                "enable_terminal_tape_bonus": True,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 1.0,
+                "turnover_penalty_weight": 0.50,
+                "benchmark_shaping_weight": 1.0,
+                "terminal_tape_bonus_weight": 0.50,
+            },
+            {
+                "threshold": 445_000,
+                "phase": "C_full_tape",
+                "enable_base_reward": True,
+                "enable_dsr_reward": True,
+                "enable_turnover_penalty": True,
+                "enable_benchmark_shaping": True,
+                "enable_terminal_tape_bonus": True,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 1.0,
+                "turnover_penalty_weight": 1.0,
+                "benchmark_shaping_weight": 1.0,
+                "terminal_tape_bonus_weight": 1.0,
+            },
+        ],
+        "episode_length_curriculum_schedule": [
+            {"threshold": 0, "episode_length": 756},
+            {"threshold": 200_000, "episode_length": 1008},
+            {"threshold": 350_000, "episode_length": 1500},
+            {"threshold": 475_000, "episode_length": None},
+        ],
+        "episode_length_curriculum_overlap_steps": 10_000,
+        "training_early_stop_warmup_steps": 250_000,
+        "training_early_stop_patience_updates": 50,
+    }
+)
+RUN18_OVERRIDES["environment_params"].update(
+    {
+        "stock_dim": 10,
+        "num_assets": 10,
+        "target_turnover": 0.35,
+        "turnover_penalty_scalar": 0.00,
+        "action_execution_beta": 0.55,
+        "action_realization_penalty_scalar": 0.0,
+    }
+)
+
+
 RUN11_RELAXED_OVERRIDES = copy.deepcopy(RUN10_ALPHA_OVERRIDES)
 RUN11_RELAXED_OVERRIDES.update(
     {
@@ -3198,6 +3473,176 @@ def build_run17_test_config(
     if analysis_end_date is not None:
         config["ANALYSIS_END_DATE"] = analysis_end_date
     assert_run17_test_config(config)
+    return config
+
+
+def apply_run18_overrides(config: dict, overrides: dict = None) -> dict:
+    """Apply the canonical Run18 10-asset scaled-TAPE recipe in-place."""
+    global TRAIN_TEST_SPLIT_DATE
+    resolved = copy.deepcopy(RUN18_OVERRIDES if overrides is None else overrides)
+    split_date = resolved.get("TRAIN_TEST_SPLIT_DATE")
+    if split_date:
+        TRAIN_TEST_SPLIT_DATE = split_date
+        config["TRAIN_TEST_SPLIT_DATE"] = split_date
+    _deep_update_config(config, resolved)
+    return config
+
+
+def assert_run18_config(config: dict) -> None:
+    """Raise if a config expected to match the canonical Run18 recipe drifted."""
+    agent = config.get("agent_params", {})
+    ppo = agent.get("ppo_params", {})
+    env = config.get("environment_params", {})
+    training = config.get("training_params", {})
+    feature_params = config.get("feature_params", {})
+    feature_selection = (
+        feature_params.get("feature_selection", {})
+        if isinstance(feature_params.get("feature_selection", {}), dict)
+        else {}
+    )
+    dyn_cov = (
+        feature_params.get("dynamic_covariance", {})
+        if isinstance(feature_params.get("dynamic_covariance", {}), dict)
+        else {}
+    )
+
+    assert str(config.get("TRAIN_TEST_SPLIT_DATE", "")) == str(TRAIN_TEST_SPLIT_DATE_COVID_STRESS), (
+        "Run18 split date must be 2019-12-31 (COVID stress window)"
+    )
+    assert str(config.get("ANALYSIS_START_DATE", "")) == "2009-01-01", (
+        "Run18 analysis start date must be 2009-01-01"
+    )
+    assert int(config.get("NUM_ASSETS", 0)) == 10, f"Run18 must have 10 assets, got {config.get('NUM_ASSETS')}"
+    assert len(config.get("ASSET_TICKERS", [])) == 10, (
+        f"Run18 must have 10 tickers, got {len(config.get('ASSET_TICKERS', []))}"
+    )
+    assert abs(float(config.get("EQUAL_WEIGHT_CASH_ALLOCATION", 0.0)) - (1.0 / 11.0)) < 1e-12, (
+        "Run18 equal-weight cash allocation must match the 10-asset universe"
+    )
+
+    assert bool(agent.get("regime_conditioning_enabled", False)), "Run18 regime_conditioning_enabled must stay on"
+    assert str(agent.get("regime_conditioning_mode", "concat")).lower() == "film", (
+        "Run18 regime_conditioning_mode must stay film"
+    )
+    assert bool(agent.get("distributional_critic_enabled", False)), "Run18 distributional critic must stay on"
+    assert not bool(agent.get("fusion_cross_asset_mixer_enabled", True)), (
+        "Run18 fusion_cross_asset_mixer_enabled must stay off"
+    )
+    assert list(agent.get("tcn_filters", [])) == [64, 96, 128], "Run18 TCN filters drifted"
+    assert list(agent.get("tcn_dilations", [])) == [1, 2, 4], "Run18 TCN dilations drifted"
+    assert int(agent.get("tcn_kernel_size", 0)) == 5, "Run18 TCN kernel size drifted"
+    assert str(agent.get("dirichlet_alpha_activation", "")).lower() == "cross_softplus", (
+        "Run18 alpha activation must stay cross_softplus"
+    )
+    assert float(agent.get("dirichlet_softplus_alpha_floor", 0.0)) == 0.75, (
+        "Run18 softplus alpha floor drifted"
+    )
+    assert float(agent.get("dirichlet_softplus_alpha_scale", 0.0)) == 2.5, (
+        "Run18 softplus alpha scale drifted"
+    )
+    assert bool(agent.get("dirichlet_cross_sectional_standardize", False)), (
+        "Run18 cross-sectional alpha standardization must stay on"
+    )
+
+    assert float(ppo.get("entropy_coef", 1.0)) == 0.0007, "Run18 base entropy drifted"
+    assert float(ppo.get("risk_aux_mvo_coef", 1.0)) == 0.0, "Run18 risk_aux_mvo_coef must stay off"
+    assert float(ppo.get("alpha_diversity_coef", 1.0)) == 0.0, "Run18 alpha_diversity_coef must stay off"
+    assert float(ppo.get("alpha_dispersion_coef", 0.0)) == 0.20, "Run18 alpha_dispersion_coef drifted"
+    assert float(ppo.get("alpha_dispersion_target_std", 0.0)) == 0.20, (
+        "Run18 alpha_dispersion_target_std drifted"
+    )
+    assert not bool(ppo.get("lagrangian_cvar_enabled", True)), "Run18 lagrangian_cvar_enabled must stay off"
+    assert float(ppo.get("lagrangian_cvar_penalty_scale", 1.0)) == 0.0, (
+        "Run18 lagrangian_cvar_penalty_scale must stay at 0.0"
+    )
+
+    assert int(training.get("max_total_timesteps", 0)) == 500_000, "Run18 max_total_timesteps must stay at 500k"
+    assert bool(training.get("training_early_stop_enabled", False)), "Run18 early stop must stay enabled"
+    assert int(training.get("training_early_stop_warmup_steps", 0)) == 250_000, (
+        "Run18 early-stop warmup drifted"
+    )
+    assert int(training.get("training_early_stop_patience_updates", 0)) == 50, (
+        "Run18 early-stop patience drifted"
+    )
+    assert float(training.get("evaluation_action_execution_beta", 0.0)) == 1.0, (
+        "Run18 evaluation_action_execution_beta must stay at 1.0"
+    )
+    assert float(training.get("evaluation_turnover_penalty_scalar", 0.0)) == 0.30, (
+        "Run18 evaluation_turnover_penalty_scalar drifted"
+    )
+    assert int(training.get("episode_length_curriculum_overlap_steps", 0)) == 10_000, (
+        "Run18 episode-length overlap drifted"
+    )
+
+    assert float(env.get("target_turnover", 0.0)) == 0.35, "Run18 target_turnover drifted"
+    assert float(env.get("turnover_penalty_scalar", 1.0)) == 0.0, (
+        "Run18 bootstrap environment turnover scalar must stay at 0.0"
+    )
+    assert float(env.get("action_execution_beta", 0.0)) == 0.55, (
+        "Run18 bootstrap environment beta must stay at 0.55"
+    )
+    assert float(env.get("action_realization_penalty_scalar", 1.0)) == 0.0, (
+        "Run18 action_realization_penalty_scalar must stay off"
+    )
+    assert int(env.get("stock_dim", 0)) == 10, "Run18 environment stock_dim drifted"
+    assert int(env.get("num_assets", 0)) == 10, "Run18 environment num_assets drifted"
+
+    assert bool(feature_selection.get("enforce_allowlist", False)), "Run18 feature allowlist must stay enforced"
+    assert not bool(feature_params.get("actuarial_params", {}).get("enabled", False)), (
+        "Run18 actuarial features must stay disabled"
+    )
+    assert copy.deepcopy(feature_selection.get("active_features_allowlist", [])) == copy.deepcopy(
+        RUN18_ACTIVE_FEATURE_ALLOWLIST
+    ), "Run18 feature allowlist drifted"
+    assert int(feature_selection.get("feature_audit_expected_non_actuarial_count", 0)) == len(
+        RUN18_ACTIVE_FEATURE_ALLOWLIST
+    ), "Run18 non-actuarial feature audit count drifted"
+    assert int(feature_selection.get("feature_audit_expected_total_count", 0)) == len(
+        RUN18_ACTIVE_FEATURE_ALLOWLIST
+    ), "Run18 total feature audit count drifted"
+    assert int(dyn_cov.get("num_eigenvalues", 0)) == 2, "Run18 dynamic covariance num_eigenvalues drifted"
+    assert int(dyn_cov.get("num_loading_components", 0)) == 2, (
+        "Run18 dynamic covariance num_loading_components drifted"
+    )
+
+    for key in [
+        "ppo_entropy_coef_schedule",
+        "action_execution_beta_schedule",
+        "reward_component_schedule",
+        "episode_length_curriculum_schedule",
+    ]:
+        expected = copy.deepcopy(RUN18_OVERRIDES["training_params"][key])
+        actual = copy.deepcopy(training.get(key, []))
+        assert actual == expected, f"Run18 {key} drifted from the canonical schedule"
+
+    expected_turnover = copy.deepcopy(RUN18_OVERRIDES["training_params"]["turnover_penalty_curriculum"])
+    actual_turnover = {
+        int(threshold): float(value)
+        for threshold, value in dict(training.get("turnover_penalty_curriculum", {})).items()
+    }
+    assert actual_turnover == expected_turnover, "Run18 turnover_penalty_curriculum drifted"
+
+    expected_beta = copy.deepcopy(RUN18_OVERRIDES["training_params"]["action_execution_beta_curriculum"])
+    actual_beta = {
+        int(threshold): float(value)
+        for threshold, value in dict(training.get("action_execution_beta_curriculum", {})).items()
+    }
+    assert actual_beta == expected_beta, "Run18 action_execution_beta_curriculum drifted"
+
+
+def build_run18_config(
+    phase_name: str = "phase1",
+    *,
+    analysis_end_date: str | None = None,
+    overrides: dict | None = None,
+) -> dict:
+    """Return a deep-copied phase config with the canonical Run18 overrides applied."""
+    config = copy.deepcopy(get_active_config(phase_name))
+    enforce_feature_audit_plan(config)
+    apply_run18_overrides(config, overrides=overrides)
+    if analysis_end_date is not None:
+        config["ANALYSIS_END_DATE"] = analysis_end_date
+    assert_run18_config(config)
     return config
 
 

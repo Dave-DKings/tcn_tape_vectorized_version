@@ -2551,6 +2551,11 @@ def run_experiment6_tape(
                     "enable_turnover_penalty": bool(entry.get("enable_turnover_penalty", True)),
                     "enable_benchmark_shaping": bool(entry.get("enable_benchmark_shaping", True)),
                     "enable_terminal_tape_bonus": bool(entry.get("enable_terminal_tape_bonus", True)),
+                    "base_reward_weight": float(np.clip(entry.get("base_reward_weight", 1.0), 0.0, 1.0)),
+                    "dsr_reward_weight": float(np.clip(entry.get("dsr_reward_weight", 1.0), 0.0, 1.0)),
+                    "turnover_penalty_weight": float(np.clip(entry.get("turnover_penalty_weight", 1.0), 0.0, 1.0)),
+                    "benchmark_shaping_weight": float(np.clip(entry.get("benchmark_shaping_weight", 1.0), 0.0, 1.0)),
+                    "terminal_tape_bonus_weight": float(np.clip(entry.get("terminal_tape_bonus_weight", 1.0), 0.0, 1.0)),
                 }
             )
     if not reward_component_schedule:
@@ -2563,6 +2568,11 @@ def run_experiment6_tape(
                 "enable_turnover_penalty": True,
                 "enable_benchmark_shaping": True,
                 "enable_terminal_tape_bonus": True,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 1.0,
+                "turnover_penalty_weight": 1.0,
+                "benchmark_shaping_weight": 1.0,
+                "terminal_tape_bonus_weight": 1.0,
             }
         ]
     reward_component_schedule = sorted(reward_component_schedule, key=lambda entry: int(entry["threshold"]))
@@ -2623,7 +2633,13 @@ def run_experiment6_tape(
             f"dsr={bool(entry['enable_dsr_reward'])} "
             f"turnover={bool(entry['enable_turnover_penalty'])} "
             f"benchmark={bool(entry['enable_benchmark_shaping'])} "
-            f"terminal={bool(entry['enable_terminal_tape_bonus'])}"
+            f"terminal={bool(entry['enable_terminal_tape_bonus'])} | "
+            f"weights="
+            f"b{float(entry.get('base_reward_weight', 1.0)):.2f}/"
+            f"d{float(entry.get('dsr_reward_weight', 1.0)):.2f}/"
+            f"t{float(entry.get('turnover_penalty_weight', 1.0)):.2f}/"
+            f"bm{float(entry.get('benchmark_shaping_weight', 1.0)):.2f}/"
+            f"tt{float(entry.get('terminal_tape_bonus_weight', 1.0)):.2f}"
         )
     print(f"   ⚡ Parallel rollout envs: {num_parallel_envs}")
     if parallel_rollout_enabled:
@@ -2894,6 +2910,11 @@ def run_experiment6_tape(
             enable_turnover_penalty=bool(initial_reward_flags.get("enable_turnover_penalty", True)),
             enable_benchmark_shaping=bool(initial_reward_flags.get("enable_benchmark_shaping", True)),
             enable_terminal_tape_bonus=bool(initial_reward_flags.get("enable_terminal_tape_bonus", True)),
+            base_reward_weight=float(initial_reward_flags.get("base_reward_weight", 1.0)),
+            dsr_reward_weight=float(initial_reward_flags.get("dsr_reward_weight", 1.0)),
+            turnover_penalty_weight=float(initial_reward_flags.get("turnover_penalty_weight", 1.0)),
+            benchmark_shaping_weight=float(initial_reward_flags.get("benchmark_shaping_weight", 1.0)),
+            terminal_tape_bonus_weight=float(initial_reward_flags.get("terminal_tape_bonus_weight", 1.0)),
             turnover_penalty_scalar=train_turnover_default,
             gamma=gamma_cfg,
             episode_length_limit=episode_horizon_start,
@@ -5572,6 +5593,11 @@ def run_experiment6_tape(
                     enable_terminal_tape_bonus=bool(
                         current_reward_component_flags.get("enable_terminal_tape_bonus", True)
                     ),
+                    base_reward_weight=float(current_reward_component_flags.get("base_reward_weight", 1.0)),
+                    dsr_reward_weight=float(current_reward_component_flags.get("dsr_reward_weight", 1.0)),
+                    turnover_penalty_weight=float(current_reward_component_flags.get("turnover_penalty_weight", 1.0)),
+                    benchmark_shaping_weight=float(current_reward_component_flags.get("benchmark_shaping_weight", 1.0)),
+                    terminal_tape_bonus_weight=float(current_reward_component_flags.get("terminal_tape_bonus_weight", 1.0)),
                 )
             print(f"\n🧭 REWARD PHASE UPDATE at {step:,} steps:")
             print(
@@ -5581,7 +5607,13 @@ def run_experiment6_tape(
                 f"dsr={bool(current_reward_component_flags.get('enable_dsr_reward', True))} "
                 f"turnover={bool(current_reward_component_flags.get('enable_turnover_penalty', True))} "
                 f"benchmark={bool(current_reward_component_flags.get('enable_benchmark_shaping', True))} "
-                f"terminal={bool(current_reward_component_flags.get('enable_terminal_tape_bonus', True))}"
+                f"terminal={bool(current_reward_component_flags.get('enable_terminal_tape_bonus', True))} | "
+                f"weights="
+                f"b{float(current_reward_component_flags.get('base_reward_weight', 1.0)):.2f}/"
+                f"d{float(current_reward_component_flags.get('dsr_reward_weight', 1.0)):.2f}/"
+                f"t{float(current_reward_component_flags.get('turnover_penalty_weight', 1.0)):.2f}/"
+                f"bm{float(current_reward_component_flags.get('benchmark_shaping_weight', 1.0)):.2f}/"
+                f"tt{float(current_reward_component_flags.get('terminal_tape_bonus_weight', 1.0)):.2f}"
             )
 
         if use_episode_length_curriculum:

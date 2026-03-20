@@ -685,17 +685,20 @@ class DataProcessor:
     
     def calculate_dynamic_covariance_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Calculate dynamic covariance matrix features (eigenvalues).
+        Calculate dynamic covariance matrix features.
         
-        This computes rolling covariance matrices of asset returns and extracts
-        the top eigenvalues, which capture the principal modes of portfolio
-        correlation/volatility.
+        This computes rolling covariance matrices of asset returns and extracts:
+        - top eigenvalues
+        - explained-variance ratios
+        - covariance trace / effective rank
+        - pairwise correlation summaries
+        - per-asset PC loadings with sign-stability over time
         
         Args:
             df: DataFrame with log returns in long format
             
         Returns:
-            DataFrame with added covariance eigenvalue columns
+            DataFrame with date-level covariance summaries and per-asset loadings
         """
         cov_params = self.config.get('feature_params', {}).get('dynamic_covariance')
         
@@ -709,9 +712,19 @@ class DataProcessor:
         
         window_length = cov_params.get('covariance_window_length', 60)
         num_eigenvalues = cov_params.get('num_eigenvalues', min(3, self.num_assets))
+        num_loading_components = min(
+            int(cov_params.get('num_loading_components', num_eigenvalues)),
+            max(0, self.num_assets),
+        )
+        include_explained_variance_ratios = bool(cov_params.get('include_explained_variance_ratios', False))
+        include_trace = bool(cov_params.get('include_trace', False))
+        include_effective_rank = bool(cov_params.get('include_effective_rank', False))
+        include_pairwise_correlation_stats = bool(cov_params.get('include_pairwise_correlation_stats', False))
+        include_pc_loadings = bool(cov_params.get('include_pc_loadings', False))
         
         logger.info(f"Window length: {window_length} days")
         logger.info(f"Number of eigenvalues: {num_eigenvalues}")
+        logger.info(f"Number of loading components: {num_loading_components}")
         
         df_copy = df.copy()
         
@@ -729,6 +742,12 @@ class DataProcessor:
                 columns=self.ticker_col,
                 values=log_return_col
             )
+            returns_pivot.columns = [str(col) for col in returns_pivot.columns]
+            ordered_tickers = [str(t) for t in self.asset_tickers if str(t) in returns_pivot.columns]
+            for col in returns_pivot.columns:
+                if col not in ordered_tickers:
+                    ordered_tickers.append(str(col))
+            returns_pivot = returns_pivot.reindex(columns=ordered_tickers)
             
             logger.info(f"Returns matrix shape: {returns_pivot.shape}")
             logger.info(f"Date range: {returns_pivot.index.min()} to {returns_pivot.index.max()}")
@@ -737,22 +756,60 @@ class DataProcessor:
             logger.error(f"Failed to pivot returns data: {e}")
             return df_copy
         
-        # Initialize eigenvalue columns
+        # Initialize date-level covariance summary columns.
         eigenvalue_columns = {}
         for i in range(num_eigenvalues):
             eigenvalue_columns[f"Covariance_Eigenvalue_{i}"] = []
+
+        ratio_columns = {}
+        if include_explained_variance_ratios:
+            for i in range(num_eigenvalues):
+                ratio_columns[f"Covariance_ExplainedVarRatio_{i}"] = []
+
+        summary_columns = {}
+        if include_trace:
+            summary_columns["Covariance_Trace"] = []
+        if include_effective_rank:
+            summary_columns["Covariance_EffectiveRank"] = []
+        if include_pairwise_correlation_stats:
+            summary_columns["Covariance_MeanPairwiseCorr"] = []
+            summary_columns["Covariance_CorrDispersion"] = []
+
+        loading_columns = {}
+        if include_pc_loadings:
+            for i in range(num_loading_components):
+                loading_columns[f"Covariance_PC{i + 1}_Loading"] = []
         
-        # Calculate rolling covariance and extract eigenvalues
+        # Calculate rolling covariance summaries and per-asset loadings.
         dates_processed = []
+        loading_rows: List[Dict[str, Any]] = []
+        ticker_to_idx = {ticker: idx for idx, ticker in enumerate(ordered_tickers)}
+        prev_full_loading_vectors: Dict[int, np.ndarray] = {}
+        eps = 1e-12
         
         for idx in range(len(returns_pivot)):
             current_date = returns_pivot.index[idx]
+            current_loading_map = {
+                ticker: {
+                    load_col: np.nan
+                    for load_col in loading_columns.keys()
+                }
+                for ticker in ordered_tickers
+            }
             
             # Check if we have enough history
             if idx < window_length:
-                # Not enough history - use NaN
+                # Not enough history - use NaN.
                 for i in range(num_eigenvalues):
                     eigenvalue_columns[f"Covariance_Eigenvalue_{i}"].append(np.nan)
+                for col in ratio_columns.keys():
+                    ratio_columns[col].append(np.nan)
+                for col in summary_columns.keys():
+                    summary_columns[col].append(np.nan)
+                for ticker in ordered_tickers:
+                    row = {self.date_col: current_date, self.ticker_col: ticker}
+                    row.update(current_loading_map[ticker])
+                    loading_rows.append(row)
                 dates_processed.append(current_date)
                 continue
             
@@ -765,61 +822,152 @@ class DataProcessor:
             window_returns_clean = window_returns.dropna(axis=1)
             
             if window_returns_clean.shape[1] < 2:
-                # Need at least 2 assets for covariance
+                # Need at least 2 assets for covariance.
                 for i in range(num_eigenvalues):
                     eigenvalue_columns[f"Covariance_Eigenvalue_{i}"].append(np.nan)
+                for col in ratio_columns.keys():
+                    ratio_columns[col].append(np.nan)
+                for col in summary_columns.keys():
+                    summary_columns[col].append(np.nan)
+                for ticker in ordered_tickers:
+                    row = {self.date_col: current_date, self.ticker_col: ticker}
+                    row.update(current_loading_map[ticker])
+                    loading_rows.append(row)
                 dates_processed.append(current_date)
                 continue
             
             try:
-                # Calculate covariance matrix
-                cov_matrix = window_returns_clean.cov()
+                cov_matrix = np.asarray(window_returns_clean.cov(), dtype=np.float64)
                 
-                # Extract eigenvalues (sorted descending)
-                eigenvalues = np.linalg.eigvalsh(cov_matrix)
-                eigenvalues = np.sort(eigenvalues)[::-1]  # Sort descending
+                # Extract eigen-system and sort descending.
+                eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+                sort_idx = np.argsort(eigenvalues)[::-1]
+                eigenvalues = np.maximum(eigenvalues[sort_idx], 0.0)
+                eigenvectors = eigenvectors[:, sort_idx]
+                trace_val = float(np.sum(eigenvalues))
+                explained_var = (
+                    eigenvalues / max(trace_val, eps)
+                    if trace_val > eps
+                    else np.zeros_like(eigenvalues)
+                )
                 
-                # Store top eigenvalues
+                # Store top eigenvalues.
                 for i in range(num_eigenvalues):
                     if i < len(eigenvalues):
                         eigenvalue_columns[f"Covariance_Eigenvalue_{i}"].append(eigenvalues[i])
                     else:
                         eigenvalue_columns[f"Covariance_Eigenvalue_{i}"].append(0.0)
+
+                # Store explained-variance ratios.
+                for i in range(num_eigenvalues):
+                    col = f"Covariance_ExplainedVarRatio_{i}"
+                    if col in ratio_columns:
+                        if i < len(explained_var):
+                            ratio_columns[col].append(float(explained_var[i]))
+                        else:
+                            ratio_columns[col].append(0.0)
+
+                # Store covariance/global summaries.
+                if "Covariance_Trace" in summary_columns:
+                    summary_columns["Covariance_Trace"].append(trace_val)
+                if "Covariance_EffectiveRank" in summary_columns:
+                    positive_p = explained_var[explained_var > eps]
+                    if positive_p.size > 0:
+                        entropy = -np.sum(positive_p * np.log(positive_p))
+                        effective_rank = float(np.exp(entropy))
+                    else:
+                        effective_rank = 0.0
+                    summary_columns["Covariance_EffectiveRank"].append(effective_rank)
+                if include_pairwise_correlation_stats:
+                    corr_matrix = np.asarray(window_returns_clean.corr(), dtype=np.float64)
+                    tri_idx = np.triu_indices_from(corr_matrix, k=1)
+                    pairwise_corr = corr_matrix[tri_idx]
+                    pairwise_corr = pairwise_corr[np.isfinite(pairwise_corr)]
+                    if pairwise_corr.size > 0:
+                        summary_columns["Covariance_MeanPairwiseCorr"].append(float(np.mean(pairwise_corr)))
+                        summary_columns["Covariance_CorrDispersion"].append(float(np.std(pairwise_corr)))
+                    else:
+                        summary_columns["Covariance_MeanPairwiseCorr"].append(np.nan)
+                        summary_columns["Covariance_CorrDispersion"].append(np.nan)
+
+                # Store sign-stable per-asset PC loadings.
+                if include_pc_loadings and num_loading_components > 0:
+                    clean_cols = [str(col) for col in window_returns_clean.columns]
+                    clean_positions = [ticker_to_idx[col] for col in clean_cols if col in ticker_to_idx]
+                    for comp_idx in range(num_loading_components):
+                        if comp_idx >= eigenvectors.shape[1]:
+                            continue
+                        full_loading = np.full(len(ordered_tickers), np.nan, dtype=np.float64)
+                        full_loading[np.asarray(clean_positions, dtype=np.int64)] = eigenvectors[:, comp_idx]
+                        prev_loading = prev_full_loading_vectors.get(comp_idx)
+                        if prev_loading is not None:
+                            overlap_mask = np.isfinite(prev_loading) & np.isfinite(full_loading)
+                            if int(np.sum(overlap_mask)) > 0:
+                                signed_similarity = float(np.dot(prev_loading[overlap_mask], full_loading[overlap_mask]))
+                                if signed_similarity < 0.0:
+                                    full_loading = -full_loading
+                        prev_full_loading_vectors[comp_idx] = full_loading.copy()
+                        load_col = f"Covariance_PC{comp_idx + 1}_Loading"
+                        for pos, ticker in enumerate(ordered_tickers):
+                            current_loading_map[ticker][load_col] = float(full_loading[pos]) if np.isfinite(full_loading[pos]) else np.nan
                 
             except Exception as e:
-                logger.warning(f"Failed to compute eigenvalues for date {current_date}: {e}")
+                logger.warning(f"Failed to compute covariance features for date {current_date}: {e}")
                 for i in range(num_eigenvalues):
                     eigenvalue_columns[f"Covariance_Eigenvalue_{i}"].append(np.nan)
+                for col in ratio_columns.keys():
+                    ratio_columns[col].append(np.nan)
+                for col in summary_columns.keys():
+                    summary_columns[col].append(np.nan)
             
+            for ticker in ordered_tickers:
+                row = {self.date_col: current_date, self.ticker_col: ticker}
+                row.update(current_loading_map[ticker])
+                loading_rows.append(row)
             dates_processed.append(current_date)
         
-        # Create eigenvalue dataframe
-        eigenvalue_df = pd.DataFrame(eigenvalue_columns, index=dates_processed)
-        eigenvalue_df.index.name = self.date_col
-        eigenvalue_df = eigenvalue_df.reset_index()
+        # Create date-level covariance summary dataframe.
+        covariance_feature_columns = {}
+        covariance_feature_columns.update(eigenvalue_columns)
+        covariance_feature_columns.update(ratio_columns)
+        covariance_feature_columns.update(summary_columns)
+        covariance_feature_df = pd.DataFrame(covariance_feature_columns, index=dates_processed)
+        covariance_feature_df.index.name = self.date_col
+        covariance_feature_df = covariance_feature_df.reset_index()
         
-        # CRITICAL: Ensure Date column is datetime64, not object
-        eigenvalue_df[self.date_col] = pd.to_datetime(eigenvalue_df[self.date_col])
+        # CRITICAL: Ensure Date column is datetime64, not object.
+        covariance_feature_df[self.date_col] = pd.to_datetime(covariance_feature_df[self.date_col])
+        loading_feature_df = pd.DataFrame(loading_rows)
+        if not loading_feature_df.empty:
+            loading_feature_df[self.date_col] = pd.to_datetime(loading_feature_df[self.date_col])
+            loading_feature_df[self.ticker_col] = loading_feature_df[self.ticker_col].astype(str)
         
-        logger.info(f"Computed eigenvalues for {len(eigenvalue_df)} dates")
-        logger.info(f"Non-NaN eigenvalue counts:")
-        for col in eigenvalue_columns.keys():
-            non_nan_count = eigenvalue_df[col].notna().sum()
-            logger.info(f"  {col}: {non_nan_count}/{len(eigenvalue_df)}")
+        logger.info(f"Computed covariance features for {len(covariance_feature_df)} dates")
+        logger.info("Non-NaN covariance summary counts:")
+        for col in covariance_feature_columns.keys():
+            non_nan_count = covariance_feature_df[col].notna().sum()
+            logger.info(f"  {col}: {non_nan_count}/{len(covariance_feature_df)}")
         
-        # Ensure df_copy Date column is also datetime64
+        # Ensure df_copy join keys use the expected dtypes.
         df_copy[self.date_col] = pd.to_datetime(df_copy[self.date_col])
+        df_copy[self.ticker_col] = df_copy[self.ticker_col].astype(str)
         
-        # Merge eigenvalues back to original dataframe
-        # Each date gets the same eigenvalues for all assets
+        # Merge date-level covariance summaries back to the original dataframe.
         df_with_cov = df_copy.merge(
-            eigenvalue_df,
+            covariance_feature_df,
             on=self.date_col,
             how='left'
         )
+        if include_pc_loadings and not loading_feature_df.empty:
+            df_with_cov = df_with_cov.merge(
+                loading_feature_df,
+                on=[self.date_col, self.ticker_col],
+                how='left'
+            )
         
-        # Forward fill and backward fill to handle any remaining NaN
-        for col in eigenvalue_columns.keys():
+        # Forward-fill within ticker, then zero-fill any remaining warm-up gaps.
+        merged_covariance_columns = list(covariance_feature_columns.keys()) + list(loading_columns.keys())
+        for col in merged_covariance_columns:
             df_with_cov[col] = (
                 df_with_cov.groupby(self.ticker_col)[col]
                 .transform(lambda s: s.ffill())
@@ -828,7 +976,11 @@ class DataProcessor:
         
         logger.info("=" * 60)
         logger.info("DYNAMIC COVARIANCE FEATURES COMPLETED")
-        logger.info(f"Added {num_eigenvalues} eigenvalue features")
+        logger.info(
+            "Added covariance features: global=%d | per-asset loadings=%d",
+            len(covariance_feature_columns),
+            len(loading_columns),
+        )
         logger.info(f"Final shape: {df_with_cov.shape}")
         logger.info("=" * 60)
         
@@ -1836,6 +1988,8 @@ class DataProcessor:
             return True
         if column.startswith("Volume_Percentile_"):
             return True
+        if column.startswith("Covariance_ExplainedVarRatio_"):
+            return True
         bounded_prefixes = ("RSI_", "STOCHk_", "STOCHd_", "WILLR_", "MFI_", "ADX_")
         return column.startswith(bounded_prefixes)
 
@@ -1870,6 +2024,7 @@ class DataProcessor:
             "VolOfVol_",
             "Beta_to_Market",
             "Covariance_Eigenvalue_",
+            "Covariance_Trace",
             "Fundamental_",
             "Actuarial_",
             "Candle_",
@@ -2893,6 +3048,22 @@ class DataProcessor:
             num_eigenvalues = cov_config.get('num_eigenvalues', 3)
             for i in range(num_eigenvalues):
                 feature_cols.append(f"Covariance_Eigenvalue_{i}")
+            if bool(cov_config.get('include_explained_variance_ratios', False)):
+                for i in range(num_eigenvalues):
+                    feature_cols.append(f"Covariance_ExplainedVarRatio_{i}")
+            if bool(cov_config.get('include_trace', False)):
+                feature_cols.append("Covariance_Trace")
+            if bool(cov_config.get('include_effective_rank', False)):
+                feature_cols.append("Covariance_EffectiveRank")
+            if bool(cov_config.get('include_pairwise_correlation_stats', False)):
+                feature_cols.extend([
+                    "Covariance_MeanPairwiseCorr",
+                    "Covariance_CorrDispersion",
+                ])
+            if bool(cov_config.get('include_pc_loadings', False)):
+                num_loading_components = int(cov_config.get('num_loading_components', num_eigenvalues))
+                for i in range(max(0, num_loading_components)):
+                    feature_cols.append(f"Covariance_PC{i + 1}_Loading")
 
         if self._fundamental_features_active and self._fundamental_feature_names:
             feature_cols.extend(self._fundamental_feature_names)
