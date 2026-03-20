@@ -1946,12 +1946,12 @@ RUN18_OVERRIDES.update(
 RUN18_OVERRIDES["feature_params"].update(
     {
         "dynamic_covariance": {
-            **copy.deepcopy(RUN17_EXPANDED_OVERRIDES["feature_params"]["dynamic_covariance"]),
+            **copy.deepcopy(DYNAMIC_COVARIANCE_PARAMS),
             "num_eigenvalues": 2,
             "num_loading_components": 2,
         },
         "feature_selection": {
-            **copy.deepcopy(RUN17_EXPANDED_OVERRIDES["feature_params"]["feature_selection"]),
+            **copy.deepcopy(FEATURE_SELECTION_CONFIG),
             "enforce_allowlist": True,
             "allowlist_apply_to_phase2": False,
             "active_features_allowlist": copy.deepcopy(RUN18_ACTIVE_FEATURE_ALLOWLIST),
@@ -2116,10 +2116,10 @@ RUN18_OVERRIDES["training_params"].update(
             },
         ],
         "episode_length_curriculum_schedule": [
-            {"threshold": 0, "episode_length": 756},
-            {"threshold": 200_000, "episode_length": 1008},
-            {"threshold": 350_000, "episode_length": 1500},
-            {"threshold": 475_000, "episode_length": None},
+            {"threshold": 0, "limit": 756},
+            {"threshold": 200_000, "limit": 1008},
+            {"threshold": 350_000, "limit": 1500},
+            {"threshold": 475_000, "limit": None},
         ],
         "episode_length_curriculum_overlap_steps": 10_000,
         "training_early_stop_warmup_steps": 250_000,
