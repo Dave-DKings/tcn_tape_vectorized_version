@@ -1843,6 +1843,12 @@ class TCNFusionActor(DirichletActor):
         mixture_dirichlet_num_components: Optional[int] = None,
         mixture_dirichlet_gating_hidden_dims: Optional[List[int]] = None,
         mixture_dirichlet_component_hidden_dims: Optional[List[int]] = None,
+        objective_experts_enabled: Optional[bool] = None,
+        objective_expert_names: Optional[List[str]] = None,
+        objective_expert_adapter_dim: Optional[int] = None,
+        objective_expert_dropout: Optional[float] = None,
+        objective_router_hidden_dims: Optional[List[int]] = None,
+        objective_router_dropout: Optional[float] = None,
         aux_return_enabled: bool = False,
         exp_tanh_scale: float = 2.5,
         softplus_alpha_floor: float = 0.0,
@@ -1907,6 +1913,18 @@ class TCNFusionActor(DirichletActor):
             mixture_dirichlet_gating_hidden_dims = _DEFAULT_MIXTURE_DIRICHLET_GATING_HIDDEN_DIMS
         if mixture_dirichlet_component_hidden_dims is None:
             mixture_dirichlet_component_hidden_dims = _DEFAULT_MIXTURE_DIRICHLET_COMPONENT_HIDDEN_DIMS
+        if objective_experts_enabled is None:
+            objective_experts_enabled = _DEFAULT_OBJECTIVE_EXPERTS_ENABLED
+        if objective_expert_names is None:
+            objective_expert_names = _DEFAULT_OBJECTIVE_EXPERT_NAMES
+        if objective_expert_adapter_dim is None:
+            objective_expert_adapter_dim = _DEFAULT_OBJECTIVE_EXPERT_ADAPTER_DIM
+        if objective_expert_dropout is None:
+            objective_expert_dropout = _DEFAULT_OBJECTIVE_EXPERT_DROPOUT
+        if objective_router_hidden_dims is None:
+            objective_router_hidden_dims = _DEFAULT_OBJECTIVE_ROUTER_HIDDEN_DIMS
+        if objective_router_dropout is None:
+            objective_router_dropout = _DEFAULT_OBJECTIVE_ROUTER_DROPOUT
 
         super(TCNFusionActor, self).__init__(
             name=name,
