@@ -3130,6 +3130,14 @@ def run_experiment6_tape(
             raise
     print(f"[OK] Agent created: {agent.__class__.__name__}")
     print(f"   [RAND] Dirichlet Distribution: ENABLED")
+    if getattr(agent, "objective_experts_enabled", False):
+        initial_expert_mask = [
+            1.0,
+            1.0 if bool(initial_reward_flags.get("enable_dsr_reward", False)) else 0.0,
+            1.0 if bool(initial_reward_flags.get("enable_turnover_penalty", False)) else 0.0,
+        ]
+        agent.set_objective_expert_mask(initial_expert_mask)
+        print(f"   [MOE] Objective expert mask initialized to {initial_expert_mask}")
 
     actor_lr_schedule_cfg = training_params.get(
         "actor_lr_schedule",
@@ -5094,6 +5102,10 @@ def run_experiment6_tape(
                     "mixture_components": [],
                     "rewards": [],
                     "values": [],
+                    "expert_rewards": [],
+                    "expert_values": [],
+                    "expert_log_probs": [],
+                    "router_probs": [],
                     "dones": [],
                 }
                 for _ in train_envs
@@ -5116,6 +5128,15 @@ def run_experiment6_tape(
                 batch_action_meta = getattr(agent, "_latest_batch_action_metadata", {}) or {}
                 if batch_action_meta.get("mixture_components", None) is not None:
                     batch_mixture_components = np.asarray(batch_action_meta["mixture_components"], dtype=np.int32)
+                batch_expert_log_probs = None
+                batch_expert_values = None
+                batch_router_probs = None
+                if batch_action_meta.get("expert_log_probs", None) is not None:
+                    batch_expert_log_probs = np.asarray(batch_action_meta["expert_log_probs"], dtype=np.float32)
+                if batch_action_meta.get("expert_values", None) is not None:
+                    batch_expert_values = np.asarray(batch_action_meta["expert_values"], dtype=np.float32)
+                if batch_action_meta.get("router_probs", None) is not None:
+                    batch_router_probs = np.asarray(batch_action_meta["router_probs"], dtype=np.float32)
 
                 for batch_pos, env_idx in enumerate(active_indices):
                     active_env = train_envs[env_idx]
@@ -5146,6 +5167,35 @@ def run_experiment6_tape(
                     )
                     rollout_buffers[env_idx]["rewards"].append(float(reward))
                     rollout_buffers[env_idx]["values"].append(value)
+                    rollout_buffers[env_idx]["expert_rewards"].append(
+                        np.asarray(
+                            [
+                                float(info.get("reward_component_base", 0.0) or 0.0),
+                                float(info.get("reward_component_dsr", 0.0) or 0.0)
+                                + float(info.get("reward_component_benchmark_total", 0.0) or 0.0),
+                                float(info.get("reward_component_turnover", 0.0) or 0.0),
+                            ],
+                            dtype=np.float32,
+                        )
+                    )
+                    rollout_buffers[env_idx]["expert_values"].append(
+                        np.asarray(
+                            batch_expert_values[batch_pos] if batch_expert_values is not None else np.zeros((agent.num_objective_experts,), dtype=np.float32),
+                            dtype=np.float32,
+                        )
+                    )
+                    rollout_buffers[env_idx]["expert_log_probs"].append(
+                        np.asarray(
+                            batch_expert_log_probs[batch_pos] if batch_expert_log_probs is not None else np.zeros((agent.num_objective_experts,), dtype=np.float32),
+                            dtype=np.float32,
+                        )
+                    )
+                    rollout_buffers[env_idx]["router_probs"].append(
+                        np.asarray(
+                            batch_router_probs[batch_pos] if batch_router_probs is not None else np.zeros((agent.num_objective_experts,), dtype=np.float32),
+                            dtype=np.float32,
+                        )
+                    )
                     rollout_buffers[env_idx]["dones"].append(bool(done or truncated))
 
                     step += 1
@@ -5288,12 +5338,35 @@ def run_experiment6_tape(
             agent.clear_memory()
             prev_reward_mean = float(getattr(agent, "_reward_mean", 0.0))
             prev_reward_std = float(max(getattr(agent, "_reward_std", 1.0), 1e-1))
+            prev_expert_reward_mean = np.asarray(
+                getattr(agent, "_expert_reward_mean", np.zeros((getattr(agent, "num_objective_experts", 0),), dtype=np.float32)),
+                dtype=np.float32,
+            )
+            prev_expert_reward_std = np.asarray(
+                getattr(agent, "_expert_reward_std", np.ones((getattr(agent, "num_objective_experts", 0),), dtype=np.float32)),
+                dtype=np.float32,
+            )
+            prev_expert_reward_std = np.maximum(prev_expert_reward_std, 1e-1)
             all_advantages: List[np.ndarray] = []
             all_returns: List[np.ndarray] = []
+            all_expert_advantages: List[np.ndarray] = []
+            all_expert_returns: List[np.ndarray] = []
             for env_idx, buffer in enumerate(rollout_buffers):
                 if not buffer["rewards"]:
                     continue
-                for key in ("states", "actions", "log_probs", "mixture_components", "rewards", "values", "dones"):
+                for key in (
+                    "states",
+                    "actions",
+                    "log_probs",
+                    "mixture_components",
+                    "rewards",
+                    "values",
+                    "expert_rewards",
+                    "expert_values",
+                    "expert_log_probs",
+                    "router_probs",
+                    "dones",
+                ):
                     agent.memory[key].extend(buffer[key])
 
                 rewards_raw = np.asarray(buffer["rewards"], dtype=np.float32)
@@ -5313,8 +5386,12 @@ def run_experiment6_tape(
                         state_for_value, _ = agent.prepare_state_input(seq_for_value)
                     else:
                         state_for_value, _ = agent.prepare_state_input(obs_for_value)
-                    next_value_tensor = tf.cast(agent.critic(state_for_value, training=False), tf.float32)
-                    next_value_scalar = agent._critic_values_to_scalar(next_value_tensor)
+                    actor_eval = agent._parse_actor_outputs(agent.actor(state_for_value, training=False))
+                    critic_eval = agent._parse_critic_outputs(
+                        agent.critic(state_for_value, training=False),
+                        router_probs=actor_eval.get("router_probs", None),
+                    )
+                    next_value_scalar = critic_eval["value"]
                     next_value_scalar = agent._denormalize_value(next_value_scalar)
                     next_value_env = float(np.asarray(next_value_scalar.numpy()).reshape(-1)[0])
 
@@ -5326,12 +5403,57 @@ def run_experiment6_tape(
                 )
                 all_advantages.append(np.asarray(advantages_env, dtype=np.float32))
                 all_returns.append(np.asarray(returns_env, dtype=np.float32))
+                if getattr(agent, "objective_experts_enabled", False):
+                    expert_rewards_arr = np.asarray(buffer["expert_rewards"], dtype=np.float32)
+                    expert_rewards_arr = agent.normalize_expert_rewards_for_update(
+                        expert_rewards_arr,
+                        prev_mean=prev_expert_reward_mean,
+                        prev_std=prev_expert_reward_std,
+                        update_stats=False,
+                    )
+                    expert_values_arr = np.asarray(buffer["expert_values"], dtype=np.float32)
+                    next_expert_values = np.zeros((expert_values_arr.shape[-1],), dtype=np.float32)
+                    if not bool(dones_arr[-1]):
+                        obs_for_value = train_obs[env_idx]
+                        if env_sequence_histories is not None:
+                            seq_for_value = agent.build_sequence_from_history(
+                                env_sequence_histories[env_idx], obs_for_value, mutate=False
+                            )
+                            state_for_value, _ = agent.prepare_state_input(seq_for_value)
+                        else:
+                            state_for_value, _ = agent.prepare_state_input(obs_for_value)
+                        actor_eval = agent._parse_actor_outputs(agent.actor(state_for_value, training=False))
+                        critic_eval = agent._parse_critic_outputs(
+                            agent.critic(state_for_value, training=False),
+                            router_probs=actor_eval.get("router_probs", None),
+                        )
+                        if critic_eval.get("expert_values", None) is not None:
+                            next_expert_values = np.asarray(
+                                critic_eval["expert_values"].numpy(),
+                                dtype=np.float32,
+                            ).reshape(-1)
+                    env_expert_advantages = []
+                    env_expert_returns = []
+                    for expert_idx in range(expert_rewards_arr.shape[-1]):
+                        adv_i, ret_i = agent.compute_gae(
+                            expert_rewards_arr[:, expert_idx],
+                            expert_values_arr[:, expert_idx],
+                            dones_arr,
+                            next_value=float(next_expert_values[expert_idx]) if next_expert_values.size > expert_idx else 0.0,
+                        )
+                        env_expert_advantages.append(np.asarray(adv_i, dtype=np.float32))
+                        env_expert_returns.append(np.asarray(ret_i, dtype=np.float32))
+                    all_expert_advantages.append(np.stack(env_expert_advantages, axis=-1))
+                    all_expert_returns.append(np.stack(env_expert_returns, axis=-1))
 
             if all_advantages and all_returns:
-                precomputed_gae_data = (
-                    np.concatenate(all_advantages, axis=0),
-                    np.concatenate(all_returns, axis=0),
-                )
+                precomputed_gae_data = {
+                    "advantages": np.concatenate(all_advantages, axis=0),
+                    "returns": np.concatenate(all_returns, axis=0),
+                }
+                if all_expert_advantages and all_expert_returns:
+                    precomputed_gae_data["expert_advantages"] = np.concatenate(all_expert_advantages, axis=0)
+                    precomputed_gae_data["expert_returns"] = np.concatenate(all_expert_returns, axis=0)
 
         for _ in range(steps_this_update if not parallel_rollout_enabled else 0):
             action, log_prob, value = agent.get_action_and_value(obs, deterministic=False)
@@ -5353,6 +5475,16 @@ def run_experiment6_tape(
                 value,
                 done,
                 mixture_component=(getattr(agent, "_latest_action_metadata", {}) or {}).get("mixture_component", -1),
+                reward_components={
+                    "base": float(info.get("reward_component_base", 0.0) or 0.0),
+                    "dsr": float(info.get("reward_component_dsr", 0.0) or 0.0),
+                    "turnover": float(info.get("reward_component_turnover", 0.0) or 0.0),
+                    "benchmark_total": float(info.get("reward_component_benchmark_total", 0.0) or 0.0),
+                    "terminal": float(info.get("reward_component_terminal", 0.0) or 0.0),
+                },
+                expert_values=(getattr(agent, "_latest_action_metadata", {}) or {}).get("expert_values", None),
+                expert_log_probs=(getattr(agent, "_latest_action_metadata", {}) or {}).get("expert_log_probs", None),
+                router_probs=(getattr(agent, "_latest_action_metadata", {}) or {}).get("router_probs", None),
             )
             obs = next_obs
             step += 1
@@ -5599,6 +5731,13 @@ def run_experiment6_tape(
                     benchmark_shaping_weight=float(current_reward_component_flags.get("benchmark_shaping_weight", 1.0)),
                     terminal_tape_bonus_weight=float(current_reward_component_flags.get("terminal_tape_bonus_weight", 1.0)),
                 )
+            if getattr(agent, "objective_experts_enabled", False):
+                objective_mask = [
+                    1.0,
+                    1.0 if bool(current_reward_component_flags.get("enable_dsr_reward", False)) else 0.0,
+                    1.0 if bool(current_reward_component_flags.get("enable_turnover_penalty", False)) else 0.0,
+                ]
+                agent.set_objective_expert_mask(objective_mask)
             print(f"\n🧭 REWARD PHASE UPDATE at {step:,} steps:")
             print(
                 "   "
@@ -5615,6 +5754,8 @@ def run_experiment6_tape(
                 f"bm{float(current_reward_component_flags.get('benchmark_shaping_weight', 1.0)):.2f}/"
                 f"tt{float(current_reward_component_flags.get('terminal_tape_bonus_weight', 1.0)):.2f}"
             )
+            if getattr(agent, "objective_experts_enabled", False):
+                print(f"   objective_expert_mask={objective_mask}")
 
         if use_episode_length_curriculum:
             new_episode_limit = determine_episode_limit(step, env_train.total_days)
@@ -7245,7 +7386,14 @@ def evaluate_experiment6_checkpoint(
             log_prob = log_prob + comp_dist.log_prob(selected_component_idx)
         
         # Get value estimate
-        value = tf.cast(agent_eval.critic(state_input, training=False), tf.float32)
+        if hasattr(agent_eval, "_parse_critic_outputs"):
+            critic_eval = agent_eval._parse_critic_outputs(
+                agent_eval.critic(state_input, training=False),
+                router_probs=parsed_actor.get("router_probs", None) if 'parsed_actor' in locals() else None,
+            )
+            value = tf.cast(critic_eval["value"], tf.float32)
+        else:
+            value = tf.cast(agent_eval.critic(state_input, training=False), tf.float32)
         
         # Squeeze if needed
         if needs_squeeze:

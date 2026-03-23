@@ -62,6 +62,22 @@ _DEFAULT_MIXTURE_DIRICHLET_GATING_HIDDEN_DIMS = list(
 _DEFAULT_MIXTURE_DIRICHLET_COMPONENT_HIDDEN_DIMS = list(
     _DEFAULT_AGENT_PARAMS.get('mixture_dirichlet_component_hidden_dims', [64])
 )
+_DEFAULT_OBJECTIVE_EXPERTS_ENABLED = bool(_DEFAULT_AGENT_PARAMS.get('objective_experts_enabled', False))
+_DEFAULT_OBJECTIVE_EXPERT_NAMES = list(
+    _DEFAULT_AGENT_PARAMS.get('objective_expert_names', ['return', 'risk', 'discipline'])
+)
+_DEFAULT_OBJECTIVE_EXPERT_ADAPTER_DIM = int(
+    _DEFAULT_AGENT_PARAMS.get('objective_expert_adapter_dim', _DEFAULT_FUSION_EMBED_DIM)
+)
+_DEFAULT_OBJECTIVE_EXPERT_DROPOUT = float(
+    _DEFAULT_AGENT_PARAMS.get('objective_expert_dropout', _DEFAULT_FUSION_DROPOUT)
+)
+_DEFAULT_OBJECTIVE_ROUTER_HIDDEN_DIMS = list(
+    _DEFAULT_AGENT_PARAMS.get('objective_router_hidden_dims', [64, 32])
+)
+_DEFAULT_OBJECTIVE_ROUTER_DROPOUT = float(
+    _DEFAULT_AGENT_PARAMS.get('objective_router_dropout', 0.05)
+)
 _RUNTIME_STATE_AUGMENTATION_ENABLED = _DEFAULT_STATE_AUGMENTATION_ENABLED
 
 
@@ -998,6 +1014,9 @@ class DirichletActor(Model):
         mixture_gating_logits: Optional[tf.Tensor] = None,
         projection_logits: Optional[tf.Tensor] = None,
         aux_return_preds: Optional[tf.Tensor] = None,
+        expert_alpha: Optional[tf.Tensor] = None,
+        router_logits: Optional[tf.Tensor] = None,
+        router_probs: Optional[tf.Tensor] = None,
     ):
         """Return backward-compatible actor outputs.
 
@@ -1007,6 +1026,17 @@ class DirichletActor(Model):
         """
         proj_logits = logits_for_alpha if projection_logits is None else projection_logits
         alpha = self._compute_alpha(logits_for_alpha)
+        if expert_alpha is not None:
+            result = {
+                "alpha": alpha,
+                "expert_alpha": expert_alpha,
+                "router_logits": router_logits,
+                "router_probs": router_probs,
+                "projection_logits": proj_logits if self._dual_head_enabled else None,
+            }
+            if aux_return_preds is not None:
+                result["aux_return_preds"] = aux_return_preds
+            return result
         if mixture_logits_for_alpha is not None:
             mixture_alpha = self._compute_alpha(mixture_logits_for_alpha)
             result = {
@@ -1028,6 +1058,21 @@ class DirichletActor(Model):
                 result["aux_return_preds"] = aux_return_preds
             return result
         return alpha
+
+
+class ObjectiveExpertAdapter(layers.Layer):
+    """Small expert-specific adapter used after the shared encoder."""
+
+    def __init__(self, output_dim: int, dropout: float, name: str):
+        super().__init__(name=name)
+        self.norm = layers.LayerNormalization(epsilon=1e-6, name=f"{name}_norm")
+        self.dense = layers.Dense(output_dim, activation="gelu", name=f"{name}_dense")
+        self.dropout = layers.Dropout(float(dropout), name=f"{name}_dropout")
+
+    def call(self, x: tf.Tensor, training=None) -> tf.Tensor:
+        x = self.norm(x)
+        x = self.dense(x)
+        return self.dropout(x, training=training)
 
 
 class MLPActor(DirichletActor):
@@ -1067,6 +1112,12 @@ class MLPActor(DirichletActor):
         mixture_dirichlet_num_components: Optional[int] = None,
         mixture_dirichlet_gating_hidden_dims: Optional[List[int]] = None,
         mixture_dirichlet_component_hidden_dims: Optional[List[int]] = None,
+        objective_experts_enabled: Optional[bool] = None,
+        objective_expert_names: Optional[List[str]] = None,
+        objective_expert_adapter_dim: Optional[int] = None,
+        objective_expert_dropout: Optional[float] = None,
+        objective_router_hidden_dims: Optional[List[int]] = None,
+        objective_router_dropout: Optional[float] = None,
         aux_return_enabled: bool = False,
         exp_tanh_scale: float = 2.5,
         softplus_alpha_floor: float = 0.0,
@@ -1093,6 +1144,18 @@ class MLPActor(DirichletActor):
             mixture_dirichlet_gating_hidden_dims = _DEFAULT_MIXTURE_DIRICHLET_GATING_HIDDEN_DIMS
         if mixture_dirichlet_component_hidden_dims is None:
             mixture_dirichlet_component_hidden_dims = _DEFAULT_MIXTURE_DIRICHLET_COMPONENT_HIDDEN_DIMS
+        if objective_experts_enabled is None:
+            objective_experts_enabled = _DEFAULT_OBJECTIVE_EXPERTS_ENABLED
+        if objective_expert_names is None:
+            objective_expert_names = _DEFAULT_OBJECTIVE_EXPERT_NAMES
+        if objective_expert_adapter_dim is None:
+            objective_expert_adapter_dim = _DEFAULT_OBJECTIVE_EXPERT_ADAPTER_DIM
+        if objective_expert_dropout is None:
+            objective_expert_dropout = _DEFAULT_OBJECTIVE_EXPERT_DROPOUT
+        if objective_router_hidden_dims is None:
+            objective_router_hidden_dims = _DEFAULT_OBJECTIVE_ROUTER_HIDDEN_DIMS
+        if objective_router_dropout is None:
+            objective_router_dropout = _DEFAULT_OBJECTIVE_ROUTER_DROPOUT
 
         super(MLPActor, self).__init__(
             name=name,
@@ -2109,6 +2172,90 @@ class TCNFusionActor(DirichletActor):
                 layers.Dropout(0.05),
                 layers.Dense(1, activation=None, name=f'{name}_aux_ret_out'),
             ], name=f'{name}_aux_return_predictor')
+        sanitized_expert_names = [str(x).strip().lower() for x in (objective_expert_names or []) if str(x).strip()]
+        if not sanitized_expert_names:
+            sanitized_expert_names = ["return", "risk", "discipline"]
+        self.objective_experts_enabled = bool(objective_experts_enabled)
+        self.objective_expert_names = list(sanitized_expert_names[:3])
+        self.num_objective_experts = len(self.objective_expert_names)
+        self.objective_expert_adapter_dim = max(8, int(objective_expert_adapter_dim))
+        self.objective_expert_dropout = float(max(0.0, objective_expert_dropout))
+        self.objective_expert_mask = tf.Variable(
+            np.ones((self.num_objective_experts,), dtype=np.float32),
+            trainable=False,
+            dtype=tf.float32,
+            name=f"{name}_objective_expert_mask",
+        )
+        self.objective_asset_adapters: List[ObjectiveExpertAdapter] = []
+        self.objective_fused_adapters: List[ObjectiveExpertAdapter] = []
+        self.objective_per_asset_logit_heads: List[layers.Dense] = []
+        self.objective_cash_logit_heads: List[Optional[layers.Dense]] = []
+        self.objective_output_heads: List[layers.Dense] = []
+        self.objective_router_layers: List[Tuple[layers.Dense, layers.Dropout]] = []
+        self.objective_router_logits = None
+        if self.objective_experts_enabled:
+            for expert_name in self.objective_expert_names:
+                self.objective_asset_adapters.append(
+                    ObjectiveExpertAdapter(
+                        output_dim=self.objective_expert_adapter_dim,
+                        dropout=self.objective_expert_dropout,
+                        name=f"{name}_{expert_name}_asset_adapter",
+                    )
+                )
+                self.objective_fused_adapters.append(
+                    ObjectiveExpertAdapter(
+                        output_dim=self.objective_expert_adapter_dim,
+                        dropout=self.objective_expert_dropout,
+                        name=f"{name}_{expert_name}_fused_adapter",
+                    )
+                )
+                if self.per_asset_alpha_head_enabled:
+                    self.objective_per_asset_logit_heads.append(
+                        layers.Dense(
+                            1,
+                            activation=None,
+                            kernel_initializer="orthogonal",
+                            bias_initializer=tf.keras.initializers.Constant(0.5),
+                            name=f"{name}_{expert_name}_per_asset_logit",
+                        )
+                    )
+                    if self.num_actions > self.num_assets:
+                        self.objective_cash_logit_heads.append(
+                            layers.Dense(
+                                self.num_actions - self.num_assets,
+                                activation=None,
+                                kernel_initializer="orthogonal",
+                                bias_initializer=tf.keras.initializers.Constant(0.5),
+                                name=f"{name}_{expert_name}_cash_logit",
+                            )
+                        )
+                    else:
+                        self.objective_cash_logit_heads.append(None)
+                else:
+                    self.objective_output_heads.append(
+                        layers.Dense(
+                            self.num_actions,
+                            activation=None,
+                            kernel_initializer="orthogonal",
+                            bias_initializer=tf.keras.initializers.Constant(0.5),
+                            name=f"{name}_{expert_name}_output",
+                        )
+                    )
+
+            for i, hidden_units in enumerate([int(x) for x in (objective_router_hidden_dims or []) if int(x) > 0]):
+                self.objective_router_layers.append(
+                    (
+                        layers.Dense(hidden_units, activation="gelu", name=f"{name}_objective_router_{i}"),
+                        layers.Dropout(float(objective_router_dropout), name=f"{name}_objective_router_drop_{i}"),
+                    )
+                )
+            self.objective_router_logits = layers.Dense(
+                self.num_objective_experts,
+                activation=None,
+                kernel_initializer="orthogonal",
+                bias_initializer=tf.keras.initializers.Constant([2.0, 0.0, -0.5][: self.num_objective_experts]),
+                name=f"{name}_objective_router_logits",
+            )
         self.mixture_dirichlet_enabled = bool(mixture_dirichlet_enabled)
         self.mixture_dirichlet_num_components = max(1, int(mixture_dirichlet_num_components))
         gating_dims = [int(x) for x in (mixture_dirichlet_gating_hidden_dims or []) if int(x) > 0]
@@ -2247,6 +2394,39 @@ class TCNFusionActor(DirichletActor):
 
         x = self._align_feature_dim(state)
         return x
+
+    def set_objective_expert_mask(self, mask: List[float]) -> None:
+        if not self.objective_experts_enabled:
+            return
+        arr = np.asarray(mask, dtype=np.float32).reshape(-1)
+        if arr.size != self.num_objective_experts:
+            raise ValueError(
+                f"objective expert mask size mismatch: got {arr.size}, expected {self.num_objective_experts}"
+            )
+        arr = np.where(arr > 0.0, 1.0, 0.0).astype(np.float32)
+        if float(np.sum(arr)) <= 0.0:
+            arr[0] = 1.0
+        self.objective_expert_mask.assign(arr)
+
+    def _compute_objective_router_probs(self, router_features: tf.Tensor, training=None) -> Tuple[tf.Tensor, tf.Tensor]:
+        router_hidden = router_features
+        for dense_layer, dropout_layer in self.objective_router_layers:
+            router_hidden = dense_layer(router_hidden)
+            router_hidden = dropout_layer(router_hidden, training=training)
+        router_logits = self.objective_router_logits(router_hidden, training=training)
+        expert_mask = tf.cast(self.objective_expert_mask, router_logits.dtype)[tf.newaxis, :]
+        masked_logits = tf.where(
+            expert_mask > 0.0,
+            router_logits,
+            tf.fill(tf.shape(router_logits), tf.cast(-1e9, router_logits.dtype)),
+        )
+        router_probs = tf.nn.softmax(masked_logits, axis=-1)
+        router_probs = router_probs * expert_mask
+        router_probs = router_probs / tf.maximum(
+            tf.reduce_sum(router_probs, axis=-1, keepdims=True),
+            tf.cast(1e-8, router_probs.dtype),
+        )
+        return router_logits, router_probs
 
     def call(self, state, training=None):
         if isinstance(state, dict):
@@ -2397,8 +2577,47 @@ class TCNFusionActor(DirichletActor):
             aux_preds = self.aux_return_head(tf.stop_gradient(x_assets) if not training else x_assets, training=training)
             aux_preds = tf.squeeze(aux_preds, axis=-1)  # (batch, num_assets)
 
-        # --- Change 3: Per-asset alpha head OR legacy pooled head ---
-        if self.per_asset_alpha_head_enabled and self.per_asset_logit_head is not None:
+        alpha_features = None
+        logits = None
+        expert_logits = None
+        router_logits = None
+        router_probs = None
+
+        # --- Change 3: Per-asset alpha head OR objective-expert heads OR legacy pooled head ---
+        if self.objective_experts_enabled:
+            expert_logits_list = []
+            asset_context_router = self.asset_pool(x_assets)
+            router_feature_parts = [asset_context_router, global_context]
+            if regime_embedding is not None:
+                router_feature_parts.append(regime_embedding)
+            router_features = tf.concat(router_feature_parts, axis=-1)
+            router_logits, router_probs = self._compute_objective_router_probs(router_features, training=training)
+
+            for expert_idx in range(self.num_objective_experts):
+                expert_asset_features = self.objective_asset_adapters[expert_idx](x_assets, training=training)
+                expert_fused_features = self.objective_fused_adapters[expert_idx](fused, training=training)
+                if self.per_asset_alpha_head_enabled and self.objective_per_asset_logit_heads:
+                    risky_logits = self.objective_per_asset_logit_heads[expert_idx](
+                        expert_asset_features,
+                        training=training,
+                    )
+                    risky_logits = tf.squeeze(risky_logits, axis=-1)
+                    cash_head = self.objective_cash_logit_heads[expert_idx]
+                    if cash_head is not None:
+                        cash_logits = cash_head(expert_fused_features, training=training)
+                        expert_logit = tf.concat([risky_logits, cash_logits], axis=-1)
+                    else:
+                        expert_logit = risky_logits
+                else:
+                    expert_logit = self.objective_output_heads[expert_idx](expert_fused_features, training=training)
+                expert_logits_list.append(expert_logit)
+
+            expert_logits = tf.stack(expert_logits_list, axis=1)
+            logits = tf.reduce_sum(
+                router_probs[:, :, tf.newaxis] * expert_logits,
+                axis=1,
+            )
+        elif self.per_asset_alpha_head_enabled and self.per_asset_logit_head is not None:
             # x_assets is (batch, num_assets, embed_dim)
             # Apply optional richer alpha MLP per-asset
             if self.use_richer_alpha_head and self.alpha_pre_norm is not None:
@@ -2463,7 +2682,7 @@ class TCNFusionActor(DirichletActor):
                 else:
                     mixture_logits = risky_component_logits
             else:
-                component_features = alpha_features if 'alpha_features' in locals() else fused
+                component_features = alpha_features if alpha_features is not None else fused
                 if self.mixture_component_norm is not None:
                     component_features = self.mixture_component_norm(component_features)
                 for dense_layer, dropout_layer in self.mixture_component_layers:
@@ -2480,6 +2699,9 @@ class TCNFusionActor(DirichletActor):
             mixture_logits_for_alpha=mixture_logits,
             mixture_gating_logits=gating_logits,
             aux_return_preds=aux_preds,
+            expert_alpha=self._compute_alpha(expert_logits) if expert_logits is not None else None,
+            router_logits=router_logits,
+            router_probs=router_probs,
         )
 
     def get_film_diagnostics(self, state) -> Dict[str, float]:
@@ -3006,6 +3228,10 @@ class TCNFusionCritic(Model):
         regime_conditioning_mode: Optional[str] = None,
         distributional_critic_enabled: Optional[bool] = None,
         distributional_num_quantiles: Optional[int] = None,
+        objective_experts_enabled: Optional[bool] = None,
+        objective_expert_names: Optional[List[str]] = None,
+        objective_expert_adapter_dim: Optional[int] = None,
+        objective_expert_dropout: Optional[float] = None,
         name: str = "tcn_fusion_critic",
     ):
         super(TCNFusionCritic, self).__init__(name=name)
@@ -3056,6 +3282,14 @@ class TCNFusionCritic(Model):
             distributional_critic_enabled = _DEFAULT_DISTRIBUTIONAL_CRITIC_ENABLED
         if distributional_num_quantiles is None:
             distributional_num_quantiles = _DEFAULT_DISTRIBUTIONAL_NUM_QUANTILES
+        if objective_experts_enabled is None:
+            objective_experts_enabled = _DEFAULT_OBJECTIVE_EXPERTS_ENABLED
+        if objective_expert_names is None:
+            objective_expert_names = _DEFAULT_OBJECTIVE_EXPERT_NAMES
+        if objective_expert_adapter_dim is None:
+            objective_expert_adapter_dim = _DEFAULT_OBJECTIVE_EXPERT_ADAPTER_DIM
+        if objective_expert_dropout is None:
+            objective_expert_dropout = _DEFAULT_OBJECTIVE_EXPERT_DROPOUT
 
         self.input_dim = int(input_dim)
         self.num_assets = int(num_assets) if num_assets is not None else 5
@@ -3074,6 +3308,14 @@ class TCNFusionCritic(Model):
         self.regime_conditioning_enabled = bool(regime_conditioning_enabled)
         self.distributional_critic_enabled = bool(distributional_critic_enabled)
         self.distributional_num_quantiles = max(2, int(distributional_num_quantiles))
+        sanitized_expert_names = [str(x).strip().lower() for x in (objective_expert_names or []) if str(x).strip()]
+        if not sanitized_expert_names:
+            sanitized_expert_names = ["return", "risk", "discipline"]
+        self.objective_experts_enabled = bool(objective_experts_enabled)
+        self.objective_expert_names = list(sanitized_expert_names[:3])
+        self.num_objective_experts = len(self.objective_expert_names)
+        self.objective_expert_adapter_dim = max(8, int(objective_expert_adapter_dim))
+        self.objective_expert_dropout = float(max(0.0, objective_expert_dropout))
 
         if self.fusion_embed_dim % fusion_attention_heads != 0:
             fusion_attention_heads = 1
@@ -3220,6 +3462,25 @@ class TCNFusionCritic(Model):
 
         output_units = self.distributional_num_quantiles if self.distributional_critic_enabled else 1
         self.output_layer = layers.Dense(output_units, activation=None, kernel_initializer="orthogonal", name=f"{name}_output")
+        self.objective_value_adapters: List[ObjectiveExpertAdapter] = []
+        self.objective_value_heads: List[layers.Dense] = []
+        if self.objective_experts_enabled:
+            for expert_name in self.objective_expert_names:
+                self.objective_value_adapters.append(
+                    ObjectiveExpertAdapter(
+                        output_dim=self.objective_expert_adapter_dim,
+                        dropout=self.objective_expert_dropout,
+                        name=f"{name}_{expert_name}_value_adapter",
+                    )
+                )
+                self.objective_value_heads.append(
+                    layers.Dense(
+                        1,
+                        activation=None,
+                        kernel_initializer="orthogonal",
+                        name=f"{name}_{expert_name}_value",
+                    )
+                )
 
     def _align_feature_dim(self, x: tf.Tensor) -> tf.Tensor:
         current_dim = tf.shape(x)[-1]
@@ -3381,6 +3642,16 @@ class TCNFusionCritic(Model):
                 training=training,
             )
 
+        if self.objective_experts_enabled:
+            expert_values = []
+            for adapter, head in zip(self.objective_value_adapters, self.objective_value_heads):
+                adapted = adapter(fused, training=training)
+                value = head(adapted, training=training)
+                expert_values.append(tf.squeeze(value, axis=-1))
+            return {
+                "expert_values": tf.stack(expert_values, axis=-1),
+            }
+
         return self.output_layer(fused, training=training)
 
 
@@ -3489,6 +3760,26 @@ def create_actor_critic(architecture: str,
             config.get("mixture_dirichlet_component_hidden_dims", _DEFAULT_MIXTURE_DIRICHLET_COMPONENT_HIDDEN_DIMS)
         ),
     }
+    objective_expert_kwargs = {
+        "objective_experts_enabled": bool(
+            config.get("objective_experts_enabled", _DEFAULT_OBJECTIVE_EXPERTS_ENABLED)
+        ),
+        "objective_expert_names": list(
+            config.get("objective_expert_names", _DEFAULT_OBJECTIVE_EXPERT_NAMES)
+        ),
+        "objective_expert_adapter_dim": int(
+            config.get("objective_expert_adapter_dim", _DEFAULT_OBJECTIVE_EXPERT_ADAPTER_DIM)
+        ),
+        "objective_expert_dropout": float(
+            config.get("objective_expert_dropout", _DEFAULT_OBJECTIVE_EXPERT_DROPOUT)
+        ),
+        "objective_router_hidden_dims": list(
+            config.get("objective_router_hidden_dims", _DEFAULT_OBJECTIVE_ROUTER_HIDDEN_DIMS)
+        ),
+        "objective_router_dropout": float(
+            config.get("objective_router_dropout", _DEFAULT_OBJECTIVE_ROUTER_DROPOUT)
+        ),
+    }
     ppo_params_cfg = config.get("ppo_params", {}) if isinstance(config.get("ppo_params", {}), dict) else {}
     aux_return_enabled_cfg = bool(
         config.get("aux_return_pred_enabled", ppo_params_cfg.get("aux_return_pred_enabled", False))
@@ -3544,6 +3835,7 @@ def create_actor_critic(architecture: str,
                 fusion_per_asset_alpha_head=config.get('fusion_per_asset_alpha_head', _DEFAULT_FUSION_PER_ASSET_ALPHA_HEAD),
                 dual_head_enabled=dual_head_enabled_cfg,
                 **mixture_kwargs,
+                **objective_expert_kwargs,
                 aux_return_enabled=aux_return_enabled_cfg,
                 **recurrent_kwargs,
                 **regime_kwargs,
@@ -3569,6 +3861,10 @@ def create_actor_critic(architecture: str,
                 fusion_context_cross_attention_enabled=config.get('fusion_context_cross_attention_enabled', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_ENABLED),
                 fusion_context_cross_attention_heads=config.get('fusion_context_cross_attention_heads', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_HEADS),
                 fusion_context_cross_attention_dropout=config.get('fusion_context_cross_attention_dropout', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_DROPOUT),
+                objective_experts_enabled=objective_expert_kwargs["objective_experts_enabled"],
+                objective_expert_names=objective_expert_kwargs["objective_expert_names"],
+                objective_expert_adapter_dim=objective_expert_kwargs["objective_expert_adapter_dim"],
+                objective_expert_dropout=objective_expert_kwargs["objective_expert_dropout"],
                 **recurrent_kwargs,
                 **regime_kwargs,
                 **critic_distributional_kwargs,
@@ -3652,6 +3948,7 @@ def create_actor_critic(architecture: str,
             fusion_per_asset_alpha_head=config.get('fusion_per_asset_alpha_head', _DEFAULT_FUSION_PER_ASSET_ALPHA_HEAD),
             dual_head_enabled=dual_head_enabled_cfg,
             **mixture_kwargs,
+            **objective_expert_kwargs,
             aux_return_enabled=aux_return_enabled_cfg,
             **recurrent_kwargs,
             **regime_kwargs,
@@ -3677,6 +3974,10 @@ def create_actor_critic(architecture: str,
             fusion_context_cross_attention_enabled=config.get('fusion_context_cross_attention_enabled', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_ENABLED),
             fusion_context_cross_attention_heads=config.get('fusion_context_cross_attention_heads', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_HEADS),
             fusion_context_cross_attention_dropout=config.get('fusion_context_cross_attention_dropout', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_DROPOUT),
+            objective_experts_enabled=objective_expert_kwargs["objective_experts_enabled"],
+            objective_expert_names=objective_expert_kwargs["objective_expert_names"],
+            objective_expert_adapter_dim=objective_expert_kwargs["objective_expert_adapter_dim"],
+            objective_expert_dropout=objective_expert_kwargs["objective_expert_dropout"],
             **recurrent_kwargs,
             **regime_kwargs,
             **critic_distributional_kwargs,

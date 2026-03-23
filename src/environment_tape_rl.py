@@ -1436,6 +1436,16 @@ class PortfolioEnvTAPE(gym.Env):
             
             # Clip to prevent extreme values (wider range for strong turnover signal)
             final_step_reward = np.clip(final_step_reward, -150.0, 150.0)
+            self._last_reward_component_breakdown = {
+                'base': float(base_reward),
+                'dsr': float(dsr_component),
+                'turnover': float(turnover_reward),
+                'benchmark_equal_weight': float(outperformance_bonus),
+                'benchmark_spy': float(spy_outperformance_bonus),
+                'benchmark_total': float(outperformance_bonus + spy_outperformance_bonus),
+                'terminal': 0.0,
+                'total': float(final_step_reward),
+            }
             return np.nan_to_num(final_step_reward, nan=0.0, posinf=150.0, neginf=-150.0)
         
         else:
@@ -1671,6 +1681,17 @@ class PortfolioEnvTAPE(gym.Env):
                     tape_bonus_raw_final = 0.0
                     tape_bonus_core_final = 0.0
                     terminal_bonus = 0.0
+
+                self._last_reward_component_breakdown = {
+                    'base': 0.0,
+                    'dsr': 0.0,
+                    'turnover': 0.0,
+                    'benchmark_equal_weight': 0.0,
+                    'benchmark_spy': 0.0,
+                    'benchmark_total': 0.0,
+                    'terminal': float(tape_bonus_final),
+                    'total': float(reward),
+                }
 
                 if self.enable_terminal_tape_bonus:
                     logger.info(f"🎯 TAPE Terminal Bonus")
@@ -2169,6 +2190,20 @@ class PortfolioEnvTAPE(gym.Env):
             'reward_weight_turnover': float(getattr(self, 'turnover_penalty_weight', 0.0)),
             'reward_weight_benchmark': float(getattr(self, 'benchmark_shaping_weight', 0.0)),
             'reward_weight_terminal': float(getattr(self, 'terminal_tape_bonus_weight', 0.0)),
+            'reward_component_base': float(getattr(self, '_last_reward_component_breakdown', {}).get('base', 0.0)),
+            'reward_component_dsr': float(getattr(self, '_last_reward_component_breakdown', {}).get('dsr', 0.0)),
+            'reward_component_turnover': float(getattr(self, '_last_reward_component_breakdown', {}).get('turnover', 0.0)),
+            'reward_component_benchmark_equal_weight': float(
+                getattr(self, '_last_reward_component_breakdown', {}).get('benchmark_equal_weight', 0.0)
+            ),
+            'reward_component_benchmark_spy': float(
+                getattr(self, '_last_reward_component_breakdown', {}).get('benchmark_spy', 0.0)
+            ),
+            'reward_component_benchmark_total': float(
+                getattr(self, '_last_reward_component_breakdown', {}).get('benchmark_total', 0.0)
+            ),
+            'reward_component_terminal': float(getattr(self, '_last_reward_component_breakdown', {}).get('terminal', 0.0)),
+            'reward_component_total': float(getattr(self, '_last_reward_component_breakdown', {}).get('total', 0.0)),
         }
         
         return observation, reward, terminated, False, info

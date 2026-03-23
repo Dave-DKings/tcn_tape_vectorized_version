@@ -2138,6 +2138,114 @@ RUN18_OVERRIDES["environment_params"].update(
 )
 
 
+# ── Run 19: Multi-objective TAPE experts on top of the Run18 backbone ──
+RUN19_OVERRIDES = copy.deepcopy(RUN18_OVERRIDES)
+RUN19_OVERRIDES["agent_params"].update(
+    {
+        "distributional_critic_enabled": False,
+        "objective_experts_enabled": True,
+        "objective_expert_names": ["return", "risk", "discipline"],
+        "objective_expert_adapter_dim": 128,
+        "objective_expert_dropout": 0.10,
+        "objective_router_hidden_dims": [64, 32],
+        "objective_router_dropout": 0.05,
+    }
+)
+RUN19_OVERRIDES["agent_params"]["ppo_params"].update(
+    {
+        "objective_head_aux_coef": 0.50,
+        "objective_head_diversity_coef": 0.02,
+        "objective_router_entropy_coef": 0.005,
+    }
+)
+RUN19_OVERRIDES["training_params"]["reward_component_schedule"] = [
+    {
+        "threshold": 0,
+        "phase": "A_return_only",
+        "enable_base_reward": True,
+        "enable_dsr_reward": False,
+        "enable_turnover_penalty": False,
+        "enable_benchmark_shaping": False,
+        "enable_terminal_tape_bonus": False,
+        "base_reward_weight": 1.0,
+        "dsr_reward_weight": 0.0,
+        "turnover_penalty_weight": 0.0,
+        "benchmark_shaping_weight": 0.0,
+        "terminal_tape_bonus_weight": 0.0,
+    },
+    {
+        "threshold": 200_000,
+        "phase": "B_ramp_1",
+        "enable_base_reward": True,
+        "enable_dsr_reward": True,
+        "enable_turnover_penalty": False,
+        "enable_benchmark_shaping": True,
+        "enable_terminal_tape_bonus": False,
+        "base_reward_weight": 1.0,
+        "dsr_reward_weight": 0.25,
+        "turnover_penalty_weight": 0.0,
+        "benchmark_shaping_weight": 0.20,
+        "terminal_tape_bonus_weight": 0.0,
+    },
+    {
+        "threshold": 260_000,
+        "phase": "B_ramp_2",
+        "enable_base_reward": True,
+        "enable_dsr_reward": True,
+        "enable_turnover_penalty": False,
+        "enable_benchmark_shaping": True,
+        "enable_terminal_tape_bonus": False,
+        "base_reward_weight": 1.0,
+        "dsr_reward_weight": 0.60,
+        "turnover_penalty_weight": 0.0,
+        "benchmark_shaping_weight": 0.50,
+        "terminal_tape_bonus_weight": 0.0,
+    },
+    {
+        "threshold": 320_000,
+        "phase": "C_ramp_1",
+        "enable_base_reward": True,
+        "enable_dsr_reward": True,
+        "enable_turnover_penalty": True,
+        "enable_benchmark_shaping": True,
+        "enable_terminal_tape_bonus": True,
+        "base_reward_weight": 1.0,
+        "dsr_reward_weight": 1.0,
+        "turnover_penalty_weight": 0.15,
+        "benchmark_shaping_weight": 0.75,
+        "terminal_tape_bonus_weight": 0.15,
+    },
+    {
+        "threshold": 380_000,
+        "phase": "C_ramp_2",
+        "enable_base_reward": True,
+        "enable_dsr_reward": True,
+        "enable_turnover_penalty": True,
+        "enable_benchmark_shaping": True,
+        "enable_terminal_tape_bonus": True,
+        "base_reward_weight": 1.0,
+        "dsr_reward_weight": 1.0,
+        "turnover_penalty_weight": 0.45,
+        "benchmark_shaping_weight": 1.0,
+        "terminal_tape_bonus_weight": 0.45,
+    },
+    {
+        "threshold": 440_000,
+        "phase": "C_full_tape",
+        "enable_base_reward": True,
+        "enable_dsr_reward": True,
+        "enable_turnover_penalty": True,
+        "enable_benchmark_shaping": True,
+        "enable_terminal_tape_bonus": True,
+        "base_reward_weight": 1.0,
+        "dsr_reward_weight": 1.0,
+        "turnover_penalty_weight": 1.0,
+        "benchmark_shaping_weight": 1.0,
+        "terminal_tape_bonus_weight": 1.0,
+    },
+]
+
+
 RUN11_RELAXED_OVERRIDES = copy.deepcopy(RUN10_ALPHA_OVERRIDES)
 RUN11_RELAXED_OVERRIDES.update(
     {
@@ -3643,6 +3751,89 @@ def build_run18_config(
     if analysis_end_date is not None:
         config["ANALYSIS_END_DATE"] = analysis_end_date
     assert_run18_config(config)
+    return config
+
+
+def apply_run19_overrides(config: dict, overrides: dict = None) -> dict:
+    """Apply the canonical Run19 multi-objective expert recipe in-place."""
+    global TRAIN_TEST_SPLIT_DATE
+    resolved = copy.deepcopy(RUN19_OVERRIDES if overrides is None else overrides)
+    split_date = resolved.get("TRAIN_TEST_SPLIT_DATE")
+    if split_date:
+        TRAIN_TEST_SPLIT_DATE = split_date
+        config["TRAIN_TEST_SPLIT_DATE"] = split_date
+    _deep_update_config(config, resolved)
+    return config
+
+
+def assert_run19_config(config: dict) -> None:
+    """Raise if a config expected to match the canonical Run19 recipe drifted."""
+    agent = config.get("agent_params", {})
+    ppo = agent.get("ppo_params", {})
+    training = config.get("training_params", {})
+    env = config.get("environment_params", {})
+    assert int(config.get("NUM_ASSETS", 0)) == 10, "Run19 must stay on the 10-asset universe"
+    assert list(agent.get("tcn_filters", [])) == [64, 96, 128], "Run19 TCN filters drifted"
+    assert list(agent.get("tcn_dilations", [])) == [1, 2, 4], "Run19 TCN dilations drifted"
+    assert int(agent.get("tcn_kernel_size", 0)) == 5, "Run19 TCN kernel size drifted"
+    assert str(agent.get("dirichlet_alpha_activation", "")).lower() == "cross_softplus", (
+        "Run19 alpha activation must stay cross_softplus"
+    )
+    assert float(agent.get("dirichlet_softplus_alpha_floor", 0.0)) == 0.75, (
+        "Run19 softplus alpha floor drifted"
+    )
+    assert float(agent.get("dirichlet_softplus_alpha_scale", 0.0)) == 2.5, (
+        "Run19 softplus alpha scale drifted"
+    )
+    assert float(env.get("target_turnover", 0.0)) == 0.35, "Run19 target_turnover drifted"
+    assert bool(agent.get("objective_experts_enabled", False)), "Run19 objective experts must stay enabled"
+    assert list(agent.get("objective_expert_names", [])) == ["return", "risk", "discipline"], (
+        "Run19 objective_expert_names drifted"
+    )
+    assert int(agent.get("objective_expert_adapter_dim", 0)) == 128, (
+        "Run19 objective_expert_adapter_dim drifted"
+    )
+    assert float(agent.get("objective_expert_dropout", 0.0)) == 0.10, (
+        "Run19 objective_expert_dropout drifted"
+    )
+    assert list(agent.get("objective_router_hidden_dims", [])) == [64, 32], (
+        "Run19 objective_router_hidden_dims drifted"
+    )
+    assert float(agent.get("objective_router_dropout", 0.0)) == 0.05, (
+        "Run19 objective_router_dropout drifted"
+    )
+    assert not bool(agent.get("distributional_critic_enabled", True)), (
+        "Run19 distributional critic must stay off for the first expert implementation"
+    )
+    assert not bool(agent.get("dual_head_enabled", False)), "Run19 dual_head must stay off"
+    assert not bool(agent.get("mixture_dirichlet_enabled", False)), "Run19 mixture_dirichlet must stay off"
+    assert float(ppo.get("objective_head_aux_coef", 0.0)) == 0.50, (
+        "Run19 objective_head_aux_coef drifted"
+    )
+    assert float(ppo.get("objective_head_diversity_coef", 0.0)) == 0.02, (
+        "Run19 objective_head_diversity_coef drifted"
+    )
+    assert float(ppo.get("objective_router_entropy_coef", 0.0)) == 0.005, (
+        "Run19 objective_router_entropy_coef drifted"
+    )
+    expected_reward_schedule = copy.deepcopy(RUN19_OVERRIDES["training_params"]["reward_component_schedule"])
+    actual_reward_schedule = copy.deepcopy(training.get("reward_component_schedule", []))
+    assert actual_reward_schedule == expected_reward_schedule, "Run19 reward_component_schedule drifted"
+
+
+def build_run19_config(
+    phase_name: str = "phase1",
+    *,
+    analysis_end_date: str | None = None,
+    overrides: dict | None = None,
+) -> dict:
+    """Return a deep-copied phase config with the canonical Run19 overrides applied."""
+    config = copy.deepcopy(get_active_config(phase_name))
+    enforce_feature_audit_plan(config)
+    apply_run19_overrides(config, overrides=overrides)
+    if analysis_end_date is not None:
+        config["ANALYSIS_END_DATE"] = analysis_end_date
+    assert_run19_config(config)
     return config
 
 

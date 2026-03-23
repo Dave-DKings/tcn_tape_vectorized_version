@@ -365,6 +365,26 @@ class PPOAgentTF:
         except (TypeError, ValueError):
             min_cash = 0.05
         self.dual_head_projection_min_cash_position = float(np.clip(min_cash, 0.0, 1.0))
+        self.objective_experts_enabled = bool(config.get('objective_experts_enabled', False))
+        self.objective_expert_names = [
+            str(x).strip().lower()
+            for x in config.get('objective_expert_names', ['return', 'risk', 'discipline'])
+            if str(x).strip()
+        ]
+        if not self.objective_expert_names:
+            self.objective_expert_names = ['return', 'risk', 'discipline']
+        self.num_objective_experts = len(self.objective_expert_names)
+        self.objective_head_aux_coef = float(max(ppo_params.get('objective_head_aux_coef', 0.5), 0.0))
+        self.objective_head_diversity_coef = float(max(ppo_params.get('objective_head_diversity_coef', 0.02), 0.0))
+        self.objective_router_entropy_coef = float(max(ppo_params.get('objective_router_entropy_coef', 0.005), 0.0))
+        self.objective_expert_mask = np.ones((self.num_objective_experts,), dtype=np.float32)
+        if self.objective_experts_enabled:
+            if self.dual_head_enabled:
+                raise ValueError("objective_experts_enabled is not compatible with dual_head_enabled.")
+            if self.mixture_dirichlet_enabled:
+                raise ValueError("objective_experts_enabled is not compatible with mixture_dirichlet_enabled.")
+            if self.distributional_critic_enabled:
+                raise ValueError("objective_experts_enabled currently requires scalar critics.")
 
         # Create networks using architecture factory
         logger.info(f"Creating {self.architecture} actor-critic networks...")
@@ -391,6 +411,10 @@ class PPOAgentTF:
             'mixture_components': [],
             'rewards': [],
             'values': [],
+            'expert_rewards': [],
+            'expert_values': [],
+            'expert_log_probs': [],
+            'router_probs': [],
             'dones': []
         }
         self._latest_action_metadata = {}
@@ -461,6 +485,9 @@ class PPOAgentTF:
         self.reward_rms = RunningMeanStd()
         self._reward_mean = 0.0
         self._reward_std = 1.0
+        self.expert_reward_rms = [RunningMeanStd() for _ in range(self.num_objective_experts)]
+        self._expert_reward_mean = np.zeros((self.num_objective_experts,), dtype=np.float32)
+        self._expert_reward_std = np.ones((self.num_objective_experts,), dtype=np.float32)
         # Debug/diagnostic verbosity toggle
         self.debug_prints = bool(config.get('debug_prints', False))
 
@@ -573,6 +600,21 @@ class PPOAgentTF:
             self.dirichlet_epsilon_min,
             self.dirichlet_epsilon_max,
         )
+
+    def set_objective_expert_mask(self, mask: List[float]) -> None:
+        if not self.objective_experts_enabled:
+            return
+        arr = np.asarray(mask, dtype=np.float32).reshape(-1)
+        if arr.size != self.num_objective_experts:
+            raise ValueError(
+                f"objective expert mask size mismatch: got {arr.size}, expected {self.num_objective_experts}"
+            )
+        arr = np.where(arr > 0.0, 1.0, 0.0).astype(np.float32)
+        if float(np.sum(arr)) <= 0.0:
+            arr[0] = 1.0
+        self.objective_expert_mask = arr
+        if hasattr(self.actor, "set_objective_expert_mask"):
+            self.actor.set_objective_expert_mask(arr.tolist())
 
     def _split_flat_state_array(self, state_array):
         """
@@ -935,6 +977,43 @@ class PPOAgentTF:
         """Public wrapper used by external rollout collectors for GAE consistency."""
         return self._apply_multi_horizon_reward_decomposition(raw_rewards)
 
+    def normalize_expert_rewards_for_update(self, raw_expert_rewards, prev_mean=None, prev_std=None, update_stats=False):
+        """
+        Normalize objective-expert reward streams independently.
+
+        The c0/c1/c2 streams operate on different natural scales and their
+        curriculum weights change over time, so each stream needs its own
+        running statistics.
+        """
+        rewards = np.asarray(raw_expert_rewards, dtype=np.float32)
+        if rewards.size == 0:
+            return rewards
+        if rewards.ndim == 1:
+            rewards = rewards[:, np.newaxis]
+        if rewards.shape[-1] != self.num_objective_experts:
+            raise ValueError(
+                f"expert reward shape mismatch: got {rewards.shape}, expected last dim {self.num_objective_experts}"
+            )
+
+        means = np.asarray(
+            self._expert_reward_mean if prev_mean is None else prev_mean,
+            dtype=np.float32,
+        ).reshape(1, -1)
+        stds = np.asarray(
+            self._expert_reward_std if prev_std is None else prev_std,
+            dtype=np.float32,
+        ).reshape(1, -1)
+        stds = np.maximum(stds, 1e-1)
+        rewards_norm = np.clip((rewards - means) / stds, -5.0, 5.0).astype(np.float32)
+
+        if update_stats:
+            for expert_idx in range(self.num_objective_experts):
+                self.expert_reward_rms[expert_idx].update(rewards[:, expert_idx])
+                self._expert_reward_mean[expert_idx] = float(self.expert_reward_rms[expert_idx].mean)
+                self._expert_reward_std[expert_idx] = float(max(self.expert_reward_rms[expert_idx].std, 1e-1))
+
+        return rewards_norm
+
     def _distributional_quantile_loss(self, pred_quantiles, target_values):
         """
         Quantile Huber loss for distributional critic.
@@ -1030,12 +1109,18 @@ class PPOAgentTF:
         alpha = actor_output
         mixture_alpha = None
         mixture_gating_logits = None
+        expert_alpha = None
+        router_logits = None
+        router_probs = None
         if isinstance(actor_output, dict):
             alpha = actor_output.get("alpha", actor_output.get("dirichlet_alpha", None))
             projection_logits = actor_output.get("projection_logits", actor_output.get("softmax_logits", None))
             aux_return_preds = actor_output.get("aux_return_preds", None)
             mixture_alpha = actor_output.get("mixture_alpha", None)
             mixture_gating_logits = actor_output.get("mixture_gating_logits", None)
+            expert_alpha = actor_output.get("expert_alpha", None)
+            router_logits = actor_output.get("router_logits", None)
+            router_probs = actor_output.get("router_probs", None)
         elif isinstance(actor_output, (tuple, list)) and len(actor_output) > 0:
             alpha = actor_output[0]
             if len(actor_output) > 1:
@@ -1055,6 +1140,13 @@ class PPOAgentTF:
             mixture_alpha = tf.maximum(mixture_alpha, tf.constant(1e-6, dtype=mixture_alpha.dtype))
         if mixture_gating_logits is not None:
             mixture_gating_logits = _to_tensor_with_cast(mixture_gating_logits, tf.float32)
+        if expert_alpha is not None:
+            expert_alpha = _to_tensor_with_cast(expert_alpha, tf.float32)
+            expert_alpha = tf.maximum(expert_alpha, tf.constant(1e-6, dtype=expert_alpha.dtype))
+        if router_logits is not None:
+            router_logits = _to_tensor_with_cast(router_logits, tf.float32)
+        if router_probs is not None:
+            router_probs = _to_tensor_with_cast(router_probs, tf.float32)
 
         mixture_probs = None
         if mixture_alpha is not None and mixture_gating_logits is not None:
@@ -1068,6 +1160,38 @@ class PPOAgentTF:
             "mixture_alpha": mixture_alpha,
             "mixture_gating_logits": mixture_gating_logits,
             "mixture_probs": mixture_probs,
+            "expert_alpha": expert_alpha,
+            "router_logits": router_logits,
+            "router_probs": router_probs,
+        }
+
+    def _parse_critic_outputs(self, critic_output, router_probs: Optional[tf.Tensor] = None):
+        if isinstance(critic_output, dict):
+            expert_values = critic_output.get("expert_values", None)
+            if expert_values is not None:
+                expert_values = _to_tensor_with_cast(expert_values, tf.float32)
+                if expert_values.shape.rank == 3 and expert_values.shape[-1] == 1:
+                    expert_values = tf.squeeze(expert_values, axis=-1)
+                if router_probs is None:
+                    if self.objective_experts_enabled:
+                        mask = tf.constant(self.objective_expert_mask, dtype=expert_values.dtype)
+                        mask = tf.maximum(mask, tf.cast(0.0, expert_values.dtype))
+                        mask_sum = tf.reduce_sum(mask)
+                        router_probs = mask[tf.newaxis, :] / tf.maximum(mask_sum, tf.cast(1e-8, expert_values.dtype))
+                    else:
+                        router_probs = tf.ones_like(expert_values, dtype=expert_values.dtype)
+                        router_probs = router_probs / tf.cast(tf.shape(expert_values)[-1], expert_values.dtype)
+                else:
+                    router_probs = _to_tensor_with_cast(router_probs, expert_values.dtype)
+                blended_value = tf.reduce_sum(router_probs * expert_values, axis=-1)
+                return {
+                    "value": blended_value,
+                    "expert_values": expert_values,
+                }
+        value = self._critic_values_to_scalar(critic_output)
+        return {
+            "value": value,
+            "expert_values": None,
         }
 
     def _gather_component_alpha(self, mixture_alpha: tf.Tensor, component_indices: tf.Tensor) -> tf.Tensor:
@@ -1291,6 +1415,8 @@ class PPOAgentTF:
         projection_logits = actor_parts["projection_logits"]
         mixture_alpha = actor_parts["mixture_alpha"]
         mixture_probs = actor_parts["mixture_probs"]
+        expert_alpha = actor_parts["expert_alpha"]
+        router_probs = actor_parts["router_probs"]
 
         selected_component = None
         if self.mixture_dirichlet_enabled and mixture_alpha is not None and mixture_probs is not None:
@@ -1325,9 +1451,15 @@ class PPOAgentTF:
             log_prob = log_prob + categorical.log_prob(selected_component)
         
         # Get value estimate
-        value = self.critic(state_input, training=False)
-        value = self._critic_values_to_scalar(value)
+        critic_output = self.critic(state_input, training=False)
+        critic_parts = self._parse_critic_outputs(critic_output, router_probs=router_probs)
+        value = critic_parts["value"]
         value = self._denormalize_value(value)
+
+        expert_log_probs = None
+        expert_values = critic_parts["expert_values"]
+        if self.objective_experts_enabled and expert_alpha is not None:
+            expert_log_probs = tfd.Dirichlet(expert_alpha).log_prob(action[:, tf.newaxis, :])
 
         # Squeeze batch dimension if needed
         if needs_squeeze:
@@ -1336,9 +1468,18 @@ class PPOAgentTF:
             value = tf.squeeze(value, 0)
             if selected_component is not None:
                 selected_component = tf.squeeze(selected_component, 0)
+            if expert_log_probs is not None:
+                expert_log_probs = tf.squeeze(expert_log_probs, 0)
+            if expert_values is not None:
+                expert_values = tf.squeeze(expert_values, 0)
+            if router_probs is not None:
+                router_probs = tf.squeeze(router_probs, 0)
 
         self._latest_action_metadata = {
             "mixture_component": None if selected_component is None else int(np.asarray(selected_component.numpy()).reshape(-1)[0]),
+            "expert_log_probs": None if expert_log_probs is None else np.asarray(expert_log_probs.numpy(), dtype=np.float32),
+            "expert_values": None if expert_values is None else np.asarray(expert_values.numpy(), dtype=np.float32),
+            "router_probs": None if router_probs is None else np.asarray(router_probs.numpy(), dtype=np.float32),
         }
         
         return action, log_prob, value
@@ -1395,6 +1536,8 @@ class PPOAgentTF:
         projection_logits = actor_parts["projection_logits"]
         mixture_alpha = actor_parts["mixture_alpha"]
         mixture_probs = actor_parts["mixture_probs"]
+        expert_alpha = actor_parts["expert_alpha"]
+        router_probs = actor_parts["router_probs"]
 
         selected_components = None
         if self.mixture_dirichlet_enabled and mixture_alpha is not None and mixture_probs is not None:
@@ -1428,12 +1571,20 @@ class PPOAgentTF:
         if selected_components is not None and mixture_probs is not None:
             categorical = tfd.Categorical(probs=mixture_probs)
             log_prob = log_prob + categorical.log_prob(selected_components)
-        value = self.critic(prepared_state, training=False)
-        value = self._critic_values_to_scalar(value)
+        critic_output = self.critic(prepared_state, training=False)
+        critic_parts = self._parse_critic_outputs(critic_output, router_probs=router_probs)
+        value = critic_parts["value"]
         value = self._denormalize_value(value)
+
+        expert_log_probs = None
+        if self.objective_experts_enabled and expert_alpha is not None:
+            expert_log_probs = tfd.Dirichlet(expert_alpha).log_prob(action[:, tf.newaxis, :])
 
         self._latest_batch_action_metadata = {
             "mixture_components": None if selected_components is None else np.asarray(selected_components.numpy(), dtype=np.int32),
+            "expert_log_probs": None if expert_log_probs is None else np.asarray(expert_log_probs.numpy(), dtype=np.float32),
+            "expert_values": None if critic_parts["expert_values"] is None else np.asarray(critic_parts["expert_values"].numpy(), dtype=np.float32),
+            "router_probs": None if router_probs is None else np.asarray(router_probs.numpy(), dtype=np.float32),
         }
 
         return (
@@ -1443,7 +1594,20 @@ class PPOAgentTF:
             states_for_storage,
         )
     
-    def store_transition(self, state, action, log_prob, reward, value, done, mixture_component=None):
+    def store_transition(
+        self,
+        state,
+        action,
+        log_prob,
+        reward,
+        value,
+        done,
+        mixture_component=None,
+        reward_components=None,
+        expert_values=None,
+        expert_log_probs=None,
+        router_probs=None,
+    ):
         """
         Store a transition in memory with shape normalization.
         
@@ -1491,7 +1655,44 @@ class PPOAgentTF:
             mixture_component = int(mixture_component)
         except Exception:
             mixture_component = -1
-        
+        if expert_values is None:
+            expert_values = self._latest_action_metadata.get("expert_values", None)
+        if expert_log_probs is None:
+            expert_log_probs = self._latest_action_metadata.get("expert_log_probs", None)
+        if router_probs is None:
+            router_probs = self._latest_action_metadata.get("router_probs", None)
+        if reward_components is None:
+            reward_components = {}
+        expert_reward_vector = np.zeros((self.num_objective_experts,), dtype=np.float32)
+        if self.objective_experts_enabled:
+            benchmark_total = float(reward_components.get("benchmark_total", 0.0) or 0.0)
+            expert_reward_vector = np.asarray(
+                [
+                    float(reward_components.get("base", 0.0) or 0.0),
+                    float(reward_components.get("dsr", 0.0) or 0.0) + benchmark_total,
+                    float(reward_components.get("turnover", 0.0) or 0.0),
+                ],
+                dtype=np.float32,
+            )
+        expert_values_arr = np.asarray(
+            expert_values if expert_values is not None else np.zeros((self.num_objective_experts,), dtype=np.float32),
+            dtype=np.float32,
+        ).reshape(-1)
+        expert_log_probs_arr = np.asarray(
+            expert_log_probs if expert_log_probs is not None else np.zeros((self.num_objective_experts,), dtype=np.float32),
+            dtype=np.float32,
+        ).reshape(-1)
+        router_probs_arr = np.asarray(
+            router_probs if router_probs is not None else np.zeros((self.num_objective_experts,), dtype=np.float32),
+            dtype=np.float32,
+        ).reshape(-1)
+        if expert_values_arr.size != self.num_objective_experts:
+            expert_values_arr = np.resize(expert_values_arr, self.num_objective_experts).astype(np.float32)
+        if expert_log_probs_arr.size != self.num_objective_experts:
+            expert_log_probs_arr = np.resize(expert_log_probs_arr, self.num_objective_experts).astype(np.float32)
+        if router_probs_arr.size != self.num_objective_experts:
+            router_probs_arr = np.resize(router_probs_arr, self.num_objective_experts).astype(np.float32)
+
         # Store in memory
         self.memory['states'].append(state)
         self.memory['actions'].append(action)
@@ -1499,6 +1700,10 @@ class PPOAgentTF:
         self.memory['mixture_components'].append(mixture_component)
         self.memory['rewards'].append(float(reward))
         self.memory['values'].append(float(value))
+        self.memory['expert_rewards'].append(expert_reward_vector)
+        self.memory['expert_values'].append(expert_values_arr)
+        self.memory['expert_log_probs'].append(expert_log_probs_arr)
+        self.memory['router_probs'].append(router_probs_arr)
         self.memory['dones'].append(bool(done))
 
         self._global_step += 1
@@ -1790,7 +1995,16 @@ class PPOAgentTF:
         return total_aux, sharpe_proxy, sharpe_loss, mvo_loss, cvar_proxy, cvar_loss
 
     # @tf.function  # DISABLED: Causes weight caching issues with PPO ratio stuck at 1.0
-    def _actor_loss(self, states, actions, log_probs_old, advantages, mixture_components=None):
+    def _actor_loss(
+        self,
+        states,
+        actions,
+        log_probs_old,
+        advantages,
+        mixture_components=None,
+        expert_log_probs_old=None,
+        expert_advantages=None,
+    ):
         """
         Compute the actor loss (PPO clipped objective + entropy bonus).
         
@@ -1812,6 +2026,8 @@ class PPOAgentTF:
         mixture_alpha = actor_parts["mixture_alpha"]
         mixture_gating_logits = actor_parts["mixture_gating_logits"]
         mixture_probs = actor_parts["mixture_probs"]
+        expert_alpha = actor_parts["expert_alpha"]
+        router_probs = actor_parts["router_probs"]
 
         mixture_balance_loss = tf.constant(0.0, dtype=tf.float32)
         mixture_separation_loss = tf.constant(0.0, dtype=tf.float32)
@@ -1893,6 +2109,45 @@ class PPOAgentTF:
             dirichlet = tfd.Dirichlet(alpha)
             log_probs_new = dirichlet.log_prob(actions)
             entropy = tf.reduce_mean(dirichlet.entropy())
+
+        objective_expert_loss = tf.constant(0.0, dtype=tf.float32)
+        objective_router_entropy = tf.constant(0.0, dtype=tf.float32)
+        objective_diversity_loss = tf.constant(0.0, dtype=tf.float32)
+        if self.objective_experts_enabled and expert_alpha is not None:
+            expert_mask = tf.constant(self.objective_expert_mask, dtype=tf.float32)[tf.newaxis, :]
+            active_expert_count = tf.maximum(tf.reduce_sum(expert_mask), 1.0)
+            expert_dist = tfd.Dirichlet(expert_alpha)
+            if expert_advantages is not None:
+                expert_log_probs_new = expert_dist.log_prob(actions[:, tf.newaxis, :])
+                expert_advantages = _to_tensor_with_cast(expert_advantages, tf.float32)
+                expert_weighted_log_prob = expert_mask * tf.stop_gradient(expert_advantages) * expert_log_probs_new
+                objective_expert_loss = (
+                    tf.constant(self.objective_head_aux_coef, dtype=tf.float32)
+                    * -tf.reduce_sum(expert_weighted_log_prob)
+                    / (tf.cast(tf.shape(actions)[0], tf.float32) * active_expert_count)
+                )
+            if router_probs is not None and self.objective_router_entropy_coef > 0.0:
+                router_probs_safe = tf.maximum(router_probs, tf.constant(1e-8, dtype=router_probs.dtype))
+                objective_router_entropy = -tf.constant(
+                    self.objective_router_entropy_coef,
+                    dtype=tf.float32,
+                ) * tf.reduce_mean(-tf.reduce_sum(router_probs_safe * tf.math.log(router_probs_safe), axis=-1))
+            if self.objective_head_diversity_coef > 0.0:
+                expert_means = expert_alpha / tf.maximum(tf.reduce_sum(expert_alpha, axis=-1, keepdims=True), 1e-8)
+                expert_means = tf.math.l2_normalize(expert_means, axis=-1)
+                sims = tf.matmul(expert_means, expert_means, transpose_b=True)
+                num_experts = tf.shape(sims)[-1]
+                off_diag = 1.0 - tf.eye(num_experts, dtype=sims.dtype)
+                pair_mask = tf.matmul(expert_mask[:, :, tf.newaxis], expert_mask[:, tf.newaxis, :])
+                masked_off_diag = off_diag[tf.newaxis, :, :] * pair_mask
+                mean_similarity = tf.reduce_sum(sims * masked_off_diag, axis=[1, 2]) / tf.maximum(
+                    tf.reduce_sum(masked_off_diag, axis=[1, 2]),
+                    1.0,
+                )
+                objective_diversity_loss = (
+                    tf.constant(self.objective_head_diversity_coef, dtype=tf.float32)
+                    * tf.reduce_mean(mean_similarity)
+                )
 
         # Stabilize PPO ratio by clipping the log-probability delta
         log_prob_delta_raw = log_probs_new - log_probs_old
@@ -1995,6 +2250,9 @@ class PPOAgentTF:
             + mixture_balance_loss
             + mixture_separation_loss
             + mixture_component_dispersion_loss
+            + objective_expert_loss
+            + objective_router_entropy
+            + objective_diversity_loss
         )
         
         approx_kl = tf.reduce_mean(log_probs_old - log_probs_new)
@@ -2022,6 +2280,9 @@ class PPOAgentTF:
             mixture_separation_loss,
             mixture_component_dispersion_loss,
             mixture_gating_entropy,
+            objective_expert_loss,
+            objective_router_entropy,
+            objective_diversity_loss,
         )
     
     @tf.function(reduce_retracing=True)
@@ -2096,6 +2357,41 @@ class PPOAgentTF:
                 loss = tf.reduce_mean(tf.square(returns_norm - values_norm))
         
         return loss, clip_fraction
+
+    def _objective_critic_loss(self, states, expert_returns, old_expert_values=None, expert_mask=None):
+        critic_output = self.critic(states, training=True)
+        critic_parts = self._parse_critic_outputs(critic_output)
+        expert_values = critic_parts["expert_values"]
+        if expert_values is None:
+            raise ValueError("Objective critic loss requested but critic does not emit expert_values.")
+        expert_returns = _to_tensor_with_cast(expert_returns, tf.float32)
+        if expert_mask is None:
+            expert_mask = tf.constant(self.objective_expert_mask, dtype=tf.float32)
+        expert_mask = tf.reshape(_to_tensor_with_cast(expert_mask, tf.float32), (1, -1))
+        loss_unclipped = tf.square(expert_returns - expert_values)
+        clip_fraction = tf.constant(0.0, dtype=tf.float32)
+        if (
+            self.value_clip_range is not None
+            and self.value_clip_range > 0.0
+            and old_expert_values is not None
+        ):
+            old_expert_values = _to_tensor_with_cast(old_expert_values, tf.float32)
+            expert_values_clipped = old_expert_values + tf.clip_by_value(
+                expert_values - old_expert_values,
+                -self.value_clip_range,
+                self.value_clip_range,
+            )
+            loss_clipped = tf.square(expert_returns - expert_values_clipped)
+            clip_flags = tf.cast(tf.abs(expert_values - old_expert_values) > self.value_clip_range, tf.float32)
+            clip_fraction = tf.reduce_sum(clip_flags * expert_mask) / tf.maximum(tf.reduce_sum(expert_mask), 1.0)
+            loss_matrix = tf.maximum(loss_unclipped, loss_clipped)
+        else:
+            loss_matrix = loss_unclipped
+        loss = tf.reduce_sum(loss_matrix * expert_mask) / tf.maximum(
+            tf.cast(tf.shape(loss_matrix)[0], tf.float32) * tf.reduce_sum(expert_mask),
+            1.0,
+        )
+        return loss, clip_fraction
     
     def update(self, num_epochs=10, batch_size=64, precomputed_gae=None):
         """
@@ -2123,6 +2419,10 @@ class PPOAgentTF:
         mixture_components_old = np.array(self.memory.get('mixture_components', []), dtype=np.int32)
         rewards = np.array(self.memory['rewards'])
         values = np.array(self.memory['values'])
+        expert_rewards = np.array(self.memory.get('expert_rewards', []), dtype=np.float32)
+        expert_values = np.array(self.memory.get('expert_values', []), dtype=np.float32)
+        expert_log_probs_old = np.array(self.memory.get('expert_log_probs', []), dtype=np.float32)
+        router_probs_old = np.array(self.memory.get('router_probs', []), dtype=np.float32)
         dones = np.array(self.memory['dones'])
         
         if self.debug_prints:
@@ -2158,14 +2458,45 @@ class PPOAgentTF:
                     f"   Multi-horizon bonus: mean={np.mean(mh_bonus):.6f}, std={np.std(mh_bonus):.6f}, "
                     f"max={np.max(mh_bonus):.6f}"
                 )
+        if self.objective_experts_enabled:
+            if expert_rewards.size == 0:
+                expert_rewards = np.zeros((len(rewards), self.num_objective_experts), dtype=np.float32)
+            prev_expert_mean = np.array(self._expert_reward_mean, copy=True)
+            prev_expert_std = np.maximum(np.array(self._expert_reward_std, copy=True), 1e-1)
+            expert_rewards = self.normalize_expert_rewards_for_update(
+                expert_rewards,
+                prev_mean=prev_expert_mean,
+                prev_std=prev_expert_std,
+                update_stats=True,
+            )
+            if self.debug_prints:
+                print(
+                    "   Expert reward running mean/std: "
+                    f"mean={np.round(self._expert_reward_mean, 6).tolist()}, "
+                    f"std={np.round(self._expert_reward_std, 6).tolist()}"
+                )
         
         values_old = values.copy()
+        expert_values_old = expert_values.copy()
+        expert_advantages = None
+        expert_returns = None
         if precomputed_gae is not None:
-            try:
-                advantages = np.asarray(precomputed_gae[0], dtype=np.float32)
-                returns = np.asarray(precomputed_gae[1], dtype=np.float32)
-            except Exception as exc:
-                raise ValueError(f"Invalid precomputed_gae provided to update(): {exc}") from exc
+            if isinstance(precomputed_gae, dict):
+                try:
+                    advantages = np.asarray(precomputed_gae["advantages"], dtype=np.float32)
+                    returns = np.asarray(precomputed_gae["returns"], dtype=np.float32)
+                    if "expert_advantages" in precomputed_gae:
+                        expert_advantages = np.asarray(precomputed_gae["expert_advantages"], dtype=np.float32)
+                    if "expert_returns" in precomputed_gae:
+                        expert_returns = np.asarray(precomputed_gae["expert_returns"], dtype=np.float32)
+                except Exception as exc:
+                    raise ValueError(f"Invalid precomputed_gae dict provided to update(): {exc}") from exc
+            else:
+                try:
+                    advantages = np.asarray(precomputed_gae[0], dtype=np.float32)
+                    returns = np.asarray(precomputed_gae[1], dtype=np.float32)
+                except Exception as exc:
+                    raise ValueError(f"Invalid precomputed_gae provided to update(): {exc}") from exc
             if len(advantages) != len(rewards) or len(returns) != len(rewards):
                 raise ValueError(
                     "precomputed_gae length mismatch: "
@@ -2174,6 +2505,23 @@ class PPOAgentTF:
         else:
             # Compute advantages and returns using GAE
             advantages, returns = self.compute_gae(rewards, values_old, dones)
+        if self.objective_experts_enabled:
+            if expert_advantages is None or expert_returns is None:
+                expert_advantages_list = []
+                expert_returns_list = []
+                if expert_rewards.size == 0 or expert_values_old.size == 0:
+                    expert_rewards = np.zeros((len(rewards), self.num_objective_experts), dtype=np.float32)
+                    expert_values_old = np.zeros((len(rewards), self.num_objective_experts), dtype=np.float32)
+                for expert_idx in range(self.num_objective_experts):
+                    adv_i, ret_i = self.compute_gae(
+                        expert_rewards[:, expert_idx],
+                        expert_values_old[:, expert_idx],
+                        dones,
+                    )
+                    expert_advantages_list.append(np.asarray(adv_i, dtype=np.float32))
+                    expert_returns_list.append(np.asarray(ret_i, dtype=np.float32))
+                expert_advantages = np.stack(expert_advantages_list, axis=-1)
+                expert_returns = np.stack(expert_returns_list, axis=-1)
         
         # Store raw advantages for diagnostics BEFORE normalization
         raw_advantages = advantages.copy()
@@ -2190,7 +2538,13 @@ class PPOAgentTF:
         
         # Normalize advantages
         advantages = (advantages - np.mean(advantages)) / (np.std(advantages) + 1e-8)
-        
+        if self.objective_experts_enabled and expert_advantages is not None:
+            normalized_cols = []
+            for expert_idx in range(self.num_objective_experts):
+                col = expert_advantages[:, expert_idx]
+                normalized_cols.append((col - np.mean(col)) / (np.std(col) + 1e-8))
+            expert_advantages = np.stack(normalized_cols, axis=-1)
+
         # DIAGNOSTIC: Check advantages AFTER normalization
         if self.debug_prints:
             print(f"   Normalized advantages: min={advantages.min():.6f}, max={advantages.max():.6f}")
@@ -2208,6 +2562,22 @@ class PPOAgentTF:
         mixture_components_old = tf.constant(
             mixture_components_old if mixture_components_old.size else np.full(len(actions), -1, dtype=np.int32),
             dtype=tf.int32,
+        )
+        expert_log_probs_old_tf = tf.constant(
+            expert_log_probs_old if expert_log_probs_old.size else np.zeros((len(actions), self.num_objective_experts), dtype=np.float32),
+            dtype=tf.float32,
+        )
+        expert_advantages_tf = tf.constant(
+            expert_advantages if expert_advantages is not None else np.zeros((len(actions), self.num_objective_experts), dtype=np.float32),
+            dtype=tf.float32,
+        )
+        expert_returns_tf = tf.constant(
+            expert_returns if expert_returns is not None else np.zeros((len(actions), self.num_objective_experts), dtype=np.float32),
+            dtype=tf.float32,
+        )
+        expert_old_values_tf = tf.constant(
+            expert_values_old if expert_values_old.size else np.zeros((len(actions), self.num_objective_experts), dtype=np.float32),
+            dtype=tf.float32,
         )
         advantages = tf.constant(advantages, dtype=tf.float32)
         returns = tf.constant(returns, dtype=tf.float32)
@@ -2258,6 +2628,10 @@ class PPOAgentTF:
             'mixture_separation_loss': 0.0,
             'mixture_component_dispersion_loss': 0.0,
             'mixture_gating_entropy': 0.0,
+            'objective_expert_loss': 0.0,
+            'objective_router_entropy': 0.0,
+            'objective_diversity_loss': 0.0,
+            'objective_router_probs': np.zeros(self.num_objective_experts, dtype=np.float64),
             'mixture_component_usage': np.zeros(self.mixture_dirichlet_num_components, dtype=np.float64),
             # Track risky-asset alpha means only; cash is handled separately in actions
             # and would break ticker-aligned diagnostics if included here.
@@ -2318,9 +2692,13 @@ class PPOAgentTF:
                 batch_actions = tf.gather(actions, batch_indices)
                 batch_log_probs_old = tf.gather(log_probs_old, batch_indices)
                 batch_mixture_components_old = tf.gather(mixture_components_old, batch_indices)
+                batch_expert_log_probs_old = tf.gather(expert_log_probs_old_tf, batch_indices)
+                batch_expert_advantages = tf.gather(expert_advantages_tf, batch_indices)
                 batch_advantages = tf.gather(advantages, batch_indices)
                 batch_returns = tf.gather(returns, batch_indices)
+                batch_expert_returns = tf.gather(expert_returns_tf, batch_indices)
                 batch_old_values = tf.gather(old_values_tf, batch_indices)
+                batch_old_expert_values = tf.gather(expert_old_values_tf, batch_indices)
                 
                 # Update actor
                 with tf.GradientTape() as tape:
@@ -2345,8 +2723,17 @@ class PPOAgentTF:
                         mixture_separation_loss,
                         mixture_component_dispersion_loss,
                         mixture_gating_entropy,
+                        objective_expert_loss,
+                        objective_router_entropy,
+                        objective_diversity_loss,
                     ) = self._actor_loss(
-                        batch_states, batch_actions, batch_log_probs_old, batch_advantages, batch_mixture_components_old
+                        batch_states,
+                        batch_actions,
+                        batch_log_probs_old,
+                        batch_advantages,
+                        batch_mixture_components_old,
+                        batch_expert_log_probs_old,
+                        batch_expert_advantages,
                     )
                 
                 actor_grads = tape.gradient(actor_loss, self.actor.trainable_variables)
@@ -2360,13 +2747,21 @@ class PPOAgentTF:
                 
                 # Update critic
                 with tf.GradientTape() as tape:
-                    critic_loss_raw, value_clip_fraction = self._critic_loss(
-                        batch_states,
-                        batch_returns,
-                        returns_mean_tf,
-                        returns_std_tf,
-                        batch_old_values
-                    )
+                    if self.objective_experts_enabled:
+                        critic_loss_raw, value_clip_fraction = self._objective_critic_loss(
+                            batch_states,
+                            batch_expert_returns,
+                            batch_old_expert_values,
+                            self.objective_expert_mask,
+                        )
+                    else:
+                        critic_loss_raw, value_clip_fraction = self._critic_loss(
+                            batch_states,
+                            batch_returns,
+                            returns_mean_tf,
+                            returns_std_tf,
+                            batch_old_values
+                        )
                     # Apply configurable value-function coefficient to critic optimization.
                     # This was previously ignored because actor/critic are updated separately.
                     critic_loss = critic_loss_raw * self.vf_coef
@@ -2406,6 +2801,9 @@ class PPOAgentTF:
                 stats['mixture_separation_loss'] += float(mixture_separation_loss)
                 stats['mixture_component_dispersion_loss'] += float(mixture_component_dispersion_loss)
                 stats['mixture_gating_entropy'] += float(mixture_gating_entropy)
+                stats['objective_expert_loss'] += float(objective_expert_loss)
+                stats['objective_router_entropy'] += float(objective_router_entropy)
+                stats['objective_diversity_loss'] += float(objective_diversity_loss)
                 if self.risk_aux_cvar_adaptive_enabled:
                     self._update_adaptive_cvar_coef(float(cvar_aux_proxy))
                 stats['risk_aux_cvar_coef'] = float(self.risk_aux_cvar_coef)
@@ -2421,6 +2819,11 @@ class PPOAgentTF:
                 stats['alpha_cap_hit_frac'] += alpha_cap_hit_frac_batch
                 risky_alpha_batch = alpha_batch[..., :self.num_assets]
                 stats['alpha_per_asset'] += np.mean(risky_alpha_batch, axis=0).astype(np.float64)
+                if self.objective_experts_enabled:
+                    actor_diag = self._parse_actor_outputs(self.actor(batch_states, training=False))
+                    batch_router_probs = actor_diag.get("router_probs", None)
+                    if batch_router_probs is not None:
+                        stats['objective_router_probs'] += np.mean(batch_router_probs.numpy(), axis=0).astype(np.float64)
                 film_diag = self.get_film_diagnostics(batch_states)
                 if film_diag:
                     stats['film_seq_gamma_delta_abs_mean'] += float(film_diag.get('seq_gamma_delta_abs_mean', 0.0))
@@ -2487,6 +2890,7 @@ class PPOAgentTF:
                        'alpha_diversity_loss', 'alpha_dispersion_loss',
                        'mixture_balance_loss', 'mixture_separation_loss',
                        'mixture_component_dispersion_loss', 'mixture_gating_entropy',
+                       'objective_expert_loss', 'objective_router_entropy', 'objective_diversity_loss',
                        'policy_loss', 'entropy_loss', 'entropy',
                        'actor_grad_norm', 'critic_grad_norm', 'alpha_min', 'alpha_max', 'alpha_mean', 'alpha_std',
                        'alpha_cap_hit_frac',
@@ -2497,6 +2901,7 @@ class PPOAgentTF:
                        'ratio_mean', 'ratio_std', 'approx_kl', 'clip_fraction', 'value_clip_fraction']:
                 stats[key] /= num_updates
             stats['alpha_per_asset'] /= num_updates
+            stats['objective_router_probs'] /= num_updates
             usage_total = float(np.sum(stats['mixture_component_usage']))
             if usage_total > 0.0:
                 stats['mixture_component_usage'] /= usage_total
@@ -2507,9 +2912,10 @@ class PPOAgentTF:
         # Clear memory after update
         self.clear_memory()
         
+        actor_eval_parts = self._parse_actor_outputs(self.actor(states, training=False))
         values_post = self.critic(states, training=False)
         returns_np = np.asarray(returns_np, dtype=np.float32)
-        values_post = self._critic_values_to_scalar(values_post)
+        values_post = self._parse_critic_outputs(values_post, router_probs=actor_eval_parts.get("router_probs", None))["value"]
         values_post = self._denormalize_value(values_post).numpy()
         returns_var = np.var(returns_np)
         if returns_var > 1e-8:
