@@ -3131,10 +3131,11 @@ def run_experiment6_tape(
     print(f"[OK] Agent created: {agent.__class__.__name__}")
     print(f"   [RAND] Dirichlet Distribution: ENABLED")
     if getattr(agent, "objective_experts_enabled", False):
+        initial_reward_component_flags = get_current_reward_component_flags(0)
         initial_expert_mask = [
             1.0,
-            1.0 if bool(initial_reward_flags.get("enable_dsr_reward", False)) else 0.0,
-            1.0 if bool(initial_reward_flags.get("enable_turnover_penalty", False)) else 0.0,
+            1.0 if bool(initial_reward_component_flags.get("enable_dsr_reward", False)) else 0.0,
+            1.0 if bool(initial_reward_component_flags.get("enable_turnover_penalty", False)) else 0.0,
         ]
         agent.set_objective_expert_mask(initial_expert_mask)
         print(f"   [MOE] Objective expert mask initialized to {initial_expert_mask}")
