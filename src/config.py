@@ -1968,7 +1968,7 @@ RUN18_OVERRIDES["agent_params"].update(
         "tcn_kernel_size": 5,
         "dirichlet_alpha_activation": "cross_softplus",
         "dirichlet_softplus_alpha_floor": 0.75,
-        "dirichlet_softplus_alpha_scale": 2.5,
+        "dirichlet_softplus_alpha_scale": 3.0,
         "dirichlet_cross_sectional_standardize": True,
     }
 )
@@ -3782,7 +3782,7 @@ def assert_run19_config(config: dict) -> None:
     assert float(agent.get("dirichlet_softplus_alpha_floor", 0.0)) == 0.75, (
         "Run19 softplus alpha floor drifted"
     )
-    assert float(agent.get("dirichlet_softplus_alpha_scale", 0.0)) == 2.5, (
+    assert float(agent.get("dirichlet_softplus_alpha_scale", 0.0)) == 3.0, (
         "Run19 softplus alpha scale drifted"
     )
     assert float(env.get("target_turnover", 0.0)) == 0.35, "Run19 target_turnover drifted"
