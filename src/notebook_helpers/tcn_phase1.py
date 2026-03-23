@@ -900,7 +900,18 @@ TRAINING_FIELDNAMES: List[str] = [
     "alpha_min",
     "alpha_max",
     "alpha_mean",
+    "alpha_std",
     "alpha_cap_hit_frac",
+    "objective_expert_loss",
+    "objective_router_entropy",
+    "objective_diversity_loss",
+    "objective_router_prob_0",
+    "objective_router_prob_1",
+    "objective_router_prob_2",
+    "objective_router_probs",
+    "objective_expert_mask",
+    "nonfinite_actor_loss_detected",
+    "nonfinite_critic_loss_detected",
     "mixture_balance_loss",
     "mixture_separation_loss",
     "mixture_component_dispersion_loss",
@@ -5832,6 +5843,13 @@ def run_experiment6_tape(
         mixture_component_dispersion_loss_value = update_metrics.get("mixture_component_dispersion_loss", 0.0)
         mixture_gating_entropy_value = update_metrics.get("mixture_gating_entropy", 0.0)
         mixture_component_usage_value = update_metrics.get("mixture_component_usage", None)
+        objective_expert_loss_value = update_metrics.get("objective_expert_loss", 0.0)
+        objective_router_entropy_value = update_metrics.get("objective_router_entropy", 0.0)
+        objective_diversity_loss_value = update_metrics.get("objective_diversity_loss", 0.0)
+        objective_router_probs_value = update_metrics.get("objective_router_probs", None)
+        nonfinite_actor_loss_detected_value = update_metrics.get("nonfinite_actor_loss_detected", 0.0)
+        nonfinite_critic_loss_detected_value = update_metrics.get("nonfinite_critic_loss_detected", 0.0)
+        objective_expert_mask_value = getattr(agent, "objective_expert_mask", None)
 
         if ra_kl_enabled:
             approx_kl_scalar = to_scalar(approx_kl_value)
@@ -5866,10 +5884,19 @@ def run_experiment6_tape(
                 if not np.isclose(new_target_kl, current_target_kl):
                     agent.target_kl = new_target_kl
 
-        if np.isnan(actor_loss_value) or np.isinf(actor_loss_value):
+        if (
+            np.isnan(actor_loss_value)
+            or np.isinf(actor_loss_value)
+            or bool(nonfinite_actor_loss_detected_value)
+            or bool(nonfinite_critic_loss_detected_value)
+        ):
             print(f"\n[ERROR] CRITICAL ERROR: NaN/Inf detected in actor_loss at update {update_count}!")
             print(f"   Actor Loss: {actor_loss_value}")
             print(f"   Critic Loss: {critic_loss_value}")
+            if objective_router_probs_value is not None:
+                print(f"   Router Probs: {objective_router_probs_value}")
+            if objective_expert_mask_value is not None:
+                print(f"   Expert Mask: {objective_expert_mask_value}")
             print(f"   🛑 Stopping training early to prevent cascade failure.")
             break
 
@@ -5963,6 +5990,19 @@ def run_experiment6_tape(
             mixture_separation_loss_val = to_scalar(mixture_separation_loss_value)
             mixture_component_dispersion_loss_val = to_scalar(mixture_component_dispersion_loss_value)
             mixture_gating_entropy_val = to_scalar(mixture_gating_entropy_value)
+            objective_expert_loss_val = to_scalar(objective_expert_loss_value)
+            objective_router_entropy_val = to_scalar(objective_router_entropy_value)
+            objective_diversity_loss_val = to_scalar(objective_diversity_loss_value)
+            objective_router_probs_arr = None
+            if objective_router_probs_value is not None:
+                objective_router_probs_arr = np.asarray(objective_router_probs_value, dtype=np.float32).flatten()
+                if objective_router_probs_arr.size == 0:
+                    objective_router_probs_arr = None
+            objective_expert_mask_arr = None
+            if objective_expert_mask_value is not None:
+                objective_expert_mask_arr = np.asarray(objective_expert_mask_value, dtype=np.float32).flatten()
+                if objective_expert_mask_arr.size == 0:
+                    objective_expert_mask_arr = None
             mixture_component_usage_val = None
             if mixture_component_usage_value is not None:
                 mixture_component_usage_arr = np.asarray(mixture_component_usage_value, dtype=np.float32).flatten()
@@ -6095,6 +6135,30 @@ def run_experiment6_tape(
                 f"hhi_loss={alpha_diversity_loss_val:.4f} | "
                 f"dispersion_loss={alpha_dispersion_loss_val:.4f}"
             )
+            if (
+                objective_expert_loss_val
+                or objective_router_entropy_val
+                or objective_diversity_loss_val
+                or objective_router_probs_arr is not None
+            ):
+                expert_names = list(getattr(agent, "objective_expert_names", [])) or [
+                    f"expert_{i}" for i in range(len(objective_router_probs_arr) if objective_router_probs_arr is not None else 3)
+                ]
+                router_fmt = "n/a"
+                if objective_router_probs_arr is not None:
+                    router_fmt = " | ".join(
+                        f"{expert_names[i] if i < len(expert_names) else f'expert_{i}'}={float(p):.3f}"
+                        for i, p in enumerate(objective_router_probs_arr.tolist())
+                    )
+                mask_fmt = "n/a"
+                if objective_expert_mask_arr is not None:
+                    mask_fmt = "[" + ", ".join(f"{float(v):.0f}" for v in objective_expert_mask_arr.tolist()) + "]"
+                print(
+                    f"   🧠 Objective Experts: aux_loss={objective_expert_loss_val:.4f} | "
+                    f"router_entropy={objective_router_entropy_val:.4f} | "
+                    f"diversity_loss={objective_diversity_loss_val:.4f} | "
+                    f"mask={mask_fmt} | router={router_fmt}"
+                )
             if (
                 mixture_gating_entropy_val
                 or mixture_balance_loss_val
@@ -6364,7 +6428,32 @@ def run_experiment6_tape(
                     "alpha_min": alpha_min_val,
                     "alpha_max": alpha_max_val,
                     "alpha_mean": alpha_mean_val,
+                "alpha_std": alpha_std_val,
                 "alpha_cap_hit_frac": alpha_cap_hit_frac_val,
+                "objective_expert_loss": objective_expert_loss_val,
+                "objective_router_entropy": objective_router_entropy_val,
+                "objective_diversity_loss": objective_diversity_loss_val,
+                "objective_router_prob_0": (
+                    float(objective_router_probs_arr[0]) if objective_router_probs_arr is not None and objective_router_probs_arr.size > 0 else None
+                ),
+                "objective_router_prob_1": (
+                    float(objective_router_probs_arr[1]) if objective_router_probs_arr is not None and objective_router_probs_arr.size > 1 else None
+                ),
+                "objective_router_prob_2": (
+                    float(objective_router_probs_arr[2]) if objective_router_probs_arr is not None and objective_router_probs_arr.size > 2 else None
+                ),
+                "objective_router_probs": (
+                    json.dumps([float(v) for v in objective_router_probs_arr.tolist()])
+                    if objective_router_probs_arr is not None
+                    else None
+                ),
+                "objective_expert_mask": (
+                    json.dumps([float(v) for v in objective_expert_mask_arr.tolist()])
+                    if objective_expert_mask_arr is not None
+                    else None
+                ),
+                "nonfinite_actor_loss_detected": float(nonfinite_actor_loss_detected_value or 0.0),
+                "nonfinite_critic_loss_detected": float(nonfinite_critic_loss_detected_value or 0.0),
                 "mixture_balance_loss": mixture_balance_loss_val,
                 "mixture_separation_loss": mixture_separation_loss_val,
                 "mixture_component_dispersion_loss": mixture_component_dispersion_loss_val,
@@ -7322,12 +7411,18 @@ def evaluate_experiment6_checkpoint(
         import tensorflow_probability as tfp
         tfd = tfp.distributions
 
-        alpha = tf.maximum(alpha, tf.constant(1e-6, dtype=alpha.dtype))  # Ensure alpha > 0
+        if hasattr(agent_eval, "_stabilize_dirichlet_alpha"):
+            alpha = agent_eval._stabilize_dirichlet_alpha(alpha)
+        else:
+            alpha = tf.maximum(alpha, tf.constant(1e-6, dtype=alpha.dtype))  # Ensure alpha > 0
         mode_name = _normalize_mode(eval_mode, fallback="mode")
 
         selected_component_idx = None
         if mixture_alpha is not None and mixture_probs is not None:
-            mixture_alpha = tf.maximum(mixture_alpha, tf.constant(1e-6, dtype=mixture_alpha.dtype))
+            if hasattr(agent_eval, "_stabilize_dirichlet_alpha"):
+                mixture_alpha = agent_eval._stabilize_dirichlet_alpha(mixture_alpha)
+            else:
+                mixture_alpha = tf.maximum(mixture_alpha, tf.constant(1e-6, dtype=mixture_alpha.dtype))
             if mode_name == "sample":
                 comp_dist = tfd.Categorical(probs=mixture_probs)
                 selected_component_idx = comp_dist.sample()
@@ -7379,12 +7474,19 @@ def evaluate_experiment6_checkpoint(
                 stochastic=(mode_name == "sample"),
                 use_eval_settings=True,
             )
+        if hasattr(agent_eval, "_stabilize_action_for_log_prob"):
+            action = agent_eval._stabilize_action_for_log_prob(action)
+        else:
+            action = tf.maximum(action, tf.constant(1e-6, dtype=action.dtype))
+            action = action / tf.reduce_sum(action, axis=-1, keepdims=True)
 
         # Get log probability
         log_prob = dirichlet.log_prob(action)
         if selected_component_idx is not None:
             comp_dist = tfd.Categorical(probs=mixture_probs)
             log_prob = log_prob + comp_dist.log_prob(selected_component_idx)
+        if hasattr(agent_eval, "_sanitize_log_prob_tensor"):
+            log_prob = agent_eval._sanitize_log_prob_tensor(log_prob)
         
         # Get value estimate
         if hasattr(agent_eval, "_parse_critic_outputs"):

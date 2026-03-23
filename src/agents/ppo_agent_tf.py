@@ -419,6 +419,7 @@ class PPOAgentTF:
         }
         self._latest_action_metadata = {}
         self._latest_batch_action_metadata = {}
+        self._last_policy_debug = {}
         
         logger.info(f"Initialized {name}")
         logger.info(f"  State dim: {state_dim}, Num assets: {num_assets}, Actions: {self.num_actions}")
@@ -1210,10 +1211,126 @@ class PPOAgentTF:
     def _normalize_simplex(self, weights: tf.Tensor) -> tf.Tensor:
         """Enforce strictly-positive simplex weights."""
         weights = _to_tensor_with_cast(weights, tf.float32)
-        weights = tf.maximum(weights, tf.constant(1e-8, dtype=weights.dtype))
+        weights = tf.where(tf.math.is_finite(weights), weights, tf.zeros_like(weights))
+        weights = tf.maximum(weights, tf.constant(1e-6, dtype=weights.dtype))
         denom = tf.reduce_sum(weights, axis=-1, keepdims=True)
-        denom = tf.maximum(denom, tf.constant(1e-8, dtype=weights.dtype))
+        denom = tf.maximum(denom, tf.constant(1e-6, dtype=weights.dtype))
         return weights / denom
+
+    def _stabilize_dirichlet_alpha(self, alpha: tf.Tensor) -> tf.Tensor:
+        """Keep Dirichlet concentration parameters finite and strictly positive."""
+        alpha = _to_tensor_with_cast(alpha, tf.float32)
+        alpha = tf.where(tf.math.is_finite(alpha), alpha, tf.ones_like(alpha))
+        alpha = tf.maximum(alpha, tf.constant(1e-4, dtype=alpha.dtype))
+        alpha_cap = getattr(self.actor, "_alpha_cap", None)
+        if alpha_cap is not None and np.isfinite(alpha_cap):
+            alpha = tf.minimum(alpha, tf.cast(alpha_cap, alpha.dtype))
+        return alpha
+
+    def _stabilize_action_for_log_prob(self, action: tf.Tensor) -> tf.Tensor:
+        """Move actions away from the simplex boundary before Dirichlet log-prob evaluation."""
+        return self._normalize_simplex(action)
+
+    def _sanitize_log_prob_tensor(self, log_probs: tf.Tensor) -> tf.Tensor:
+        """Replace non-finite log-prob entries with a large finite negative fallback."""
+        log_probs = _to_tensor_with_cast(log_probs, tf.float32)
+        fallback = tf.fill(tf.shape(log_probs), tf.constant(-50.0, dtype=log_probs.dtype))
+        return tf.where(tf.math.is_finite(log_probs), log_probs, fallback)
+
+    def _tensor_stat_summary(self, tensor: tf.Tensor) -> dict:
+        arr = np.asarray(_to_tensor_with_cast(tensor, tf.float32).numpy(), dtype=np.float64)
+        finite_mask = np.isfinite(arr)
+        finite_vals = arr[finite_mask]
+        summary = {
+            "nonfinite": int(np.size(arr) - np.count_nonzero(finite_mask)),
+            "shape": tuple(arr.shape),
+        }
+        if finite_vals.size == 0:
+            summary.update({"min": np.nan, "max": np.nan, "mean": np.nan, "near_zero_frac": np.nan})
+            return summary
+        summary.update(
+            {
+                "min": float(np.min(finite_vals)),
+                "max": float(np.max(finite_vals)),
+                "mean": float(np.mean(finite_vals)),
+                "near_zero_frac": float(np.mean(finite_vals <= 1e-5)),
+            }
+        )
+        return summary
+
+    def _log_nonfinite_policy_diagnostics(
+        self,
+        batch_states,
+        batch_actions,
+        batch_log_probs_old,
+        batch_mixture_components_old=None,
+    ) -> None:
+        """Emit focused diagnostics when the policy loss becomes non-finite."""
+        try:
+            actor_output = self.actor(batch_states, training=False)
+            actor_parts = self._parse_actor_outputs(actor_output)
+            alpha = self._stabilize_dirichlet_alpha(actor_parts["alpha"])
+            actions_safe = self._stabilize_action_for_log_prob(batch_actions)
+            mixture_alpha = actor_parts["mixture_alpha"]
+            mixture_probs = actor_parts["mixture_probs"]
+            if self.mixture_dirichlet_enabled and mixture_alpha is not None and mixture_probs is not None:
+                mixture_components = tf.cast(batch_mixture_components_old, tf.int32)
+                alpha_for_policy = self._stabilize_dirichlet_alpha(
+                    self._gather_component_alpha(mixture_alpha, mixture_components)
+                )
+                log_probs_new = self._sanitize_log_prob_tensor(
+                    tfd.Dirichlet(alpha_for_policy).log_prob(actions_safe)
+                    + tfd.Categorical(probs=mixture_probs).log_prob(mixture_components)
+                )
+            else:
+                alpha_for_policy = alpha
+                log_probs_new = self._sanitize_log_prob_tensor(
+                    tfd.Dirichlet(alpha_for_policy).log_prob(actions_safe)
+                )
+            log_probs_old = self._sanitize_log_prob_tensor(batch_log_probs_old)
+            ratio = tf.exp(tf.clip_by_value(log_probs_new - log_probs_old, -10.0, 10.0))
+            action_stats = self._tensor_stat_summary(actions_safe)
+            alpha_stats = self._tensor_stat_summary(alpha_for_policy)
+            logp_new_stats = self._tensor_stat_summary(log_probs_new)
+            logp_old_stats = self._tensor_stat_summary(log_probs_old)
+            ratio_stats = self._tensor_stat_summary(ratio)
+            logger.error(
+                "[ERROR] Dirichlet diagnostics | action[min=%.3e max=%.3e near0=%.2f%% nonfinite=%d] | "
+                "alpha[min=%.3e max=%.3e near0=%.2f%% nonfinite=%d]",
+                action_stats["min"],
+                action_stats["max"],
+                100.0 * action_stats["near_zero_frac"],
+                action_stats["nonfinite"],
+                alpha_stats["min"],
+                alpha_stats["max"],
+                100.0 * alpha_stats["near_zero_frac"],
+                alpha_stats["nonfinite"],
+            )
+            logger.error(
+                "[ERROR] Log-prob diagnostics | old[min=%.4f max=%.4f nonfinite=%d] | "
+                "new[min=%.4f max=%.4f nonfinite=%d] | ratio[min=%.4f max=%.4f nonfinite=%d]",
+                logp_old_stats["min"],
+                logp_old_stats["max"],
+                logp_old_stats["nonfinite"],
+                logp_new_stats["min"],
+                logp_new_stats["max"],
+                logp_new_stats["nonfinite"],
+                ratio_stats["min"],
+                ratio_stats["max"],
+                ratio_stats["nonfinite"],
+            )
+            if self.objective_experts_enabled and actor_parts.get("router_probs") is not None:
+                router_stats = self._tensor_stat_summary(actor_parts["router_probs"])
+                logger.error(
+                    "[ERROR] Router diagnostics | probs[min=%.4f max=%.4f mean=%.4f nonfinite=%d] | mask=%s",
+                    router_stats["min"],
+                    router_stats["max"],
+                    router_stats["mean"],
+                    router_stats["nonfinite"],
+                    self.objective_expert_mask.tolist(),
+                )
+        except Exception as exc:
+            logger.exception("[ERROR] Failed to compute non-finite policy diagnostics: %s", exc)
 
     def _project_weights_np(self, weights_np: np.ndarray) -> np.ndarray:
         """Apply lightweight long-only + cap + min-cash projection on numpy arrays."""
@@ -1411,11 +1528,13 @@ class PPOAgentTF:
         # Get actor outputs (alpha + optional softmax/projection logits)
         actor_output = self.actor(state_input, training=False)
         actor_parts = self._parse_actor_outputs(actor_output)
-        alpha = actor_parts["alpha"]
+        alpha = self._stabilize_dirichlet_alpha(actor_parts["alpha"])
         projection_logits = actor_parts["projection_logits"]
         mixture_alpha = actor_parts["mixture_alpha"]
         mixture_probs = actor_parts["mixture_probs"]
         expert_alpha = actor_parts["expert_alpha"]
+        if expert_alpha is not None:
+            expert_alpha = self._stabilize_dirichlet_alpha(expert_alpha)
         router_probs = actor_parts["router_probs"]
 
         selected_component = None
@@ -1429,6 +1548,7 @@ class PPOAgentTF:
         else:
             alpha_for_action = alpha
 
+        alpha_for_action = self._stabilize_dirichlet_alpha(alpha_for_action)
         dirichlet = tfd.Dirichlet(alpha_for_action)
         if stochastic:
             action = dirichlet.sample()
@@ -1444,11 +1564,12 @@ class PPOAgentTF:
             stochastic=bool(stochastic),
             use_eval_settings=bool(deterministic or stochastic),
         )
+        action = self._stabilize_action_for_log_prob(action)
         
-        log_prob = dirichlet.log_prob(action)
+        log_prob = self._sanitize_log_prob_tensor(dirichlet.log_prob(action))
         if selected_component is not None and mixture_probs is not None:
             categorical = tfd.Categorical(probs=mixture_probs)
-            log_prob = log_prob + categorical.log_prob(selected_component)
+            log_prob = self._sanitize_log_prob_tensor(log_prob + categorical.log_prob(selected_component))
         
         # Get value estimate
         critic_output = self.critic(state_input, training=False)
@@ -1459,7 +1580,9 @@ class PPOAgentTF:
         expert_log_probs = None
         expert_values = critic_parts["expert_values"]
         if self.objective_experts_enabled and expert_alpha is not None:
-            expert_log_probs = tfd.Dirichlet(expert_alpha).log_prob(action[:, tf.newaxis, :])
+            expert_log_probs = self._sanitize_log_prob_tensor(
+                tfd.Dirichlet(expert_alpha).log_prob(action[:, tf.newaxis, :])
+            )
 
         # Squeeze batch dimension if needed
         if needs_squeeze:
@@ -1532,11 +1655,13 @@ class PPOAgentTF:
 
         actor_output = self.actor(prepared_state, training=False)
         actor_parts = self._parse_actor_outputs(actor_output)
-        alpha = actor_parts["alpha"]
+        alpha = self._stabilize_dirichlet_alpha(actor_parts["alpha"])
         projection_logits = actor_parts["projection_logits"]
         mixture_alpha = actor_parts["mixture_alpha"]
         mixture_probs = actor_parts["mixture_probs"]
         expert_alpha = actor_parts["expert_alpha"]
+        if expert_alpha is not None:
+            expert_alpha = self._stabilize_dirichlet_alpha(expert_alpha)
         router_probs = actor_parts["router_probs"]
 
         selected_components = None
@@ -1550,6 +1675,7 @@ class PPOAgentTF:
         else:
             alpha_for_action = alpha
 
+        alpha_for_action = self._stabilize_dirichlet_alpha(alpha_for_action)
         dirichlet = tfd.Dirichlet(alpha_for_action)
 
         if stochastic:
@@ -1566,11 +1692,12 @@ class PPOAgentTF:
             stochastic=bool(stochastic),
             use_eval_settings=bool(deterministic or stochastic),
         )
+        action = self._stabilize_action_for_log_prob(action)
 
-        log_prob = dirichlet.log_prob(action)
+        log_prob = self._sanitize_log_prob_tensor(dirichlet.log_prob(action))
         if selected_components is not None and mixture_probs is not None:
             categorical = tfd.Categorical(probs=mixture_probs)
-            log_prob = log_prob + categorical.log_prob(selected_components)
+            log_prob = self._sanitize_log_prob_tensor(log_prob + categorical.log_prob(selected_components))
         critic_output = self.critic(prepared_state, training=False)
         critic_parts = self._parse_critic_outputs(critic_output, router_probs=router_probs)
         value = critic_parts["value"]
@@ -1578,7 +1705,9 @@ class PPOAgentTF:
 
         expert_log_probs = None
         if self.objective_experts_enabled and expert_alpha is not None:
-            expert_log_probs = tfd.Dirichlet(expert_alpha).log_prob(action[:, tf.newaxis, :])
+            expert_log_probs = self._sanitize_log_prob_tensor(
+                tfd.Dirichlet(expert_alpha).log_prob(action[:, tf.newaxis, :])
+            )
 
         self._latest_batch_action_metadata = {
             "mixture_components": None if selected_components is None else np.asarray(selected_components.numpy(), dtype=np.int32),
@@ -2020,14 +2149,20 @@ class PPOAgentTF:
         # Get current policy distribution
         actor_output = self.actor(states, training=True)
         actor_parts = self._parse_actor_outputs(actor_output)
-        alpha = actor_parts["alpha"]
+        alpha = self._stabilize_dirichlet_alpha(actor_parts["alpha"])
         projection_logits = actor_parts["projection_logits"]
         aux_return_preds = actor_parts["aux_return_preds"]
         mixture_alpha = actor_parts["mixture_alpha"]
+        if mixture_alpha is not None:
+            mixture_alpha = self._stabilize_dirichlet_alpha(mixture_alpha)
         mixture_gating_logits = actor_parts["mixture_gating_logits"]
         mixture_probs = actor_parts["mixture_probs"]
         expert_alpha = actor_parts["expert_alpha"]
+        if expert_alpha is not None:
+            expert_alpha = self._stabilize_dirichlet_alpha(expert_alpha)
         router_probs = actor_parts["router_probs"]
+        actions = self._stabilize_action_for_log_prob(actions)
+        log_probs_old = self._sanitize_log_prob_tensor(log_probs_old)
 
         mixture_balance_loss = tf.constant(0.0, dtype=tf.float32)
         mixture_separation_loss = tf.constant(0.0, dtype=tf.float32)
@@ -2039,9 +2174,12 @@ class PPOAgentTF:
                 raise ValueError("mixture_components must be provided when mixture_dirichlet_enabled=True")
             mixture_components = tf.cast(mixture_components, tf.int32)
             alpha_for_policy = self._gather_component_alpha(mixture_alpha, mixture_components)
+            alpha_for_policy = self._stabilize_dirichlet_alpha(alpha_for_policy)
             dirichlet = tfd.Dirichlet(alpha_for_policy)
             categorical = tfd.Categorical(probs=mixture_probs)
-            log_probs_new = dirichlet.log_prob(actions) + categorical.log_prob(mixture_components)
+            log_probs_new = self._sanitize_log_prob_tensor(
+                dirichlet.log_prob(actions) + categorical.log_prob(mixture_components)
+            )
             component_entropies = tfd.Dirichlet(mixture_alpha).entropy()
             mixture_gating_entropy = tf.reduce_mean(categorical.entropy())
             gating_entropy_coef = tf.constant(
@@ -2107,7 +2245,7 @@ class PPOAgentTF:
                 )
         else:
             dirichlet = tfd.Dirichlet(alpha)
-            log_probs_new = dirichlet.log_prob(actions)
+            log_probs_new = self._sanitize_log_prob_tensor(dirichlet.log_prob(actions))
             entropy = tf.reduce_mean(dirichlet.entropy())
 
         objective_expert_loss = tf.constant(0.0, dtype=tf.float32)
@@ -2118,7 +2256,9 @@ class PPOAgentTF:
             active_expert_count = tf.maximum(tf.reduce_sum(expert_mask), 1.0)
             expert_dist = tfd.Dirichlet(expert_alpha)
             if expert_advantages is not None:
-                expert_log_probs_new = expert_dist.log_prob(actions[:, tf.newaxis, :])
+                expert_log_probs_new = self._sanitize_log_prob_tensor(
+                    expert_dist.log_prob(actions[:, tf.newaxis, :])
+                )
                 expert_advantages = _to_tensor_with_cast(expert_advantages, tf.float32)
                 expert_weighted_log_prob = expert_mask * tf.stop_gradient(expert_advantages) * expert_log_probs_new
                 objective_expert_loss = (
@@ -2150,14 +2290,22 @@ class PPOAgentTF:
                 )
 
         # Stabilize PPO ratio by clipping the log-probability delta
-        log_prob_delta_raw = log_probs_new - log_probs_old
+        log_prob_delta_raw = self._sanitize_log_prob_tensor(log_probs_new - log_probs_old)
         log_prob_delta_raw = tf.clip_by_value(log_prob_delta_raw, -10.0, 10.0)
-        ratio_unclipped = tf.exp(log_prob_delta_raw)
+        ratio_unclipped = tf.where(
+            tf.math.is_finite(log_prob_delta_raw),
+            tf.exp(log_prob_delta_raw),
+            tf.ones_like(log_prob_delta_raw),
+        )
         
         lower_clip = tf.math.log(tf.maximum(1.0 - self.policy_clip, 1e-3))
         upper_clip = tf.math.log(1.0 + self.policy_clip)
         log_prob_delta = tf.clip_by_value(log_prob_delta_raw, lower_clip, upper_clip)
-        ratio = tf.exp(log_prob_delta)
+        ratio = tf.where(
+            tf.math.is_finite(log_prob_delta),
+            tf.exp(log_prob_delta),
+            tf.ones_like(log_prob_delta),
+        )
         
         # DIAGNOSTIC: Compute ratio statistics before clipping to understand instability
         ratio_mean = tf.reduce_mean(ratio_unclipped)
@@ -2166,7 +2314,7 @@ class PPOAgentTF:
         # Clipped surrogate objective
         surr1 = ratio * advantages
         surr2 = tf.clip_by_value(ratio, 1.0 - self.policy_clip, 1.0 + self.policy_clip) * advantages
-        policy_loss = -tf.reduce_mean(tf.minimum(surr1, surr2))
+        policy_loss = -tf.reduce_mean(tf.where(tf.math.is_finite(tf.minimum(surr1, surr2)), tf.minimum(surr1, surr2), tf.zeros_like(surr1)))
         
         # Entropy bonus for exploration
         entropy_loss = -self.entropy_coef * entropy
@@ -2255,7 +2403,13 @@ class PPOAgentTF:
             + objective_diversity_loss
         )
         
-        approx_kl = tf.reduce_mean(log_probs_old - log_probs_new)
+        approx_kl = tf.reduce_mean(
+            tf.where(
+                tf.math.is_finite(log_probs_old - log_probs_new),
+                log_probs_old - log_probs_new,
+                tf.zeros_like(log_probs_new),
+            )
+        )
         clip_mask = tf.cast(tf.abs(ratio_unclipped - 1.0) > self.policy_clip, tf.float32)
         clip_fraction = tf.reduce_mean(clip_mask)
         
@@ -2663,6 +2817,8 @@ class PPOAgentTF:
             'early_stop_kl_triggered': 0.0,
             'early_stop_kl': 0.0,
             'early_stop_epoch': -1.0,
+            'nonfinite_actor_loss_detected': 0.0,
+            'nonfinite_critic_loss_detected': 0.0,
         }
         
         # Multiple epochs of optimization
@@ -2740,7 +2896,22 @@ class PPOAgentTF:
                 
                 # Compute gradient norm BEFORE clipping for diagnostics
                 actor_grad_norm = tf.linalg.global_norm(actor_grads).numpy()
-                
+                actor_loss_nonfinite = bool(tf.math.is_nan(actor_loss) or tf.math.is_inf(actor_loss))
+                actor_grad_nonfinite = (not np.isfinite(actor_grad_norm))
+                if actor_loss_nonfinite or actor_grad_nonfinite:
+                    stats['nonfinite_actor_loss_detected'] = 1.0
+                    logger.error("[ERROR] CRITICAL: NaN/Inf detected in actor_loss! Training unstable.")
+                    logger.error("   Policy loss: %.6f, Entropy loss: %.6f", float(policy_loss), float(entropy_loss))
+                    logger.error("   Actor grad norm: %s", actor_grad_norm)
+                    self._log_nonfinite_policy_diagnostics(
+                        batch_states,
+                        batch_actions,
+                        batch_log_probs_old,
+                        batch_mixture_components_old,
+                    )
+                    early_stop = True
+                    break
+
                 if self.max_grad_norm > 0:
                     actor_grads, _ = tf.clip_by_global_norm(actor_grads, self.max_grad_norm)
                 self.actor_optimizer.apply_gradients(zip(actor_grads, self.actor.trainable_variables))
@@ -2770,6 +2941,14 @@ class PPOAgentTF:
                 
                 # Compute gradient norm BEFORE clipping for diagnostics
                 critic_grad_norm = tf.linalg.global_norm(critic_grads).numpy()
+                critic_loss_nonfinite = bool(tf.math.is_nan(critic_loss_raw) or tf.math.is_inf(critic_loss_raw))
+                critic_grad_nonfinite = (not np.isfinite(critic_grad_norm))
+                if critic_loss_nonfinite or critic_grad_nonfinite:
+                    stats['nonfinite_critic_loss_detected'] = 1.0
+                    logger.error(f"[ERROR] CRITICAL: NaN/Inf detected in critic_loss! Training unstable.")
+                    logger.error("   Critic grad norm: %s", critic_grad_norm)
+                    early_stop = True
+                    break
                 
                 if self.max_grad_norm > 0:
                     critic_grads, _ = tf.clip_by_global_norm(critic_grads, self.max_grad_norm)
@@ -2850,17 +3029,6 @@ class PPOAgentTF:
                 stats['clip_fraction'] += float(clip_fraction)
                 stats['value_clip_fraction'] += float(value_clip_fraction)
                 stats['num_grad_updates'] += 1                
-                # CRITICAL: Detect NaN/Inf early to prevent cascade failures
-                if tf.math.is_nan(actor_loss) or tf.math.is_inf(actor_loss):
-                    logger.error(f"[ERROR] CRITICAL: NaN/Inf detected in actor_loss! Training unstable.")
-                    logger.error(f"   Policy loss: {policy_loss:.6f}, Entropy loss: {entropy_loss:.6f}")
-                    # Return current stats to allow graceful handling
-                    break
-                
-                if tf.math.is_nan(critic_loss_raw) or tf.math.is_inf(critic_loss_raw):
-                    logger.error(f"[ERROR] CRITICAL: NaN/Inf detected in critic_loss! Training unstable.")
-                    break
-
                 # Early-stop PPO update when KL drift is too high (stability guard).
                 approx_kl_value = float(approx_kl)
                 if (
