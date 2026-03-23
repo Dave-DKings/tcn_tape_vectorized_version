@@ -897,6 +897,10 @@ TRAINING_FIELDNAMES: List[str] = [
     "explained_variance",
     "actor_grad_norm",
     "critic_grad_norm",
+    "actor_nonfinite_grad_tensors",
+    "actor_nonfinite_grad_elements",
+    "critic_nonfinite_grad_tensors",
+    "critic_nonfinite_grad_elements",
     "alpha_min",
     "alpha_max",
     "alpha_mean",
@@ -5830,6 +5834,10 @@ def run_experiment6_tape(
         explained_variance_value = update_metrics.get("explained_variance", 0.0)
         actor_grad_norm_value = update_metrics.get("actor_grad_norm", 0.0)
         critic_grad_norm_value = update_metrics.get("critic_grad_norm", 0.0)
+        actor_nonfinite_grad_tensors_value = update_metrics.get("actor_nonfinite_grad_tensors", 0.0)
+        actor_nonfinite_grad_elements_value = update_metrics.get("actor_nonfinite_grad_elements", 0.0)
+        critic_nonfinite_grad_tensors_value = update_metrics.get("critic_nonfinite_grad_tensors", 0.0)
+        critic_nonfinite_grad_elements_value = update_metrics.get("critic_nonfinite_grad_elements", 0.0)
         alpha_min_value = update_metrics.get("alpha_min", 0.0)
         alpha_max_value = update_metrics.get("alpha_max", 0.0)
         alpha_mean_value = update_metrics.get("alpha_mean", 0.0)
@@ -5893,6 +5901,11 @@ def run_experiment6_tape(
             print(f"\n[ERROR] CRITICAL ERROR: NaN/Inf detected in actor_loss at update {update_count}!")
             print(f"   Actor Loss: {actor_loss_value}")
             print(f"   Critic Loss: {critic_loss_value}")
+            print(
+                "   Flags: "
+                f"nonfinite_actor={bool(nonfinite_actor_loss_detected_value)} | "
+                f"nonfinite_critic={bool(nonfinite_critic_loss_detected_value)}"
+            )
             if objective_router_probs_value is not None:
                 print(f"   Router Probs: {objective_router_probs_value}")
             if objective_expert_mask_value is not None:
@@ -5977,6 +5990,10 @@ def run_experiment6_tape(
             explained_variance_val = to_scalar(explained_variance_value)
             actor_grad_norm_val = to_scalar(actor_grad_norm_value)
             critic_grad_norm_val = to_scalar(critic_grad_norm_value)
+            actor_nonfinite_grad_tensors_val = to_scalar(actor_nonfinite_grad_tensors_value)
+            actor_nonfinite_grad_elements_val = to_scalar(actor_nonfinite_grad_elements_value)
+            critic_nonfinite_grad_tensors_val = to_scalar(critic_nonfinite_grad_tensors_value)
+            critic_nonfinite_grad_elements_val = to_scalar(critic_nonfinite_grad_elements_value)
             alpha_min_val = to_scalar(alpha_min_value)
             alpha_max_val = to_scalar(alpha_max_value)
             alpha_mean_val = to_scalar(alpha_mean_value)
@@ -6177,6 +6194,22 @@ def run_experiment6_tape(
                 f"rollout={current_timestep_rollout} | batch_size={current_batch_size_ppo} | "
                 f"gamma={current_ppo_gamma:.4f} | gae_lambda={current_ppo_gae_lambda:.4f}"
             )
+            if any(
+                float(v or 0.0) > 0.0
+                for v in (
+                    actor_nonfinite_grad_tensors_val,
+                    actor_nonfinite_grad_elements_val,
+                    critic_nonfinite_grad_tensors_val,
+                    critic_nonfinite_grad_elements_val,
+                )
+            ):
+                print(
+                    "   ⚠️ Gradient Sanitize: "
+                    f"actor_tensors={int(actor_nonfinite_grad_tensors_val or 0)} | "
+                    f"actor_elements={int(actor_nonfinite_grad_elements_val or 0)} | "
+                    f"critic_tensors={int(critic_nonfinite_grad_tensors_val or 0)} | "
+                    f"critic_elements={int(critic_nonfinite_grad_elements_val or 0)}"
+                )
             if training_early_stop_enabled_cfg and training_early_stop_score_val is not None:
                 ema_disp = float(training_early_stop_ema_score or training_early_stop_score_val)
                 best_disp = float(
@@ -6425,6 +6458,10 @@ def run_experiment6_tape(
                     "explained_variance": explained_variance_val,
                     "actor_grad_norm": actor_grad_norm_val,
                     "critic_grad_norm": critic_grad_norm_val,
+                    "actor_nonfinite_grad_tensors": actor_nonfinite_grad_tensors_val,
+                    "actor_nonfinite_grad_elements": actor_nonfinite_grad_elements_val,
+                    "critic_nonfinite_grad_tensors": critic_nonfinite_grad_tensors_val,
+                    "critic_nonfinite_grad_elements": critic_nonfinite_grad_elements_val,
                     "alpha_min": alpha_min_val,
                     "alpha_max": alpha_max_val,
                     "alpha_mean": alpha_mean_val,

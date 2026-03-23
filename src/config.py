@@ -2153,9 +2153,15 @@ RUN19_OVERRIDES["agent_params"].update(
 )
 RUN19_OVERRIDES["agent_params"]["ppo_params"].update(
     {
-        "objective_head_aux_coef": 0.50,
+        "objective_head_aux_coef": 0.10,
+        "objective_head_aux_loss_clip": 0.25,
         "objective_head_diversity_coef": 0.02,
         "objective_router_entropy_coef": 0.005,
+        "critic_use_huber": True,
+        "critic_huber_delta": 2.0,
+        "advantage_clip_value": 5.0,
+        "expert_advantage_clip_value": 3.0,
+        "sanitize_nonfinite_gradients": True,
     }
 )
 RUN19_OVERRIDES["training_params"]["reward_component_schedule"] = [
@@ -3807,8 +3813,20 @@ def assert_run19_config(config: dict) -> None:
     )
     assert not bool(agent.get("dual_head_enabled", False)), "Run19 dual_head must stay off"
     assert not bool(agent.get("mixture_dirichlet_enabled", False)), "Run19 mixture_dirichlet must stay off"
-    assert float(ppo.get("objective_head_aux_coef", 0.0)) == 0.50, (
+    assert float(ppo.get("objective_head_aux_coef", 0.0)) == 0.10, (
         "Run19 objective_head_aux_coef drifted"
+    )
+    assert float(ppo.get("objective_head_aux_loss_clip", 0.0)) == 0.25, (
+        "Run19 objective_head_aux_loss_clip drifted"
+    )
+    assert bool(ppo.get("critic_use_huber", False)), "Run19 critic_use_huber must stay enabled"
+    assert float(ppo.get("critic_huber_delta", 0.0)) == 2.0, "Run19 critic_huber_delta drifted"
+    assert float(ppo.get("advantage_clip_value", 0.0)) == 5.0, "Run19 advantage_clip_value drifted"
+    assert float(ppo.get("expert_advantage_clip_value", 0.0)) == 3.0, (
+        "Run19 expert_advantage_clip_value drifted"
+    )
+    assert bool(ppo.get("sanitize_nonfinite_gradients", False)), (
+        "Run19 sanitize_nonfinite_gradients must stay enabled"
     )
     assert float(ppo.get("objective_head_diversity_coef", 0.0)) == 0.02, (
         "Run19 objective_head_diversity_coef drifted"

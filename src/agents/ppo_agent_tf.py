@@ -241,6 +241,11 @@ class PPOAgentTF:
         self.distributional_num_quantiles = int(max(2, config.get('distributional_num_quantiles', 17)))
         self.distributional_huber_kappa = float(max(ppo_params.get('distributional_huber_kappa', 1.0), 1e-3))
         self.distributional_mean_loss_coef = float(max(ppo_params.get('distributional_mean_loss_coef', 0.1), 0.0))
+        self.critic_use_huber = bool(ppo_params.get('critic_use_huber', True))
+        self.critic_huber_delta = float(max(ppo_params.get('critic_huber_delta', 2.0), 1e-3))
+        self.advantage_clip_value = float(max(ppo_params.get('advantage_clip_value', 5.0), 0.0))
+        self.expert_advantage_clip_value = float(max(ppo_params.get('expert_advantage_clip_value', 3.0), 0.0))
+        self.sanitize_nonfinite_gradients = bool(ppo_params.get('sanitize_nonfinite_gradients', True))
         # Run9: blend lower-tail critic estimates into the scalar value used for GAE.
         self.cvar_advantage_weight = float(np.clip(ppo_params.get('cvar_advantage_weight', 0.0), 0.0, 1.0))
         self.cvar_advantage_k = int(max(1, ppo_params.get('cvar_advantage_k', 4)))
@@ -375,6 +380,7 @@ class PPOAgentTF:
             self.objective_expert_names = ['return', 'risk', 'discipline']
         self.num_objective_experts = len(self.objective_expert_names)
         self.objective_head_aux_coef = float(max(ppo_params.get('objective_head_aux_coef', 0.5), 0.0))
+        self.objective_head_aux_loss_clip = float(max(ppo_params.get('objective_head_aux_loss_clip', 0.25), 0.0))
         self.objective_head_diversity_coef = float(max(ppo_params.get('objective_head_diversity_coef', 0.02), 0.0))
         self.objective_router_entropy_coef = float(max(ppo_params.get('objective_router_entropy_coef', 0.005), 0.0))
         self.objective_expert_mask = np.ones((self.num_objective_experts,), dtype=np.float32)
@@ -1227,15 +1233,45 @@ class PPOAgentTF:
             alpha = tf.minimum(alpha, tf.cast(alpha_cap, alpha.dtype))
         return alpha
 
-    def _stabilize_action_for_log_prob(self, action: tf.Tensor) -> tf.Tensor:
+    def _stabilize_action_for_log_prob(self, action: tf.Tensor, eps: float = 1e-6) -> tf.Tensor:
         """Move actions away from the simplex boundary before Dirichlet log-prob evaluation."""
-        return self._normalize_simplex(action)
+        action = _to_tensor_with_cast(action, tf.float32)
+        action = tf.where(tf.math.is_finite(action), action, tf.zeros_like(action))
+        action = tf.maximum(action, tf.cast(eps, action.dtype))
+        denom = tf.maximum(tf.reduce_sum(action, axis=-1, keepdims=True), tf.cast(eps, action.dtype))
+        return action / denom
 
     def _sanitize_log_prob_tensor(self, log_probs: tf.Tensor) -> tf.Tensor:
         """Replace non-finite log-prob entries with a large finite negative fallback."""
         log_probs = _to_tensor_with_cast(log_probs, tf.float32)
         fallback = tf.fill(tf.shape(log_probs), tf.constant(-50.0, dtype=log_probs.dtype))
         return tf.where(tf.math.is_finite(log_probs), log_probs, fallback)
+
+    def _safe_huber(self, error: tf.Tensor, delta: float) -> tf.Tensor:
+        error = _to_tensor_with_cast(error, tf.float32)
+        abs_error = tf.abs(error)
+        delta_t = tf.cast(delta, error.dtype)
+        quadratic = tf.minimum(abs_error, delta_t)
+        linear = abs_error - quadratic
+        return 0.5 * tf.square(quadratic) + delta_t * linear
+
+    def _sanitize_gradients(self, grads):
+        sanitized = []
+        nonfinite_tensors = 0
+        nonfinite_elements = 0
+        for grad in grads:
+            if grad is None:
+                sanitized.append(None)
+                continue
+            grad_t = _to_tensor_with_cast(grad, tf.float32)
+            finite_mask = tf.math.is_finite(grad_t)
+            finite_all = bool(tf.reduce_all(finite_mask))
+            if not finite_all:
+                nonfinite_tensors += 1
+                nonfinite_elements += int(tf.size(grad_t).numpy() - tf.math.count_nonzero(finite_mask).numpy())
+                grad_t = tf.where(finite_mask, grad_t, tf.zeros_like(grad_t))
+            sanitized.append(grad_t)
+        return sanitized, nonfinite_tensors, nonfinite_elements
 
     def _tensor_stat_summary(self, tensor: tf.Tensor) -> dict:
         arr = np.asarray(_to_tensor_with_cast(tensor, tf.float32).numpy(), dtype=np.float64)
@@ -2256,16 +2292,25 @@ class PPOAgentTF:
             active_expert_count = tf.maximum(tf.reduce_sum(expert_mask), 1.0)
             expert_dist = tfd.Dirichlet(expert_alpha)
             if expert_advantages is not None:
+                expert_actions = self._stabilize_action_for_log_prob(actions, eps=1e-4)
                 expert_log_probs_new = self._sanitize_log_prob_tensor(
-                    expert_dist.log_prob(actions[:, tf.newaxis, :])
+                    expert_dist.log_prob(expert_actions[:, tf.newaxis, :])
                 )
                 expert_advantages = _to_tensor_with_cast(expert_advantages, tf.float32)
+                expert_advantages = tf.clip_by_value(expert_advantages, -3.0, 3.0)
+                expert_log_probs_new = tf.clip_by_value(expert_log_probs_new, -25.0, 25.0)
                 expert_weighted_log_prob = expert_mask * tf.stop_gradient(expert_advantages) * expert_log_probs_new
                 objective_expert_loss = (
                     tf.constant(self.objective_head_aux_coef, dtype=tf.float32)
                     * -tf.reduce_sum(expert_weighted_log_prob)
                     / (tf.cast(tf.shape(actions)[0], tf.float32) * active_expert_count)
                 )
+                if self.objective_head_aux_loss_clip > 0.0:
+                    objective_expert_loss = tf.clip_by_value(
+                        objective_expert_loss,
+                        -tf.constant(self.objective_head_aux_loss_clip, dtype=tf.float32),
+                        tf.constant(self.objective_head_aux_loss_clip, dtype=tf.float32),
+                    )
             if router_probs is not None and self.objective_router_entropy_coef > 0.0:
                 router_probs_safe = tf.maximum(router_probs, tf.constant(1e-8, dtype=router_probs.dtype))
                 objective_router_entropy = -tf.constant(
@@ -2505,10 +2550,19 @@ class PPOAgentTF:
 
                 loss_unclipped = tf.square(returns_norm - values_norm)
                 loss_clipped = tf.square(returns_norm - values_clipped_norm)
+                if self.critic_use_huber:
+                    error_unclipped = returns_norm - values_norm
+                    error_clipped = returns_norm - values_clipped_norm
+                    loss_unclipped = self._safe_huber(error_unclipped, self.critic_huber_delta)
+                    loss_clipped = self._safe_huber(error_clipped, self.critic_huber_delta)
                 loss = tf.reduce_mean(tf.maximum(loss_unclipped, loss_clipped))
             else:
                 # MSE loss on centered values
-                loss = tf.reduce_mean(tf.square(returns_norm - values_norm))
+                error = returns_norm - values_norm
+                if self.critic_use_huber:
+                    loss = tf.reduce_mean(self._safe_huber(error, self.critic_huber_delta))
+                else:
+                    loss = tf.reduce_mean(tf.square(error))
         
         return loss, clip_fraction
 
@@ -2538,9 +2592,15 @@ class PPOAgentTF:
             loss_clipped = tf.square(expert_returns - expert_values_clipped)
             clip_flags = tf.cast(tf.abs(expert_values - old_expert_values) > self.value_clip_range, tf.float32)
             clip_fraction = tf.reduce_sum(clip_flags * expert_mask) / tf.maximum(tf.reduce_sum(expert_mask), 1.0)
+            if self.critic_use_huber:
+                loss_unclipped = self._safe_huber(expert_returns - expert_values, self.critic_huber_delta)
+                loss_clipped = self._safe_huber(expert_returns - expert_values_clipped, self.critic_huber_delta)
             loss_matrix = tf.maximum(loss_unclipped, loss_clipped)
         else:
-            loss_matrix = loss_unclipped
+            if self.critic_use_huber:
+                loss_matrix = self._safe_huber(expert_returns - expert_values, self.critic_huber_delta)
+            else:
+                loss_matrix = loss_unclipped
         loss = tf.reduce_sum(loss_matrix * expert_mask) / tf.maximum(
             tf.cast(tf.shape(loss_matrix)[0], tf.float32) * tf.reduce_sum(expert_mask),
             1.0,
@@ -2692,11 +2752,16 @@ class PPOAgentTF:
         
         # Normalize advantages
         advantages = (advantages - np.mean(advantages)) / (np.std(advantages) + 1e-8)
+        if self.advantage_clip_value > 0.0:
+            advantages = np.clip(advantages, -self.advantage_clip_value, self.advantage_clip_value)
         if self.objective_experts_enabled and expert_advantages is not None:
             normalized_cols = []
             for expert_idx in range(self.num_objective_experts):
                 col = expert_advantages[:, expert_idx]
-                normalized_cols.append((col - np.mean(col)) / (np.std(col) + 1e-8))
+                norm_col = (col - np.mean(col)) / (np.std(col) + 1e-8)
+                if self.expert_advantage_clip_value > 0.0:
+                    norm_col = np.clip(norm_col, -self.expert_advantage_clip_value, self.expert_advantage_clip_value)
+                normalized_cols.append(norm_col)
             expert_advantages = np.stack(normalized_cols, axis=-1)
 
         # DIAGNOSTIC: Check advantages AFTER normalization
@@ -2819,6 +2884,10 @@ class PPOAgentTF:
             'early_stop_epoch': -1.0,
             'nonfinite_actor_loss_detected': 0.0,
             'nonfinite_critic_loss_detected': 0.0,
+            'actor_nonfinite_grad_tensors': 0.0,
+            'actor_nonfinite_grad_elements': 0.0,
+            'critic_nonfinite_grad_tensors': 0.0,
+            'critic_nonfinite_grad_elements': 0.0,
         }
         
         # Multiple epochs of optimization
@@ -2893,6 +2962,10 @@ class PPOAgentTF:
                     )
                 
                 actor_grads = tape.gradient(actor_loss, self.actor.trainable_variables)
+                actor_nonfinite_grad_tensors = 0
+                actor_nonfinite_grad_elements = 0
+                if self.sanitize_nonfinite_gradients:
+                    actor_grads, actor_nonfinite_grad_tensors, actor_nonfinite_grad_elements = self._sanitize_gradients(actor_grads)
                 
                 # Compute gradient norm BEFORE clipping for diagnostics
                 actor_grad_norm = tf.linalg.global_norm(actor_grads).numpy()
@@ -2938,6 +3011,10 @@ class PPOAgentTF:
                     critic_loss = critic_loss_raw * self.vf_coef
                 
                 critic_grads = tape.gradient(critic_loss, self.critic.trainable_variables)
+                critic_nonfinite_grad_tensors = 0
+                critic_nonfinite_grad_elements = 0
+                if self.sanitize_nonfinite_gradients:
+                    critic_grads, critic_nonfinite_grad_tensors, critic_nonfinite_grad_elements = self._sanitize_gradients(critic_grads)
                 
                 # Compute gradient norm BEFORE clipping for diagnostics
                 critic_grad_norm = tf.linalg.global_norm(critic_grads).numpy()
@@ -2991,6 +3068,10 @@ class PPOAgentTF:
                 stats['entropy'] += float(entropy)
                 stats['actor_grad_norm'] += float(actor_grad_norm)
                 stats['critic_grad_norm'] += float(critic_grad_norm)
+                stats['actor_nonfinite_grad_tensors'] += float(actor_nonfinite_grad_tensors)
+                stats['actor_nonfinite_grad_elements'] += float(actor_nonfinite_grad_elements)
+                stats['critic_nonfinite_grad_tensors'] += float(critic_nonfinite_grad_tensors)
+                stats['critic_nonfinite_grad_elements'] += float(critic_nonfinite_grad_elements)
                 stats['alpha_min'] += float(np.min(alpha_batch))
                 stats['alpha_max'] += float(np.max(alpha_batch))
                 stats['alpha_mean'] += float(np.mean(alpha_batch))
@@ -3060,7 +3141,10 @@ class PPOAgentTF:
                        'mixture_component_dispersion_loss', 'mixture_gating_entropy',
                        'objective_expert_loss', 'objective_router_entropy', 'objective_diversity_loss',
                        'policy_loss', 'entropy_loss', 'entropy',
-                       'actor_grad_norm', 'critic_grad_norm', 'alpha_min', 'alpha_max', 'alpha_mean', 'alpha_std',
+                       'actor_grad_norm', 'critic_grad_norm',
+                       'actor_nonfinite_grad_tensors', 'actor_nonfinite_grad_elements',
+                       'critic_nonfinite_grad_tensors', 'critic_nonfinite_grad_elements',
+                       'alpha_min', 'alpha_max', 'alpha_mean', 'alpha_std',
                        'alpha_cap_hit_frac',
                        'film_seq_gamma_delta_abs_mean', 'film_seq_beta_abs_mean', 'film_seq_gamma_sat_frac',
                        'film_latent_gamma_delta_abs_mean', 'film_latent_beta_abs_mean', 'film_latent_gamma_sat_frac',
