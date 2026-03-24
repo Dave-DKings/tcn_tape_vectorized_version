@@ -1003,6 +1003,10 @@ class DirichletActor(Model):
             alpha_cap = tf.cast(self._alpha_cap, alpha.dtype)
             alpha = tf.minimum(alpha, alpha_cap)
 
+        if activation in {"cross_softplus", "cross_sectional_softplus", "cs_softplus"}:
+            enforced_floor = tf.cast(self._softplus_alpha_floor, alpha.dtype) + eps
+            alpha = tf.maximum(alpha, enforced_floor)
+
         # Ensure strictly positive
         return tf.maximum(alpha, tf.cast(1e-6, alpha.dtype))
 

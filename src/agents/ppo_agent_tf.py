@@ -426,6 +426,14 @@ class PPOAgentTF:
         self._latest_action_metadata = {}
         self._latest_batch_action_metadata = {}
         self._last_policy_debug = {}
+        self._last_gae_diagnostics = {
+            'nonfinite_reward_count': 0,
+            'nonfinite_value_count': 0,
+            'nonfinite_delta_count': 0,
+            'nonfinite_gae_count': 0,
+            'nonfinite_advantage_count': 0,
+            'nonfinite_return_count': 0,
+        }
         
         logger.info(f"Initialized {name}")
         logger.info(f"  State dim: {state_dim}, Num assets: {num_assets}, Actions: {self.num_actions}")
@@ -1963,12 +1971,25 @@ class PPOAgentTF:
             tuple: (advantages, returns) as numpy arrays
         """
         advantages = []
-        gae = 0
+        gae = 0.0
         
         # Convert to numpy for easier manipulation
-        rewards = np.array(rewards)
-        values = np.array(values)
-        dones = np.array(dones)
+        rewards = np.asarray(rewards, dtype=np.float32)
+        values = np.asarray(values, dtype=np.float32)
+        dones = np.asarray(dones, dtype=np.float32)
+        next_value = float(np.nan_to_num(next_value, nan=0.0, posinf=0.0, neginf=0.0))
+
+        diag = {
+            'nonfinite_reward_count': int(np.size(rewards) - np.count_nonzero(np.isfinite(rewards))),
+            'nonfinite_value_count': int(np.size(values) - np.count_nonzero(np.isfinite(values))),
+            'nonfinite_delta_count': 0,
+            'nonfinite_gae_count': 0,
+            'nonfinite_advantage_count': 0,
+            'nonfinite_return_count': 0,
+        }
+
+        rewards = np.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0)
+        values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Add next_value to values for bootstrapping
         values_with_next = np.append(values, next_value)
@@ -1984,13 +2005,24 @@ class PPOAgentTF:
             
             # TD error
             delta = rewards[t] + self.gamma * next_value * next_non_terminal - values[t]
+            if not np.isfinite(delta):
+                diag['nonfinite_delta_count'] += 1
+                delta = 0.0
             
             # GAE
             gae = delta + self.gamma * self.gae_lambda * next_non_terminal * gae
+            if not np.isfinite(gae):
+                diag['nonfinite_gae_count'] += 1
+                gae = 0.0
             advantages.insert(0, gae)
-        
-        advantages = np.array(advantages)
+
+        advantages = np.asarray(advantages, dtype=np.float32)
         returns = advantages + values
+        diag['nonfinite_advantage_count'] = int(np.size(advantages) - np.count_nonzero(np.isfinite(advantages)))
+        diag['nonfinite_return_count'] = int(np.size(returns) - np.count_nonzero(np.isfinite(returns)))
+        advantages = np.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0)
+        returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
+        self._last_gae_diagnostics = diag
         
         # DIAGNOSTIC: Check TD errors to understand advantage computation
         td_errors = []
@@ -2716,6 +2748,18 @@ class PPOAgentTF:
                     "precomputed_gae length mismatch: "
                     f"advantages={len(advantages)}, returns={len(returns)}, rewards={len(rewards)}"
                 )
+            pre_adv_nonfinite = int(np.size(advantages) - np.count_nonzero(np.isfinite(advantages)))
+            pre_ret_nonfinite = int(np.size(returns) - np.count_nonzero(np.isfinite(returns)))
+            advantages = np.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0)
+            returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
+            self._last_gae_diagnostics = {
+                'nonfinite_reward_count': 0,
+                'nonfinite_value_count': 0,
+                'nonfinite_delta_count': 0,
+                'nonfinite_gae_count': 0,
+                'nonfinite_advantage_count': pre_adv_nonfinite,
+                'nonfinite_return_count': pre_ret_nonfinite,
+            }
         else:
             # Compute advantages and returns using GAE
             advantages, returns = self.compute_gae(rewards, values_old, dones)
@@ -2736,6 +2780,8 @@ class PPOAgentTF:
                     expert_returns_list.append(np.asarray(ret_i, dtype=np.float32))
                 expert_advantages = np.stack(expert_advantages_list, axis=-1)
                 expert_returns = np.stack(expert_returns_list, axis=-1)
+            expert_advantages = np.nan_to_num(expert_advantages, nan=0.0, posinf=0.0, neginf=0.0)
+            expert_returns = np.nan_to_num(expert_returns, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Store raw advantages for diagnostics BEFORE normalization
         raw_advantages = advantages.copy()
@@ -2752,6 +2798,7 @@ class PPOAgentTF:
         
         # Normalize advantages
         advantages = (advantages - np.mean(advantages)) / (np.std(advantages) + 1e-8)
+        advantages = np.nan_to_num(advantages, nan=0.0, posinf=0.0, neginf=0.0)
         if self.advantage_clip_value > 0.0:
             advantages = np.clip(advantages, -self.advantage_clip_value, self.advantage_clip_value)
         if self.objective_experts_enabled and expert_advantages is not None:
@@ -2759,6 +2806,7 @@ class PPOAgentTF:
             for expert_idx in range(self.num_objective_experts):
                 col = expert_advantages[:, expert_idx]
                 norm_col = (col - np.mean(col)) / (np.std(col) + 1e-8)
+                norm_col = np.nan_to_num(norm_col, nan=0.0, posinf=0.0, neginf=0.0)
                 if self.expert_advantage_clip_value > 0.0:
                     norm_col = np.clip(norm_col, -self.expert_advantage_clip_value, self.expert_advantage_clip_value)
                 normalized_cols.append(norm_col)
@@ -2888,6 +2936,13 @@ class PPOAgentTF:
             'actor_nonfinite_grad_elements': 0.0,
             'critic_nonfinite_grad_tensors': 0.0,
             'critic_nonfinite_grad_elements': 0.0,
+            'gae_nonfinite_reward_count': float(self._last_gae_diagnostics.get('nonfinite_reward_count', 0)),
+            'gae_nonfinite_value_count': float(self._last_gae_diagnostics.get('nonfinite_value_count', 0)),
+            'gae_nonfinite_delta_count': float(self._last_gae_diagnostics.get('nonfinite_delta_count', 0)),
+            'gae_nonfinite_gae_count': float(self._last_gae_diagnostics.get('nonfinite_gae_count', 0)),
+            'gae_nonfinite_advantage_count': float(self._last_gae_diagnostics.get('nonfinite_advantage_count', 0)),
+            'gae_nonfinite_return_count': float(self._last_gae_diagnostics.get('nonfinite_return_count', 0)),
+            'failure_reason': '',
         }
         
         # Multiple epochs of optimization
@@ -2973,6 +3028,11 @@ class PPOAgentTF:
                 actor_grad_nonfinite = (not np.isfinite(actor_grad_norm))
                 if actor_loss_nonfinite or actor_grad_nonfinite:
                     stats['nonfinite_actor_loss_detected'] = 1.0
+                    stats['failure_reason'] = 'actor_nonfinite'
+                    stats['actor_loss'] = float(actor_loss)
+                    stats['policy_loss'] = float(policy_loss)
+                    stats['entropy_loss'] = float(entropy_loss)
+                    stats['actor_grad_norm'] = float(actor_grad_norm) if np.isfinite(actor_grad_norm) else float('nan')
                     logger.error("[ERROR] CRITICAL: NaN/Inf detected in actor_loss! Training unstable.")
                     logger.error("   Policy loss: %.6f, Entropy loss: %.6f", float(policy_loss), float(entropy_loss))
                     logger.error("   Actor grad norm: %s", actor_grad_norm)
@@ -3022,6 +3082,10 @@ class PPOAgentTF:
                 critic_grad_nonfinite = (not np.isfinite(critic_grad_norm))
                 if critic_loss_nonfinite or critic_grad_nonfinite:
                     stats['nonfinite_critic_loss_detected'] = 1.0
+                    stats['failure_reason'] = 'critic_nonfinite'
+                    stats['critic_loss'] = float(critic_loss_raw)
+                    stats['critic_loss_scaled'] = float(critic_loss)
+                    stats['critic_grad_norm'] = float(critic_grad_norm) if np.isfinite(critic_grad_norm) else float('nan')
                     logger.error(f"[ERROR] CRITICAL: NaN/Inf detected in critic_loss! Training unstable.")
                     logger.error("   Critic grad norm: %s", critic_grad_norm)
                     early_stop = True

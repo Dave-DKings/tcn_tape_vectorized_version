@@ -916,6 +916,13 @@ TRAINING_FIELDNAMES: List[str] = [
     "objective_expert_mask",
     "nonfinite_actor_loss_detected",
     "nonfinite_critic_loss_detected",
+    "failure_reason",
+    "gae_nonfinite_reward_count",
+    "gae_nonfinite_value_count",
+    "gae_nonfinite_delta_count",
+    "gae_nonfinite_gae_count",
+    "gae_nonfinite_advantage_count",
+    "gae_nonfinite_return_count",
     "mixture_balance_loss",
     "mixture_separation_loss",
     "mixture_component_dispersion_loss",
@@ -5857,6 +5864,13 @@ def run_experiment6_tape(
         objective_router_probs_value = update_metrics.get("objective_router_probs", None)
         nonfinite_actor_loss_detected_value = update_metrics.get("nonfinite_actor_loss_detected", 0.0)
         nonfinite_critic_loss_detected_value = update_metrics.get("nonfinite_critic_loss_detected", 0.0)
+        failure_reason_value = update_metrics.get("failure_reason", "")
+        gae_nonfinite_reward_count_value = update_metrics.get("gae_nonfinite_reward_count", 0.0)
+        gae_nonfinite_value_count_value = update_metrics.get("gae_nonfinite_value_count", 0.0)
+        gae_nonfinite_delta_count_value = update_metrics.get("gae_nonfinite_delta_count", 0.0)
+        gae_nonfinite_gae_count_value = update_metrics.get("gae_nonfinite_gae_count", 0.0)
+        gae_nonfinite_advantage_count_value = update_metrics.get("gae_nonfinite_advantage_count", 0.0)
+        gae_nonfinite_return_count_value = update_metrics.get("gae_nonfinite_return_count", 0.0)
         objective_expert_mask_value = getattr(agent, "objective_expert_mask", None)
 
         if ra_kl_enabled:
@@ -5906,6 +5920,28 @@ def run_experiment6_tape(
                 f"nonfinite_actor={bool(nonfinite_actor_loss_detected_value)} | "
                 f"nonfinite_critic={bool(nonfinite_critic_loss_detected_value)}"
             )
+            if failure_reason_value:
+                print(f"   Failure reason: {failure_reason_value}")
+            if any(
+                float(v or 0.0) > 0.0
+                for v in (
+                    gae_nonfinite_reward_count_value,
+                    gae_nonfinite_value_count_value,
+                    gae_nonfinite_delta_count_value,
+                    gae_nonfinite_gae_count_value,
+                    gae_nonfinite_advantage_count_value,
+                    gae_nonfinite_return_count_value,
+                )
+            ):
+                print(
+                    "   GAE diagnostics: "
+                    f"reward={int(gae_nonfinite_reward_count_value or 0)} | "
+                    f"value={int(gae_nonfinite_value_count_value or 0)} | "
+                    f"delta={int(gae_nonfinite_delta_count_value or 0)} | "
+                    f"gae={int(gae_nonfinite_gae_count_value or 0)} | "
+                    f"adv={int(gae_nonfinite_advantage_count_value or 0)} | "
+                    f"ret={int(gae_nonfinite_return_count_value or 0)}"
+                )
             if objective_router_probs_value is not None:
                 print(f"   Router Probs: {objective_router_probs_value}")
             if objective_expert_mask_value is not None:
@@ -6210,6 +6246,26 @@ def run_experiment6_tape(
                     f"critic_tensors={int(critic_nonfinite_grad_tensors_val or 0)} | "
                     f"critic_elements={int(critic_nonfinite_grad_elements_val or 0)}"
                 )
+            if any(
+                float(v or 0.0) > 0.0
+                for v in (
+                    gae_nonfinite_reward_count_value,
+                    gae_nonfinite_value_count_value,
+                    gae_nonfinite_delta_count_value,
+                    gae_nonfinite_gae_count_value,
+                    gae_nonfinite_advantage_count_value,
+                    gae_nonfinite_return_count_value,
+                )
+            ):
+                print(
+                    "   ⚠️ GAE Sanitize: "
+                    f"reward={int(gae_nonfinite_reward_count_value or 0)} | "
+                    f"value={int(gae_nonfinite_value_count_value or 0)} | "
+                    f"delta={int(gae_nonfinite_delta_count_value or 0)} | "
+                    f"gae={int(gae_nonfinite_gae_count_value or 0)} | "
+                    f"adv={int(gae_nonfinite_advantage_count_value or 0)} | "
+                    f"ret={int(gae_nonfinite_return_count_value or 0)}"
+                )
             if training_early_stop_enabled_cfg and training_early_stop_score_val is not None:
                 ema_disp = float(training_early_stop_ema_score or training_early_stop_score_val)
                 best_disp = float(
@@ -6491,6 +6547,13 @@ def run_experiment6_tape(
                 ),
                 "nonfinite_actor_loss_detected": float(nonfinite_actor_loss_detected_value or 0.0),
                 "nonfinite_critic_loss_detected": float(nonfinite_critic_loss_detected_value or 0.0),
+                "failure_reason": (str(failure_reason_value) if failure_reason_value else None),
+                "gae_nonfinite_reward_count": float(gae_nonfinite_reward_count_value or 0.0),
+                "gae_nonfinite_value_count": float(gae_nonfinite_value_count_value or 0.0),
+                "gae_nonfinite_delta_count": float(gae_nonfinite_delta_count_value or 0.0),
+                "gae_nonfinite_gae_count": float(gae_nonfinite_gae_count_value or 0.0),
+                "gae_nonfinite_advantage_count": float(gae_nonfinite_advantage_count_value or 0.0),
+                "gae_nonfinite_return_count": float(gae_nonfinite_return_count_value or 0.0),
                 "mixture_balance_loss": mixture_balance_loss_val,
                 "mixture_separation_loss": mixture_separation_loss_val,
                 "mixture_component_dispersion_loss": mixture_component_dispersion_loss_val,

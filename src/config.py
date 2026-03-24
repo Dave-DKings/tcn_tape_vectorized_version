@@ -2149,6 +2149,7 @@ RUN19_OVERRIDES["agent_params"].update(
         "objective_expert_dropout": 0.10,
         "objective_router_hidden_dims": [64, 32],
         "objective_router_dropout": 0.05,
+        "dirichlet_softplus_alpha_floor": 1.05,
     }
 )
 RUN19_OVERRIDES["agent_params"]["ppo_params"].update(
@@ -3785,7 +3786,7 @@ def assert_run19_config(config: dict) -> None:
     assert str(agent.get("dirichlet_alpha_activation", "")).lower() == "cross_softplus", (
         "Run19 alpha activation must stay cross_softplus"
     )
-    assert float(agent.get("dirichlet_softplus_alpha_floor", 0.0)) == 0.75, (
+    assert float(agent.get("dirichlet_softplus_alpha_floor", 0.0)) == 1.05, (
         "Run19 softplus alpha floor drifted"
     )
     assert float(agent.get("dirichlet_softplus_alpha_scale", 0.0)) == 3.0, (
