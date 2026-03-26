@@ -467,9 +467,11 @@ def _latest_normal_checkpoint_prefix(results_root: Path, exp_idx: int) -> Option
     search_specs = [
         (results_root, f"exp{exp_idx}_tape_ep*_actor.weights.h5"),
         (results_root, f"exp{exp_idx}_ep*_actor.weights.h5"),
-        # High-watermark style naming used by checkpoint policy and final save.
-        (results_root / "high_watermark_checkpoints", f"exp{exp_idx}_tape_hw_ep*_sh*_actor.weights.h5"),
     ]
+    # High-watermark style naming used by checkpoint policy and final save.
+    for subdir in sorted(results_root.glob("high_watermark_checkpoints*")):
+        if subdir.is_dir():
+            search_specs.append((subdir, f"exp{exp_idx}_tape_hw_ep*_sh*_actor.weights.h5"))
     for search_dir, pattern in search_specs:
         if not search_dir.exists():
             continue
@@ -3905,6 +3907,12 @@ def run_experiment6_tape(
     )
     step_sharpe_checkpoint_enabled_cfg = bool(training_params.get("step_sharpe_checkpoint_enabled", False))
     step_sharpe_checkpoint_threshold_cfg = float(training_params.get("step_sharpe_checkpoint_threshold", 0.5))
+    high_watermark_checkpoint_subdir_cfg = str(
+        training_params.get("high_watermark_checkpoint_subdir", "high_watermark_checkpoints")
+    ).strip() or "high_watermark_checkpoints"
+    step_sharpe_checkpoint_subdir_cfg = str(
+        training_params.get("step_sharpe_checkpoint_subdir", "step_sharpe_checkpoints")
+    ).strip() or "step_sharpe_checkpoints"
     periodic_checkpoint_every_steps_cfg = int(training_params.get("periodic_checkpoint_every_steps", 0) or 0)
     tape_checkpoint_threshold_cfg = float(training_params.get("tape_checkpoint_threshold", 999.0))
     if deterministic_validation_checkpointing_only_cfg:
@@ -4683,11 +4691,11 @@ def run_experiment6_tape(
         "high_watermark_skip_on_deterministic_validation_trigger": bool(
             high_watermark_skip_on_det_validation_trigger_cfg
         ),
-        "high_watermark_checkpoint_subdir": "high_watermark_checkpoints",
+        "high_watermark_checkpoint_subdir": high_watermark_checkpoint_subdir_cfg,
         "high_watermark_logic": "save_on_episode_metric_threshold",
         "step_sharpe_checkpoint_enabled": bool(step_sharpe_checkpoint_enabled_cfg),
         "step_sharpe_checkpoint_threshold": float(step_sharpe_checkpoint_threshold_cfg),
-        "step_sharpe_checkpoint_subdir": "step_sharpe_checkpoints",
+        "step_sharpe_checkpoint_subdir": step_sharpe_checkpoint_subdir_cfg,
         "training_early_stop_enabled": bool(training_early_stop_enabled_cfg),
         "training_early_stop_warmup_steps": int(training_early_stop_warmup_steps_cfg),
         "training_early_stop_ema_alpha": float(training_early_stop_ema_alpha_cfg),
@@ -5005,10 +5013,10 @@ def run_experiment6_tape(
     high_watermark_skip_on_det_validation_trigger = bool(
         high_watermark_skip_on_det_validation_trigger_cfg
     )
-    high_watermark_checkpoint_dir = results_root / "high_watermark_checkpoints"
+    high_watermark_checkpoint_dir = results_root / high_watermark_checkpoint_subdir_cfg
     step_sharpe_checkpoint_enabled = bool(step_sharpe_checkpoint_enabled_cfg)
     step_sharpe_checkpoint_threshold = float(step_sharpe_checkpoint_threshold_cfg)
-    step_sharpe_checkpoint_dir = results_root / "step_sharpe_checkpoints"
+    step_sharpe_checkpoint_dir = results_root / step_sharpe_checkpoint_subdir_cfg
     last_periodic_checkpoint_bucket = 0
 
     last_tape_bonus_clipped = False

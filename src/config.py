@@ -2257,15 +2257,18 @@ RUN19_OVERRIDES["training_params"]["reward_component_schedule"] = [
 RUN20_OVERRIDES = copy.deepcopy(RUN19_OVERRIDES)
 RUN20_OVERRIDES["training_params"].update(
     {
+        "num_parallel_envs": 16,
+        "high_watermark_checkpoint_subdir": "high_watermark_checkpoints_run20",
+        "step_sharpe_checkpoint_subdir": "step_sharpe_checkpoints_run20",
         "timesteps_per_ppo_update_schedule": [
             {"threshold": 0, "timesteps_per_update": 1008},
             {"threshold": 250_000, "timesteps_per_update": 1512},
             {"threshold": 420_000, "timesteps_per_update": 2016},
         ],
         "batch_size_ppo_schedule": [
-            {"threshold": 0, "batch_size": 252},
-            {"threshold": 270_000, "batch_size": 336},
-            {"threshold": 440_000, "batch_size": 504},
+            {"threshold": 0, "batch_size": 336},
+            {"threshold": 270_000, "batch_size": 504},
+            {"threshold": 440_000, "batch_size": 672},
         ],
         "ppo_entropy_coef_schedule": [
             {"threshold": 0, "entropy_coef": 0.0007},
@@ -4039,6 +4042,7 @@ def assert_run20_config(config: dict) -> None:
         "Run20 softplus alpha scale drifted"
     )
     assert float(env.get("target_turnover", 0.0)) == 0.35, "Run20 target_turnover drifted"
+    assert int(training.get("num_parallel_envs", 0)) == 16, "Run20 num_parallel_envs drifted"
     assert bool(agent.get("objective_experts_enabled", False)), "Run20 objective experts must stay enabled"
     assert list(agent.get("objective_expert_names", [])) == ["return", "risk", "discipline"], (
         "Run20 objective_expert_names drifted"
@@ -4055,6 +4059,12 @@ def assert_run20_config(config: dict) -> None:
     )
     assert int(training.get("training_early_stop_transition_grace_steps", 0)) == 15_000, (
         "Run20 transition grace drifted"
+    )
+    assert str(training.get("high_watermark_checkpoint_subdir", "")) == "high_watermark_checkpoints_run20", (
+        "Run20 high_watermark_checkpoint_subdir drifted"
+    )
+    assert str(training.get("step_sharpe_checkpoint_subdir", "")) == "step_sharpe_checkpoints_run20", (
+        "Run20 step_sharpe_checkpoint_subdir drifted"
     )
     assert bool(training.get("training_early_stop_reset_ema_on_transition", False)), (
         "Run20 must reset EMA state on major transitions"
