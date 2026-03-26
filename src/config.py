@@ -2253,6 +2253,157 @@ RUN19_OVERRIDES["training_params"]["reward_component_schedule"] = [
 ]
 
 
+# ── Run 20: Staggered-transition expert curriculum with phase-aware early stop ──
+RUN20_OVERRIDES = copy.deepcopy(RUN19_OVERRIDES)
+RUN20_OVERRIDES["training_params"].update(
+    {
+        "timesteps_per_ppo_update_schedule": [
+            {"threshold": 0, "timesteps_per_update": 1008},
+            {"threshold": 250_000, "timesteps_per_update": 1512},
+            {"threshold": 420_000, "timesteps_per_update": 2016},
+        ],
+        "batch_size_ppo_schedule": [
+            {"threshold": 0, "batch_size": 252},
+            {"threshold": 270_000, "batch_size": 336},
+            {"threshold": 440_000, "batch_size": 504},
+        ],
+        "ppo_entropy_coef_schedule": [
+            {"threshold": 0, "entropy_coef": 0.0007},
+            {"threshold": 275_000, "entropy_coef": 0.0005},
+            {"threshold": 395_000, "entropy_coef": 0.0003},
+            {"threshold": 455_000, "entropy_coef": 0.0001},
+        ],
+        "aux_return_pred_coef_schedule": [
+            {"threshold": 0, "aux_return_pred_coef": 0.35},
+            {"threshold": 290_000, "aux_return_pred_coef": 0.30},
+            {"threshold": 410_000, "aux_return_pred_coef": 0.25},
+        ],
+        "dirichlet_temperature_schedule": [
+            {"threshold": 0, "temperature": 1.0},
+            {"threshold": 300_000, "temperature": 0.90},
+            {"threshold": 380_000, "temperature": 0.85},
+            {"threshold": 450_000, "temperature": 0.80},
+        ],
+        "action_execution_beta_schedule": [
+            {"threshold": 0, "beta": 0.55},
+            {"threshold": 235_000, "beta": 0.65},
+            {"threshold": 365_000, "beta": 0.75},
+            {"threshold": 430_000, "beta": 0.90},
+            {"threshold": 480_000, "beta": 1.00},
+        ],
+        "action_execution_beta_curriculum": {
+            0: 0.55,
+            235_000: 0.65,
+            365_000: 0.75,
+            430_000: 0.90,
+            480_000: 1.00,
+        },
+        "turnover_penalty_curriculum": {
+            0: 0.00,
+            285_000: 0.05,
+            345_000: 0.10,
+            405_000: 0.20,
+            470_000: 0.30,
+        },
+        "reward_component_schedule": [
+            {
+                "threshold": 0,
+                "phase": "A_return_only",
+                "enable_base_reward": True,
+                "enable_dsr_reward": False,
+                "enable_turnover_penalty": False,
+                "enable_benchmark_shaping": False,
+                "enable_terminal_tape_bonus": False,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 0.0,
+                "turnover_penalty_weight": 0.0,
+                "benchmark_shaping_weight": 0.0,
+                "terminal_tape_bonus_weight": 0.0,
+            },
+            {
+                "threshold": 200_000,
+                "phase": "B_ramp_1",
+                "enable_base_reward": True,
+                "enable_dsr_reward": True,
+                "enable_turnover_penalty": False,
+                "enable_benchmark_shaping": True,
+                "enable_terminal_tape_bonus": False,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 0.25,
+                "turnover_penalty_weight": 0.0,
+                "benchmark_shaping_weight": 0.20,
+                "terminal_tape_bonus_weight": 0.0,
+            },
+            {
+                "threshold": 260_000,
+                "phase": "B_ramp_2",
+                "enable_base_reward": True,
+                "enable_dsr_reward": True,
+                "enable_turnover_penalty": False,
+                "enable_benchmark_shaping": True,
+                "enable_terminal_tape_bonus": False,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 0.60,
+                "turnover_penalty_weight": 0.0,
+                "benchmark_shaping_weight": 0.50,
+                "terminal_tape_bonus_weight": 0.0,
+            },
+            {
+                "threshold": 320_000,
+                "phase": "C_disc_intro",
+                "enable_base_reward": True,
+                "enable_dsr_reward": True,
+                "enable_turnover_penalty": True,
+                "enable_benchmark_shaping": True,
+                "enable_terminal_tape_bonus": False,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 1.0,
+                "turnover_penalty_weight": 0.10,
+                "benchmark_shaping_weight": 0.65,
+                "terminal_tape_bonus_weight": 0.0,
+            },
+            {
+                "threshold": 380_000,
+                "phase": "C_ramp_2",
+                "enable_base_reward": True,
+                "enable_dsr_reward": True,
+                "enable_turnover_penalty": True,
+                "enable_benchmark_shaping": True,
+                "enable_terminal_tape_bonus": True,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 1.0,
+                "turnover_penalty_weight": 0.45,
+                "benchmark_shaping_weight": 1.0,
+                "terminal_tape_bonus_weight": 0.30,
+            },
+            {
+                "threshold": 440_000,
+                "phase": "C_full_tape",
+                "enable_base_reward": True,
+                "enable_dsr_reward": True,
+                "enable_turnover_penalty": True,
+                "enable_benchmark_shaping": True,
+                "enable_terminal_tape_bonus": True,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 1.0,
+                "turnover_penalty_weight": 1.0,
+                "benchmark_shaping_weight": 1.0,
+                "terminal_tape_bonus_weight": 1.0,
+            },
+        ],
+        "training_early_stop_warmup_steps": 250_000,
+        "training_early_stop_patience_updates": 75,
+        "training_early_stop_transition_grace_steps": 15_000,
+        "training_early_stop_reset_ema_on_transition": True,
+        "training_early_stop_reset_on_reward_phase_change": True,
+        "training_early_stop_reset_on_turnover_scalar_update": True,
+        "training_early_stop_reset_on_action_execution_beta_update": True,
+        "training_early_stop_reset_on_rollout_batch_update": True,
+        "training_early_stop_reset_on_temperature_update": True,
+    }
+)
+
+
 RUN11_RELAXED_OVERRIDES = copy.deepcopy(RUN10_ALPHA_OVERRIDES)
 RUN11_RELAXED_OVERRIDES.update(
     {
@@ -3853,6 +4004,85 @@ def build_run19_config(
     if analysis_end_date is not None:
         config["ANALYSIS_END_DATE"] = analysis_end_date
     assert_run19_config(config)
+    return config
+
+
+def apply_run20_overrides(config: dict, overrides: dict = None) -> dict:
+    """Apply the canonical Run20 staggered-transition recipe in-place."""
+    global TRAIN_TEST_SPLIT_DATE
+    resolved = copy.deepcopy(RUN20_OVERRIDES if overrides is None else overrides)
+    split_date = resolved.get("TRAIN_TEST_SPLIT_DATE")
+    if split_date:
+        TRAIN_TEST_SPLIT_DATE = split_date
+        config["TRAIN_TEST_SPLIT_DATE"] = split_date
+    _deep_update_config(config, resolved)
+    return config
+
+
+def assert_run20_config(config: dict) -> None:
+    """Raise if a config expected to match the canonical Run20 recipe drifted."""
+    agent = config.get("agent_params", {})
+    ppo = agent.get("ppo_params", {})
+    training = config.get("training_params", {})
+    env = config.get("environment_params", {})
+    assert int(config.get("NUM_ASSETS", 0)) == 10, "Run20 must stay on the 10-asset universe"
+    assert list(agent.get("tcn_filters", [])) == [64, 96, 128], "Run20 TCN filters drifted"
+    assert list(agent.get("tcn_dilations", [])) == [1, 2, 4], "Run20 TCN dilations drifted"
+    assert int(agent.get("tcn_kernel_size", 0)) == 5, "Run20 TCN kernel size drifted"
+    assert str(agent.get("dirichlet_alpha_activation", "")).lower() == "cross_softplus", (
+        "Run20 alpha activation must stay cross_softplus"
+    )
+    assert float(agent.get("dirichlet_softplus_alpha_floor", 0.0)) == 1.05, (
+        "Run20 softplus alpha floor drifted"
+    )
+    assert float(agent.get("dirichlet_softplus_alpha_scale", 0.0)) == 3.0, (
+        "Run20 softplus alpha scale drifted"
+    )
+    assert float(env.get("target_turnover", 0.0)) == 0.35, "Run20 target_turnover drifted"
+    assert bool(agent.get("objective_experts_enabled", False)), "Run20 objective experts must stay enabled"
+    assert list(agent.get("objective_expert_names", [])) == ["return", "risk", "discipline"], (
+        "Run20 objective_expert_names drifted"
+    )
+    assert not bool(agent.get("distributional_critic_enabled", True)), (
+        "Run20 distributional critic must stay off in this staged run"
+    )
+    assert float(ppo.get("objective_head_aux_coef", 0.0)) == 0.10, "Run20 objective_head_aux_coef drifted"
+    assert float(ppo.get("objective_head_aux_loss_clip", 0.0)) == 0.25, "Run20 objective_head_aux_loss_clip drifted"
+    assert bool(ppo.get("critic_use_huber", False)), "Run20 critic_use_huber must stay enabled"
+    assert float(ppo.get("critic_huber_delta", 0.0)) == 2.0, "Run20 critic_huber_delta drifted"
+    assert int(training.get("training_early_stop_patience_updates", 0)) == 75, (
+        "Run20 early-stop patience drifted"
+    )
+    assert int(training.get("training_early_stop_transition_grace_steps", 0)) == 15_000, (
+        "Run20 transition grace drifted"
+    )
+    assert bool(training.get("training_early_stop_reset_ema_on_transition", False)), (
+        "Run20 must reset EMA state on major transitions"
+    )
+    expected_reward_schedule = copy.deepcopy(RUN20_OVERRIDES["training_params"]["reward_component_schedule"])
+    actual_reward_schedule = copy.deepcopy(training.get("reward_component_schedule", []))
+    assert actual_reward_schedule == expected_reward_schedule, "Run20 reward_component_schedule drifted"
+    expected_rollout_schedule = copy.deepcopy(RUN20_OVERRIDES["training_params"]["timesteps_per_ppo_update_schedule"])
+    actual_rollout_schedule = copy.deepcopy(training.get("timesteps_per_ppo_update_schedule", []))
+    assert actual_rollout_schedule == expected_rollout_schedule, "Run20 timesteps_per_ppo_update_schedule drifted"
+    expected_batch_schedule = copy.deepcopy(RUN20_OVERRIDES["training_params"]["batch_size_ppo_schedule"])
+    actual_batch_schedule = copy.deepcopy(training.get("batch_size_ppo_schedule", []))
+    assert actual_batch_schedule == expected_batch_schedule, "Run20 batch_size_ppo_schedule drifted"
+
+
+def build_run20_config(
+    phase_name: str = "phase1",
+    *,
+    analysis_end_date: str | None = None,
+    overrides: dict | None = None,
+) -> dict:
+    """Return a deep-copied phase config with the canonical Run20 overrides applied."""
+    config = copy.deepcopy(get_active_config(phase_name))
+    enforce_feature_audit_plan(config)
+    apply_run20_overrides(config, overrides=overrides)
+    if analysis_end_date is not None:
+        config["ANALYSIS_END_DATE"] = analysis_end_date
+    assert_run20_config(config)
     return config
 
 

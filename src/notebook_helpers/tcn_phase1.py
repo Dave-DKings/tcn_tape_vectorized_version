@@ -804,6 +804,10 @@ TRAINING_FIELDNAMES: List[str] = [
     "training_early_stop_no_improve_updates",
     "training_early_stop_hard_dd_counter",
     "training_early_stop_low_adv_counter",
+    "training_early_stop_in_grace_window",
+    "training_early_stop_grace_until_step",
+    "training_early_stop_transition_reset_count",
+    "training_early_stop_last_transition_reason",
     "training_early_stop_trigger_reason",
     "terminal_drawdown_lambda",
     "terminal_drawdown_lambda_peak",
@@ -3947,6 +3951,27 @@ def run_experiment6_tape(
     training_early_stop_low_advantage_enabled_cfg = bool(
         training_params.get("training_early_stop_low_advantage_enabled", False)
     )
+    training_early_stop_transition_grace_steps_cfg = int(
+        max(0, training_params.get("training_early_stop_transition_grace_steps", 0))
+    )
+    training_early_stop_reset_ema_on_transition_cfg = bool(
+        training_params.get("training_early_stop_reset_ema_on_transition", False)
+    )
+    training_early_stop_reset_on_reward_phase_change_cfg = bool(
+        training_params.get("training_early_stop_reset_on_reward_phase_change", False)
+    )
+    training_early_stop_reset_on_turnover_scalar_update_cfg = bool(
+        training_params.get("training_early_stop_reset_on_turnover_scalar_update", False)
+    )
+    training_early_stop_reset_on_action_execution_beta_update_cfg = bool(
+        training_params.get("training_early_stop_reset_on_action_execution_beta_update", False)
+    )
+    training_early_stop_reset_on_rollout_batch_update_cfg = bool(
+        training_params.get("training_early_stop_reset_on_rollout_batch_update", False)
+    )
+    training_early_stop_reset_on_temperature_update_cfg = bool(
+        training_params.get("training_early_stop_reset_on_temperature_update", False)
+    )
 
     deterministic_validation_best_sharpe = -np.inf
     deterministic_validation_best_score = -np.inf
@@ -4537,6 +4562,17 @@ def run_experiment6_tape(
             f"hard_dd={training_early_stop_hard_dd_limit_pct_cfg:.1f}% x "
             f"{training_early_stop_hard_dd_patience_updates_cfg})"
         )
+        if training_early_stop_transition_grace_steps_cfg > 0:
+            print(
+                "      ↳ phase-aware resets: "
+                f"grace={training_early_stop_transition_grace_steps_cfg:,} steps | "
+                f"reset_ema_on_transition={training_early_stop_reset_ema_on_transition_cfg} | "
+                f"reward_phase={training_early_stop_reset_on_reward_phase_change_cfg} | "
+                f"turnover={training_early_stop_reset_on_turnover_scalar_update_cfg} | "
+                f"beta={training_early_stop_reset_on_action_execution_beta_update_cfg} | "
+                f"rollout_batch={training_early_stop_reset_on_rollout_batch_update_cfg} | "
+                f"temperature={training_early_stop_reset_on_temperature_update_cfg}"
+            )
     else:
         print("   ⏹️ Training early-stop: disabled")
 
@@ -4666,6 +4702,23 @@ def run_experiment6_tape(
         "training_early_stop_mean_adv_abs_threshold": float(training_early_stop_mean_adv_abs_threshold_cfg),
         "training_early_stop_mean_adv_patience_updates": int(training_early_stop_mean_adv_patience_updates_cfg),
         "training_early_stop_low_advantage_enabled": bool(training_early_stop_low_advantage_enabled_cfg),
+        "training_early_stop_transition_grace_steps": int(training_early_stop_transition_grace_steps_cfg),
+        "training_early_stop_reset_ema_on_transition": bool(training_early_stop_reset_ema_on_transition_cfg),
+        "training_early_stop_reset_on_reward_phase_change": bool(
+            training_early_stop_reset_on_reward_phase_change_cfg
+        ),
+        "training_early_stop_reset_on_turnover_scalar_update": bool(
+            training_early_stop_reset_on_turnover_scalar_update_cfg
+        ),
+        "training_early_stop_reset_on_action_execution_beta_update": bool(
+            training_early_stop_reset_on_action_execution_beta_update_cfg
+        ),
+        "training_early_stop_reset_on_rollout_batch_update": bool(
+            training_early_stop_reset_on_rollout_batch_update_cfg
+        ),
+        "training_early_stop_reset_on_temperature_update": bool(
+            training_early_stop_reset_on_temperature_update_cfg
+        ),
         "saved_checkpoints_for_this_run": [],
     }
 
@@ -5035,10 +5088,48 @@ def run_experiment6_tape(
     training_early_stop_no_improve_updates = 0
     training_early_stop_hard_dd_counter = 0
     training_early_stop_low_adv_counter = 0
+    training_early_stop_grace_until_step = -1
+    training_early_stop_transition_reset_count = 0
+    training_early_stop_last_transition_reason: Optional[str] = None
     training_early_stop_trigger_reason: Optional[str] = None
     ra_kl_ema_approx_kl: Optional[float] = None
     ra_kl_last_error_ratio = 0.0
     ra_kl_last_adjust_factor = 1.0
+
+    def register_training_early_stop_transition(current_step: int, reason: str) -> None:
+        """Reset phase-aware early-stop counters around a major curriculum transition."""
+        nonlocal training_early_stop_best_ema_score
+        nonlocal training_early_stop_no_improve_updates
+        nonlocal training_early_stop_low_adv_counter
+        nonlocal training_early_stop_grace_until_step
+        nonlocal training_early_stop_transition_reset_count
+        nonlocal training_early_stop_last_transition_reason
+
+        if not training_early_stop_enabled_cfg:
+            return
+
+        training_early_stop_no_improve_updates = 0
+        training_early_stop_low_adv_counter = 0
+        training_early_stop_transition_reset_count += 1
+        training_early_stop_last_transition_reason = str(reason)
+
+        if training_early_stop_reset_ema_on_transition_cfg:
+            if training_early_stop_ema_score is not None and np.isfinite(training_early_stop_ema_score):
+                training_early_stop_best_ema_score = float(training_early_stop_ema_score)
+            else:
+                training_early_stop_best_ema_score = -np.inf
+
+        if training_early_stop_transition_grace_steps_cfg > 0:
+            training_early_stop_grace_until_step = max(
+                int(training_early_stop_grace_until_step),
+                int(current_step) + int(training_early_stop_transition_grace_steps_cfg),
+            )
+
+        print(
+            f"   ⏹️ Early-stop transition reset: reason={reason} | "
+            f"grace_until={max(int(training_early_stop_grace_until_step), int(current_step)):,} | "
+            f"best_ema_reset={'yes' if training_early_stop_reset_ema_on_transition_cfg else 'no'}"
+        )
 
     def apply_lagrangian_cvar_penalty(active_env: Any, reward_value: float) -> Tuple[float, float, float]:
         """Apply dense CVaR penalty to the collected reward before it enters GAE."""
@@ -5073,10 +5164,14 @@ def run_experiment6_tape(
             current_timestep_rollout = active_timestep_rollout
             print(f"\n📚 PPO ROLLOUT UPDATE at {step:,} steps:")
             print(f"   Timesteps per update: {current_timestep_rollout}")
+            if training_early_stop_reset_on_rollout_batch_update_cfg:
+                register_training_early_stop_transition(step, "rollout_update")
         if active_batch_size_ppo != current_batch_size_ppo:
             current_batch_size_ppo = active_batch_size_ppo
             print(f"\n📚 PPO BATCH SIZE UPDATE at {step:,} steps:")
             print(f"   Batch size: {current_batch_size_ppo}")
+            if training_early_stop_reset_on_rollout_batch_update_cfg:
+                register_training_early_stop_transition(step, "batch_size_update")
         if not np.isclose(active_ppo_gamma, current_ppo_gamma):
             current_ppo_gamma = active_ppo_gamma
             agent.gamma = current_ppo_gamma
@@ -5113,6 +5208,8 @@ def run_experiment6_tape(
                 agent.actor.set_temperature(current_temperature)
             print(f"\n🌡️ TEMPERATURE UPDATE at {step:,} steps:")
             print(f"   temperature: {current_temperature:.4f}")
+            if training_early_stop_reset_on_temperature_update_cfg:
+                register_training_early_stop_transition(step, "temperature_update")
 
         steps_this_update = min(active_timestep_rollout, max_total_timesteps - step)
         precomputed_gae_data: Optional[Tuple[np.ndarray, np.ndarray]] = None
@@ -5723,6 +5820,8 @@ def run_experiment6_tape(
                 train_env.turnover_penalty_scalar = current_turnover_scalar
             print(f"\n📚 TURNOVER CURRICULUM UPDATE at {step:,} steps:")
             print(f"   Turnover penalty scalar: {current_turnover_scalar}")
+            if training_early_stop_reset_on_turnover_scalar_update_cfg:
+                register_training_early_stop_transition(step, "turnover_scalar_update")
 
         new_action_execution_beta = get_current_action_execution_beta(step)
         if not np.isclose(new_action_execution_beta, current_action_execution_beta):
@@ -5735,6 +5834,8 @@ def run_experiment6_tape(
                 f"{current_action_execution_beta:.3f} "
                 "(w_exec=(1-β)w_prev + βw_raw)"
             )
+            if training_early_stop_reset_on_action_execution_beta_update_cfg:
+                register_training_early_stop_transition(step, "action_execution_beta_update")
 
         new_reward_component_flags = get_current_reward_component_flags(step)
         if new_reward_component_flags != current_reward_component_flags:
@@ -5779,6 +5880,9 @@ def run_experiment6_tape(
             )
             if getattr(agent, "objective_experts_enabled", False):
                 print(f"   objective_expert_mask={objective_mask}")
+            if training_early_stop_reset_on_reward_phase_change_cfg:
+                phase_name = str(current_reward_component_flags.get("phase", "unknown"))
+                register_training_early_stop_transition(step, f"reward_phase:{phase_name}")
 
         if use_episode_length_curriculum:
             new_episode_limit = determine_episode_limit(step, env_train.total_days)
@@ -6084,12 +6188,16 @@ def run_experiment6_tape(
                     )
 
                 if step >= training_early_stop_warmup_steps_cfg:
+                    in_transition_grace = (
+                        training_early_stop_transition_grace_steps_cfg > 0
+                        and step < training_early_stop_grace_until_step
+                    )
                     if training_early_stop_ema_score > (
                         training_early_stop_best_ema_score + training_early_stop_min_delta_cfg
                     ):
                         training_early_stop_best_ema_score = training_early_stop_ema_score
                         training_early_stop_no_improve_updates = 0
-                    else:
+                    elif not in_transition_grace:
                         training_early_stop_no_improve_updates += 1
 
                     if float(episode_max_dd_val) >= training_early_stop_hard_dd_limit_pct_cfg:
@@ -6099,10 +6207,11 @@ def run_experiment6_tape(
 
                     if (
                         training_early_stop_low_advantage_enabled_cfg
+                        and not in_transition_grace
                         and abs(float(mean_advantage_val or 0.0)) <= training_early_stop_mean_adv_abs_threshold_cfg
                     ):
                         training_early_stop_low_adv_counter += 1
-                    else:
+                    elif not in_transition_grace:
                         training_early_stop_low_adv_counter = 0
 
                     if training_early_stop_hard_dd_counter >= training_early_stop_hard_dd_patience_updates_cfg:
@@ -6273,11 +6382,20 @@ def run_experiment6_tape(
                     if np.isfinite(training_early_stop_best_ema_score)
                     else ema_disp
                 )
+                in_transition_grace_disp = bool(
+                    training_early_stop_transition_grace_steps_cfg > 0
+                    and step < training_early_stop_grace_until_step
+                )
                 print(
                     "   ⏹️ Early-stop monitor: "
                     f"score={training_early_stop_score_val:.4f} | "
                     f"ema={ema_disp:.4f} | best_ema={best_disp:.4f} | "
                     f"no_improve={training_early_stop_no_improve_updates}"
+                    + (
+                        f" | grace_until={int(training_early_stop_grace_until_step):,}"
+                        if in_transition_grace_disp
+                        else ""
+                    )
                 )
             if ra_kl_enabled:
                 effective_kl_threshold = float(agent.target_kl * agent.kl_stop_multiplier)
@@ -6494,6 +6612,17 @@ def run_experiment6_tape(
                 "training_early_stop_no_improve_updates": int(training_early_stop_no_improve_updates),
                 "training_early_stop_hard_dd_counter": int(training_early_stop_hard_dd_counter),
                 "training_early_stop_low_adv_counter": int(training_early_stop_low_adv_counter),
+                "training_early_stop_in_grace_window": bool(
+                    training_early_stop_transition_grace_steps_cfg > 0
+                    and step < training_early_stop_grace_until_step
+                ),
+                "training_early_stop_grace_until_step": (
+                    int(training_early_stop_grace_until_step)
+                    if training_early_stop_transition_grace_steps_cfg > 0
+                    else None
+                ),
+                "training_early_stop_transition_reset_count": int(training_early_stop_transition_reset_count),
+                "training_early_stop_last_transition_reason": training_early_stop_last_transition_reason,
                 "training_early_stop_trigger_reason": training_early_stop_trigger_reason,
             }
 
