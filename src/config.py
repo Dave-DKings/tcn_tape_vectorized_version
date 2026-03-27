@@ -35,7 +35,8 @@ TRAIN_TEST_SPLIT_DATE_COVID_STRESS = "2019-12-31"  # Train: <= 2019-12-31
 TRAIN_TEST_SPLIT_DATE = TRAIN_TEST_SPLIT_DATE_BENCHMARK
 
 # --- ASSET CONFIGURATION ---
-ASSET_TICKERS = ["MSFT", "NVDA", "AMZN", "JPM", "CAT", "XOM", "JNJ", "PG", "GLD", "NEE"]
+CANONICAL_10_ASSET_TICKERS = ["NVDA", "MSFT", "AMZN", "JPM", "BRK-B", "CAT", "XOM", "NEE", "GLD", "KO"]
+ASSET_TICKERS = copy.deepcopy(CANONICAL_10_ASSET_TICKERS)
 NUM_ASSETS = len(ASSET_TICKERS)
 CASH_ASSET_NAME = "CASH"
 
@@ -1938,7 +1939,7 @@ RUN18_OVERRIDES.update(
     {
         "TRAIN_TEST_SPLIT_DATE": TRAIN_TEST_SPLIT_DATE_COVID_STRESS,
         "ANALYSIS_START_DATE": "2009-01-01",
-        "ASSET_TICKERS": ["NVDA", "MSFT", "AMZN", "JPM", "BRK-B", "CAT", "XOM", "NEE", "GLD", "KO"],
+        "ASSET_TICKERS": copy.deepcopy(CANONICAL_10_ASSET_TICKERS),
         "NUM_ASSETS": 10,
         "EQUAL_WEIGHT_CASH_ALLOCATION": 1.0 / 11.0,
     }
@@ -2403,6 +2404,154 @@ RUN20_OVERRIDES["training_params"].update(
         "training_early_stop_reset_on_action_execution_beta_update": True,
         "training_early_stop_reset_on_rollout_batch_update": True,
         "training_early_stop_reset_on_temperature_update": True,
+    }
+)
+
+# ── Run 21: softened late curriculum with capped execution reactivity ──
+RUN21_OVERRIDES = copy.deepcopy(RUN20_OVERRIDES)
+RUN21_OVERRIDES["training_params"].update(
+    {
+        "max_total_timesteps": 650_000,
+        "high_watermark_checkpoint_subdir": "high_watermark_checkpoints_run21",
+        "step_sharpe_checkpoint_subdir": "step_sharpe_checkpoints_run21",
+        "timesteps_per_ppo_update_schedule": [
+            {"threshold": 0, "timesteps_per_update": 1008},
+            {"threshold": 300_000, "timesteps_per_update": 1512},
+            {"threshold": 500_000, "timesteps_per_update": 2016},
+        ],
+        "batch_size_ppo_schedule": [
+            {"threshold": 0, "batch_size": 336},
+            {"threshold": 380_000, "batch_size": 504},
+        ],
+        "ppo_gamma_schedule": [
+            {"threshold": 0, "gamma": 0.990},
+            {"threshold": 150_000, "gamma": 0.993},
+            {"threshold": 520_000, "gamma": 0.995},
+        ],
+        "ppo_gae_lambda_schedule": [
+            {"threshold": 0, "gae_lambda": 0.92},
+            {"threshold": 150_000, "gae_lambda": 0.94},
+            {"threshold": 520_000, "gae_lambda": 0.95},
+        ],
+        "ppo_entropy_coef_schedule": [
+            {"threshold": 0, "entropy_coef": 0.0007},
+            {"threshold": 420_000, "entropy_coef": 0.0005},
+            {"threshold": 560_000, "entropy_coef": 0.0003},
+        ],
+        "aux_return_pred_coef_schedule": [
+            {"threshold": 0, "aux_return_pred_coef": 0.30},
+        ],
+        "dirichlet_temperature_schedule": [
+            {"threshold": 0, "temperature": 1.0},
+            {"threshold": 400_000, "temperature": 0.95},
+            {"threshold": 580_000, "temperature": 0.90},
+        ],
+        "action_execution_beta_schedule": [
+            {"threshold": 0, "beta": 0.55},
+            {"threshold": 240_000, "beta": 0.65},
+            {"threshold": 440_000, "beta": 0.70},
+        ],
+        "action_execution_beta_curriculum": {
+            0: 0.55,
+            240_000: 0.65,
+            440_000: 0.70,
+        },
+        "evaluation_action_execution_beta": 0.70,
+        "evaluation_turnover_penalty_scalar": 0.25,
+        "high_watermark_sharpe_threshold": 0.70,
+        "turnover_penalty_curriculum": {
+            0: 0.00,
+            260_000: 0.08,
+            340_000: 0.15,
+            460_000: 0.20,
+            540_000: 0.25,
+        },
+        "episode_length_curriculum_schedule": [
+            {"threshold": 0, "limit": 756},
+            {"threshold": 220_000, "limit": 1008},
+            {"threshold": 390_000, "limit": 1500},
+        ],
+        "reward_component_schedule": [
+            {
+                "threshold": 0,
+                "phase": "A_return_only",
+                "enable_base_reward": True,
+                "enable_dsr_reward": False,
+                "enable_turnover_penalty": False,
+                "enable_benchmark_shaping": False,
+                "enable_terminal_tape_bonus": False,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 0.0,
+                "turnover_penalty_weight": 0.0,
+                "benchmark_shaping_weight": 0.0,
+                "terminal_tape_bonus_weight": 0.0,
+            },
+            {
+                "threshold": 200_000,
+                "phase": "B_ramp_1",
+                "enable_base_reward": True,
+                "enable_dsr_reward": True,
+                "enable_turnover_penalty": False,
+                "enable_benchmark_shaping": True,
+                "enable_terminal_tape_bonus": False,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 0.25,
+                "turnover_penalty_weight": 0.0,
+                "benchmark_shaping_weight": 0.20,
+                "terminal_tape_bonus_weight": 0.0,
+            },
+            {
+                "threshold": 280_000,
+                "phase": "B_ramp_2_soft",
+                "enable_base_reward": True,
+                "enable_dsr_reward": True,
+                "enable_turnover_penalty": False,
+                "enable_benchmark_shaping": True,
+                "enable_terminal_tape_bonus": False,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 0.45,
+                "turnover_penalty_weight": 0.0,
+                "benchmark_shaping_weight": 0.35,
+                "terminal_tape_bonus_weight": 0.0,
+            },
+            {
+                "threshold": 320_000,
+                "phase": "C_disc_intro",
+                "enable_base_reward": True,
+                "enable_dsr_reward": True,
+                "enable_turnover_penalty": True,
+                "enable_benchmark_shaping": True,
+                "enable_terminal_tape_bonus": True,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 0.75,
+                "turnover_penalty_weight": 0.15,
+                "benchmark_shaping_weight": 0.60,
+                "terminal_tape_bonus_weight": 0.10,
+            },
+            {
+                "threshold": 360_000,
+                "phase": "C_final_soft",
+                "enable_base_reward": True,
+                "enable_dsr_reward": True,
+                "enable_turnover_penalty": True,
+                "enable_benchmark_shaping": True,
+                "enable_terminal_tape_bonus": True,
+                "base_reward_weight": 1.0,
+                "dsr_reward_weight": 1.0,
+                "turnover_penalty_weight": 0.40,
+                "benchmark_shaping_weight": 0.85,
+                "terminal_tape_bonus_weight": 0.25,
+            },
+        ],
+        "training_early_stop_warmup_steps": 250_000,
+        "training_early_stop_patience_updates": 75,
+        "training_early_stop_transition_grace_steps": 15_000,
+        "training_early_stop_reset_ema_on_transition": True,
+        "training_early_stop_reset_on_reward_phase_change": True,
+        "training_early_stop_reset_on_turnover_scalar_update": False,
+        "training_early_stop_reset_on_action_execution_beta_update": False,
+        "training_early_stop_reset_on_rollout_batch_update": False,
+        "training_early_stop_reset_on_temperature_update": False,
     }
 )
 
@@ -3785,6 +3934,9 @@ def assert_run18_config(config: dict) -> None:
     assert len(config.get("ASSET_TICKERS", [])) == 10, (
         f"Run18 must have 10 tickers, got {len(config.get('ASSET_TICKERS', []))}"
     )
+    assert list(config.get("ASSET_TICKERS", [])) == CANONICAL_10_ASSET_TICKERS, (
+        f"Run18 tickers drifted: {config.get('ASSET_TICKERS')}"
+    )
     assert abs(float(config.get("EQUAL_WEIGHT_CASH_ALLOCATION", 0.0)) - (1.0 / 11.0)) < 1e-12, (
         "Run18 equal-weight cash allocation must match the 10-asset universe"
     )
@@ -3934,6 +4086,9 @@ def assert_run19_config(config: dict) -> None:
     training = config.get("training_params", {})
     env = config.get("environment_params", {})
     assert int(config.get("NUM_ASSETS", 0)) == 10, "Run19 must stay on the 10-asset universe"
+    assert list(config.get("ASSET_TICKERS", [])) == CANONICAL_10_ASSET_TICKERS, (
+        f"Run19 tickers drifted: {config.get('ASSET_TICKERS')}"
+    )
     assert list(agent.get("tcn_filters", [])) == [64, 96, 128], "Run19 TCN filters drifted"
     assert list(agent.get("tcn_dilations", [])) == [1, 2, 4], "Run19 TCN dilations drifted"
     assert int(agent.get("tcn_kernel_size", 0)) == 5, "Run19 TCN kernel size drifted"
@@ -4029,6 +4184,9 @@ def assert_run20_config(config: dict) -> None:
     training = config.get("training_params", {})
     env = config.get("environment_params", {})
     assert int(config.get("NUM_ASSETS", 0)) == 10, "Run20 must stay on the 10-asset universe"
+    assert list(config.get("ASSET_TICKERS", [])) == CANONICAL_10_ASSET_TICKERS, (
+        f"Run20 tickers drifted: {config.get('ASSET_TICKERS')}"
+    )
     assert list(agent.get("tcn_filters", [])) == [64, 96, 128], "Run20 TCN filters drifted"
     assert list(agent.get("tcn_dilations", [])) == [1, 2, 4], "Run20 TCN dilations drifted"
     assert int(agent.get("tcn_kernel_size", 0)) == 5, "Run20 TCN kernel size drifted"
@@ -4093,6 +4251,129 @@ def build_run20_config(
     if analysis_end_date is not None:
         config["ANALYSIS_END_DATE"] = analysis_end_date
     assert_run20_config(config)
+    return config
+
+
+def apply_run21_overrides(config: dict, overrides: dict = None) -> dict:
+    """Apply the canonical Run21 softened late-curriculum recipe in-place."""
+    global TRAIN_TEST_SPLIT_DATE
+    resolved = copy.deepcopy(RUN21_OVERRIDES if overrides is None else overrides)
+    split_date = resolved.get("TRAIN_TEST_SPLIT_DATE")
+    if split_date:
+        TRAIN_TEST_SPLIT_DATE = split_date
+        config["TRAIN_TEST_SPLIT_DATE"] = split_date
+    _deep_update_config(config, resolved)
+    return config
+
+
+def assert_run21_config(config: dict) -> None:
+    """Raise if a config expected to match the canonical Run21 recipe drifted."""
+    agent = config.get("agent_params", {})
+    ppo = agent.get("ppo_params", {})
+    training = config.get("training_params", {})
+    env = config.get("environment_params", {})
+    assert int(config.get("NUM_ASSETS", 0)) == 10, "Run21 must stay on the 10-asset universe"
+    assert list(config.get("ASSET_TICKERS", [])) == CANONICAL_10_ASSET_TICKERS, (
+        f"Run21 tickers drifted: {config.get('ASSET_TICKERS')}"
+    )
+    assert list(agent.get("tcn_filters", [])) == [64, 96, 128], "Run21 TCN filters drifted"
+    assert list(agent.get("tcn_dilations", [])) == [1, 2, 4], "Run21 TCN dilations drifted"
+    assert int(agent.get("tcn_kernel_size", 0)) == 5, "Run21 TCN kernel size drifted"
+    assert str(agent.get("dirichlet_alpha_activation", "")).lower() == "cross_softplus", (
+        "Run21 alpha activation must stay cross_softplus"
+    )
+    assert float(agent.get("dirichlet_softplus_alpha_floor", 0.0)) == 1.05, (
+        "Run21 softplus alpha floor drifted"
+    )
+    assert float(agent.get("dirichlet_softplus_alpha_scale", 0.0)) == 3.0, (
+        "Run21 softplus alpha scale drifted"
+    )
+    assert bool(agent.get("objective_experts_enabled", False)), "Run21 objective experts must stay enabled"
+    assert list(agent.get("objective_expert_names", [])) == ["return", "risk", "discipline"], (
+        "Run21 objective_expert_names drifted"
+    )
+    assert not bool(agent.get("distributional_critic_enabled", True)), (
+        "Run21 distributional critic must stay off in this curriculum revision"
+    )
+    assert float(env.get("target_turnover", 0.0)) == 0.35, "Run21 target_turnover drifted"
+    assert int(training.get("max_total_timesteps", 0)) == 650_000, "Run21 max_total_timesteps drifted"
+    assert int(training.get("num_parallel_envs", 0)) == 16, "Run21 num_parallel_envs drifted"
+    assert float(ppo.get("objective_head_aux_coef", 0.0)) == 0.10, "Run21 objective_head_aux_coef drifted"
+    assert float(ppo.get("objective_head_aux_loss_clip", 0.0)) == 0.25, "Run21 objective_head_aux_loss_clip drifted"
+    assert bool(ppo.get("critic_use_huber", False)), "Run21 critic_use_huber must stay enabled"
+    assert float(ppo.get("critic_huber_delta", 0.0)) == 2.0, "Run21 critic_huber_delta drifted"
+    assert int(training.get("training_early_stop_patience_updates", 0)) == 75, (
+        "Run21 early-stop patience drifted"
+    )
+    assert int(training.get("training_early_stop_transition_grace_steps", 0)) == 15_000, (
+        "Run21 transition grace drifted"
+    )
+    assert bool(training.get("training_early_stop_reset_ema_on_transition", False)), (
+        "Run21 must reset EMA state on major transitions"
+    )
+    assert bool(training.get("training_early_stop_reset_on_reward_phase_change", False)), (
+        "Run21 must reset early-stop on reward phase changes"
+    )
+    assert not bool(training.get("training_early_stop_reset_on_turnover_scalar_update", True)), (
+        "Run21 should not reset early-stop on turnover scalar updates"
+    )
+    assert not bool(training.get("training_early_stop_reset_on_action_execution_beta_update", True)), (
+        "Run21 should not reset early-stop on beta updates"
+    )
+    assert not bool(training.get("training_early_stop_reset_on_rollout_batch_update", True)), (
+        "Run21 should not reset early-stop on rollout/batch updates"
+    )
+    assert not bool(training.get("training_early_stop_reset_on_temperature_update", True)), (
+        "Run21 should not reset early-stop on temperature updates"
+    )
+    assert str(training.get("high_watermark_checkpoint_subdir", "")) == "high_watermark_checkpoints_run21", (
+        "Run21 high_watermark_checkpoint_subdir drifted"
+    )
+    assert str(training.get("step_sharpe_checkpoint_subdir", "")) == "step_sharpe_checkpoints_run21", (
+        "Run21 step_sharpe_checkpoint_subdir drifted"
+    )
+    assert float(training.get("evaluation_action_execution_beta", 0.0)) == 0.70, (
+        "Run21 evaluation_action_execution_beta drifted"
+    )
+    assert float(training.get("evaluation_turnover_penalty_scalar", 0.0)) == 0.25, (
+        "Run21 evaluation_turnover_penalty_scalar drifted"
+    )
+    expected_reward_schedule = copy.deepcopy(RUN21_OVERRIDES["training_params"]["reward_component_schedule"])
+    actual_reward_schedule = copy.deepcopy(training.get("reward_component_schedule", []))
+    assert actual_reward_schedule == expected_reward_schedule, "Run21 reward_component_schedule drifted"
+    expected_rollout_schedule = copy.deepcopy(RUN21_OVERRIDES["training_params"]["timesteps_per_ppo_update_schedule"])
+    actual_rollout_schedule = copy.deepcopy(training.get("timesteps_per_ppo_update_schedule", []))
+    assert actual_rollout_schedule == expected_rollout_schedule, "Run21 timesteps_per_ppo_update_schedule drifted"
+    expected_batch_schedule = copy.deepcopy(RUN21_OVERRIDES["training_params"]["batch_size_ppo_schedule"])
+    actual_batch_schedule = copy.deepcopy(training.get("batch_size_ppo_schedule", []))
+    assert actual_batch_schedule == expected_batch_schedule, "Run21 batch_size_ppo_schedule drifted"
+    expected_episode_schedule = copy.deepcopy(RUN21_OVERRIDES["training_params"]["episode_length_curriculum_schedule"])
+    actual_episode_schedule = copy.deepcopy(training.get("episode_length_curriculum_schedule", []))
+    assert actual_episode_schedule == expected_episode_schedule, "Run21 episode_length_curriculum_schedule drifted"
+    expected_beta_schedule = copy.deepcopy(RUN21_OVERRIDES["training_params"]["action_execution_beta_schedule"])
+    actual_beta_schedule = copy.deepcopy(training.get("action_execution_beta_schedule", []))
+    assert actual_beta_schedule == expected_beta_schedule, "Run21 action_execution_beta_schedule drifted"
+    expected_turnover = copy.deepcopy(RUN21_OVERRIDES["training_params"]["turnover_penalty_curriculum"])
+    actual_turnover = {
+        int(threshold): float(value)
+        for threshold, value in dict(training.get("turnover_penalty_curriculum", {})).items()
+    }
+    assert actual_turnover == expected_turnover, "Run21 turnover_penalty_curriculum drifted"
+
+
+def build_run21_config(
+    phase_name: str = "phase1",
+    *,
+    analysis_end_date: str | None = None,
+    overrides: dict | None = None,
+) -> dict:
+    """Return a deep-copied phase config with the canonical Run21 overrides applied."""
+    config = copy.deepcopy(get_active_config(phase_name))
+    enforce_feature_audit_plan(config)
+    apply_run21_overrides(config, overrides=overrides)
+    if analysis_end_date is not None:
+        config["ANALYSIS_END_DATE"] = analysis_end_date
+    assert_run21_config(config)
     return config
 
 
