@@ -6992,23 +6992,25 @@ def _classify_market_regime(date_str: str) -> str:
     except:
         return "Unknown"
     
-    # Define regime boundaries
+    # Publication-facing macro regime boundaries:
+    # - NBER dates the COVID recession from February 2020 peak to April 2020 trough.
+    # - We start the crash bucket at 2020-03-01 and move into recovery on 2020-05-01.
+    # - Fed tightening begins 2022-03-16 and the last hike in this cycle is 2023-07-26.
+    # - The first cut in the next easing cycle is 2024-09-18, effective 2024-09-19.
     if date < datetime(2020, 3, 1):
-        return "Pre-COVID (2020 Q1)"
-    elif date < datetime(2020, 6, 1):
-        return "COVID Crash (2020 Q1)"
+        return "Pre-COVID (through 2020-02)"
+    elif date < datetime(2020, 5, 1):
+        return "COVID Crash / NBER Recession (2020-03 to 2020-04)"
     elif date < datetime(2021, 1, 1):
-        return "COVID Recovery (2020 Q2-Q4)"
+        return "COVID Recovery (2020-05 to 2020-12)"
     elif date < datetime(2022, 1, 1):
         return "Post-Pandemic Rally (2021)"
-    elif date < datetime(2023, 1, 1):
-        return "Rate Hikes / Tech Correction (2022)"
-    elif date < datetime(2024, 1, 1):
-        return "Market Stabilization (2023)"
-    elif date < datetime(2025, 1, 1):
-        return "Continued Growth (2024)"
+    elif date < datetime(2023, 7, 27):
+        return "Inflation Shock / Fed Tightening (2022 to 2023-07-26)"
+    elif date < datetime(2024, 9, 19):
+        return "Disinflation / Higher for Longer (2023-07-27 to 2024-09-18)"
     else:
-        return "Current Period (2025+)"
+        return "Rate Cuts / AI Bull (2024-09-19+)"
 
 
 def evaluate_experiment6_checkpoint(
@@ -7832,6 +7834,21 @@ def evaluate_experiment6_checkpoint(
             df_alpha.insert(0, "step", np.arange(len(df_alpha)))
             df_alpha.to_csv(output_dir / f"{file_stem}_alphas_{track}.csv", index=False)
 
+    def _save_portfolio_artifact(
+        output_dir: Path,
+        file_stem: str,
+        *,
+        track: str,
+        portfolio_df: pd.DataFrame,
+    ) -> None:
+        if not save_eval_artifacts or portfolio_df is None or portfolio_df.empty:
+            return
+        output_dir.mkdir(parents=True, exist_ok=True)
+        df_port = portfolio_df.copy()
+        if "step" not in df_port.columns:
+            df_port.insert(0, "step", np.arange(len(df_port)))
+        df_port.to_csv(output_dir / f"{file_stem}_portfolio_{track}.csv", index=False)
+
     evaluation_rows: List[Dict[str, Any]] = []
     unique_test_dates = pd.to_datetime(test_df["Date"]).drop_duplicates().sort_values().reset_index(drop=True)
     test_start_date = unique_test_dates.iloc[0].strftime("%Y-%m-%d") if len(unique_test_dates) else ""
@@ -7974,6 +7991,7 @@ def evaluate_experiment6_checkpoint(
         deterministic_track_outputs[track_name] = {
             "metrics": metrics_det,
             "portfolio_history": portfolio_history,
+            "portfolio_df": env_test_deterministic.save_portfolio_history().copy(),
             "weights": deterministic_weights_array,
             "actions": deterministic_actions_array,
             "alphas": deterministic_alphas_array,
@@ -8002,6 +8020,7 @@ def evaluate_experiment6_checkpoint(
     stochastic_weights_list: List[np.ndarray] = []  # Track weights for each run
     stochastic_actions_list: List[np.ndarray] = []  # Track actions for each run
     stochastic_alphas_list: List[np.ndarray] = []   # Track alphas for each run
+    stochastic_portfolio_frames: List[pd.DataFrame] = []
 
     for run_idx in range(num_eval_runs):
         run_seed = random_seed + 100 + run_idx
@@ -8182,6 +8201,12 @@ def evaluate_experiment6_checkpoint(
         stochastic_weights_list.append(run_weights)
         stochastic_actions_list.append(run_actions)
         stochastic_alphas_list.append(run_alphas)
+        run_portfolio_df = env_test_random.save_portfolio_history().copy()
+        if not run_portfolio_df.empty:
+            run_portfolio_df.insert(0, "run", run_idx + 1)
+            run_portfolio_df.insert(1, "seed", run_seed)
+            run_portfolio_df.insert(2, "step", np.arange(len(run_portfolio_df)))
+            stochastic_portfolio_frames.append(run_portfolio_df)
 
         print(f"\n[RAND] Run {run_idx + 1}/{num_eval_runs} (Seed={run_seed}):")
         print(f"   Start Date: {run_start_date} | Regime: {run_regime}")
@@ -8299,6 +8324,12 @@ def evaluate_experiment6_checkpoint(
                 actions=out["actions"],
                 alphas=out["alphas"],
             )
+            _save_portfolio_artifact(
+                eval_log_dir,
+                file_stem,
+                track=track,
+                portfolio_df=out.get("portfolio_df", pd.DataFrame()),
+            )
 
         if stochastic_weights_list:
             sto_weights = np.concatenate(stochastic_weights_list, axis=0)
@@ -8339,6 +8370,14 @@ def evaluate_experiment6_checkpoint(
                     df_alpha.insert(0, "run", run_ids_alphas)
                 df_alpha.insert(0, "step", np.arange(len(df_alpha)))
                 df_alpha.to_csv(eval_log_dir / f"{file_stem}_alphas_stochastic.csv", index=False)
+        if stochastic_portfolio_frames:
+            sto_portfolio = pd.concat(stochastic_portfolio_frames, ignore_index=True, sort=False)
+            _save_portfolio_artifact(
+                eval_log_dir,
+                file_stem,
+                track="stochastic",
+                portfolio_df=sto_portfolio,
+            )
 
         print(f"💾 Per-track artifacts saved in: {eval_log_dir}")
 
