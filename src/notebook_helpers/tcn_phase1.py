@@ -7033,6 +7033,7 @@ def evaluate_experiment6_checkpoint(
     deterministic_eval_mode: str = "mode",
     compare_deterministic_modes: Optional[List[str]] = None,
     stochastic_eval_mode: str = "sample",
+    stochastic_random_start: bool = True,
     checkpoint_path_override: Optional[str] = None,
     save_eval_logs: bool = True,
     save_eval_artifacts: bool = True,
@@ -7300,7 +7301,7 @@ def evaluate_experiment6_checkpoint(
         enable_base_reward=True,
         turnover_penalty_scalar=eval_turnover_scalar,
         gamma=gamma_cfg,
-        random_start=True,
+        random_start=bool(stochastic_random_start),
         episode_length_limit=stochastic_episode_length_limit,
         tape_terminal_clip=tape_terminal_clip,
         drawdown_constraint=copy.deepcopy(drawdown_constraint_eval),
@@ -7991,7 +7992,10 @@ def evaluate_experiment6_checkpoint(
     deterministic_alphas_array = primary_det["alphas"]
 
     print("\n" + "=" * 80)
-    print(f"STOCHASTIC EVALUATIONS (Random Start = True, {num_eval_runs} Runs)")
+    print(
+        "STOCHASTIC EVALUATIONS "
+        f"(Random Start = {bool(stochastic_random_start)}, {num_eval_runs} Runs)"
+    )
     print("=" * 80)
 
     stochastic_records: List[Dict[str, Any]] = []
