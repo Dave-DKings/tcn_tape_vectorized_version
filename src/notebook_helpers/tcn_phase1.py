@@ -8502,6 +8502,8 @@ def build_weight_path_frames(
 def compare_agent_vs_baseline(
     evaluation: Experiment6Evaluation,
     baseline_returns: pd.Series,
+    risk_free_rate: float = 0.02,
+    trading_days_per_year: int = 252,
 ) -> Dict[str, float]:
     """
     Compare deterministic agent returns with a baseline return series.
@@ -8519,19 +8521,25 @@ def compare_agent_vs_baseline(
     agent_returns = agent_returns.iloc[:min_len]
     baseline = baseline.iloc[:min_len]
 
+    daily_rf = (1.0 + float(risk_free_rate)) ** (1.0 / float(trading_days_per_year)) - 1.0
+
     def _sharpe(returns: pd.Series) -> float:
-        std = float(returns.std(ddof=1))
+        arr = pd.Series(returns, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+        if arr.empty:
+            return 0.0
+        std = float(arr.std(ddof=1))
         if std == 0.0:
             return 0.0
-        return float(np.sqrt(252.0) * returns.mean() / std)
+        mean_excess = float((arr - daily_rf).mean())
+        return float(np.sqrt(float(trading_days_per_year)) * mean_excess / std)
 
     return {
         "agent_sharpe": _sharpe(agent_returns),
         "baseline_sharpe": _sharpe(baseline),
         "agent_mean_return": float(agent_returns.mean()),
         "baseline_mean_return": float(baseline.mean()),
-        "agent_volatility": float(agent_returns.std(ddof=1) * np.sqrt(252.0)),
-        "baseline_volatility": float(baseline.std(ddof=1) * np.sqrt(252.0)),
+        "agent_volatility": float(agent_returns.std(ddof=1) * np.sqrt(float(trading_days_per_year))),
+        "baseline_volatility": float(baseline.std(ddof=1) * np.sqrt(float(trading_days_per_year))),
     }
 
 
