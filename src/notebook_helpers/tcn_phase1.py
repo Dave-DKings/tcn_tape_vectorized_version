@@ -915,6 +915,15 @@ TRAINING_FIELDNAMES: List[str] = [
     "objective_expert_loss",
     "objective_router_entropy",
     "objective_diversity_loss",
+    "objective_actor_loss_return",
+    "objective_actor_loss_risk",
+    "objective_actor_loss_discipline",
+    "objective_critic_loss_return",
+    "objective_critic_loss_risk",
+    "objective_critic_loss_discipline",
+    "objective_router_prob_return",
+    "objective_router_prob_risk",
+    "objective_router_prob_discipline",
     "objective_router_prob_0",
     "objective_router_prob_1",
     "objective_router_prob_2",
@@ -5974,6 +5983,15 @@ def run_experiment6_tape(
         objective_router_entropy_value = update_metrics.get("objective_router_entropy", 0.0)
         objective_diversity_loss_value = update_metrics.get("objective_diversity_loss", 0.0)
         objective_router_probs_value = update_metrics.get("objective_router_probs", None)
+        objective_actor_loss_return_value = update_metrics.get("objective_actor_loss_return", 0.0)
+        objective_actor_loss_risk_value = update_metrics.get("objective_actor_loss_risk", 0.0)
+        objective_actor_loss_discipline_value = update_metrics.get("objective_actor_loss_discipline", 0.0)
+        objective_critic_loss_return_value = update_metrics.get("objective_critic_loss_return", 0.0)
+        objective_critic_loss_risk_value = update_metrics.get("objective_critic_loss_risk", 0.0)
+        objective_critic_loss_discipline_value = update_metrics.get("objective_critic_loss_discipline", 0.0)
+        objective_router_prob_return_value = update_metrics.get("objective_router_prob_return", 0.0)
+        objective_router_prob_risk_value = update_metrics.get("objective_router_prob_risk", 0.0)
+        objective_router_prob_discipline_value = update_metrics.get("objective_router_prob_discipline", 0.0)
         nonfinite_actor_loss_detected_value = update_metrics.get("nonfinite_actor_loss_detected", 0.0)
         nonfinite_critic_loss_detected_value = update_metrics.get("nonfinite_critic_loss_detected", 0.0)
         failure_reason_value = update_metrics.get("failure_reason", "")
@@ -6158,6 +6176,15 @@ def run_experiment6_tape(
             objective_expert_loss_val = to_scalar(objective_expert_loss_value)
             objective_router_entropy_val = to_scalar(objective_router_entropy_value)
             objective_diversity_loss_val = to_scalar(objective_diversity_loss_value)
+            objective_actor_loss_return_val = to_scalar(objective_actor_loss_return_value)
+            objective_actor_loss_risk_val = to_scalar(objective_actor_loss_risk_value)
+            objective_actor_loss_discipline_val = to_scalar(objective_actor_loss_discipline_value)
+            objective_critic_loss_return_val = to_scalar(objective_critic_loss_return_value)
+            objective_critic_loss_risk_val = to_scalar(objective_critic_loss_risk_value)
+            objective_critic_loss_discipline_val = to_scalar(objective_critic_loss_discipline_value)
+            objective_router_prob_return_val = to_scalar(objective_router_prob_return_value)
+            objective_router_prob_risk_val = to_scalar(objective_router_prob_risk_value)
+            objective_router_prob_discipline_val = to_scalar(objective_router_prob_discipline_value)
             objective_router_probs_arr = None
             if objective_router_probs_value is not None:
                 objective_router_probs_arr = np.asarray(objective_router_probs_value, dtype=np.float32).flatten()
@@ -6328,6 +6355,12 @@ def run_experiment6_tape(
                     f"router_entropy={objective_router_entropy_val:.4f} | "
                     f"diversity_loss={objective_diversity_loss_val:.4f} | "
                     f"mask={mask_fmt} | router={router_fmt}"
+                )
+                print(
+                    "      expert_losses | "
+                    f"return: actor={objective_actor_loss_return_val:.4f}, critic={objective_critic_loss_return_val:.4f}, router={objective_router_prob_return_val:.3f} | "
+                    f"risk: actor={objective_actor_loss_risk_val:.4f}, critic={objective_critic_loss_risk_val:.4f}, router={objective_router_prob_risk_val:.3f} | "
+                    f"discipline: actor={objective_actor_loss_discipline_val:.4f}, critic={objective_critic_loss_discipline_val:.4f}, router={objective_router_prob_discipline_val:.3f}"
                 )
             if (
                 mixture_gating_entropy_val
@@ -6663,6 +6696,15 @@ def run_experiment6_tape(
                 "objective_expert_loss": objective_expert_loss_val,
                 "objective_router_entropy": objective_router_entropy_val,
                 "objective_diversity_loss": objective_diversity_loss_val,
+                "objective_actor_loss_return": objective_actor_loss_return_val,
+                "objective_actor_loss_risk": objective_actor_loss_risk_val,
+                "objective_actor_loss_discipline": objective_actor_loss_discipline_val,
+                "objective_critic_loss_return": objective_critic_loss_return_val,
+                "objective_critic_loss_risk": objective_critic_loss_risk_val,
+                "objective_critic_loss_discipline": objective_critic_loss_discipline_val,
+                "objective_router_prob_return": objective_router_prob_return_val,
+                "objective_router_prob_risk": objective_router_prob_risk_val,
+                "objective_router_prob_discipline": objective_router_prob_discipline_val,
                 "objective_router_prob_0": (
                     float(objective_router_probs_arr[0]) if objective_router_probs_arr is not None and objective_router_probs_arr.size > 0 else None
                 ),

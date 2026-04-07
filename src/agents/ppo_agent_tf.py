@@ -2317,6 +2317,7 @@ class PPOAgentTF:
             entropy = tf.reduce_mean(dirichlet.entropy())
 
         objective_expert_loss = tf.constant(0.0, dtype=tf.float32)
+        objective_expert_loss_per_head = tf.zeros((self.num_objective_experts,), dtype=tf.float32)
         objective_router_entropy = tf.constant(0.0, dtype=tf.float32)
         objective_diversity_loss = tf.constant(0.0, dtype=tf.float32)
         if self.objective_experts_enabled and expert_alpha is not None:
@@ -2332,11 +2333,12 @@ class PPOAgentTF:
                 expert_advantages = tf.clip_by_value(expert_advantages, -3.0, 3.0)
                 expert_log_probs_new = tf.clip_by_value(expert_log_probs_new, -25.0, 25.0)
                 expert_weighted_log_prob = expert_mask * tf.stop_gradient(expert_advantages) * expert_log_probs_new
-                objective_expert_loss = (
+                objective_expert_loss_per_head = (
                     tf.constant(self.objective_head_aux_coef, dtype=tf.float32)
-                    * -tf.reduce_sum(expert_weighted_log_prob)
+                    * -tf.reduce_sum(expert_weighted_log_prob, axis=0)
                     / (tf.cast(tf.shape(actions)[0], tf.float32) * active_expert_count)
                 )
+                objective_expert_loss = tf.reduce_sum(objective_expert_loss_per_head)
                 if self.objective_head_aux_loss_clip > 0.0:
                     objective_expert_loss = tf.clip_by_value(
                         objective_expert_loss,
@@ -2512,6 +2514,7 @@ class PPOAgentTF:
             mixture_component_dispersion_loss,
             mixture_gating_entropy,
             objective_expert_loss,
+            objective_expert_loss_per_head,
             objective_router_entropy,
             objective_diversity_loss,
         )
@@ -2637,7 +2640,8 @@ class PPOAgentTF:
             tf.cast(tf.shape(loss_matrix)[0], tf.float32) * tf.reduce_sum(expert_mask),
             1.0,
         )
-        return loss, clip_fraction
+        per_expert_loss = tf.reduce_mean(loss_matrix, axis=0) * tf.reshape(expert_mask, (-1,))
+        return loss, clip_fraction, per_expert_loss
     
     def update(self, num_epochs=10, batch_size=64, precomputed_gae=None):
         """
@@ -2944,6 +2948,11 @@ class PPOAgentTF:
             'gae_nonfinite_return_count': float(self._last_gae_diagnostics.get('nonfinite_return_count', 0)),
             'failure_reason': '',
         }
+        for expert_name in self.objective_expert_names:
+            safe_name = str(expert_name).strip().lower().replace("-", "_").replace(" ", "_")
+            stats[f'objective_actor_loss_{safe_name}'] = 0.0
+            stats[f'objective_critic_loss_{safe_name}'] = 0.0
+            stats[f'objective_router_prob_{safe_name}'] = 0.0
         
         # Multiple epochs of optimization
         if isinstance(states, dict):
@@ -3004,6 +3013,7 @@ class PPOAgentTF:
                         mixture_component_dispersion_loss,
                         mixture_gating_entropy,
                         objective_expert_loss,
+                        objective_expert_loss_per_head,
                         objective_router_entropy,
                         objective_diversity_loss,
                     ) = self._actor_loss(
@@ -3052,7 +3062,7 @@ class PPOAgentTF:
                 # Update critic
                 with tf.GradientTape() as tape:
                     if self.objective_experts_enabled:
-                        critic_loss_raw, value_clip_fraction = self._objective_critic_loss(
+                        critic_loss_raw, value_clip_fraction, objective_critic_loss_per_head = self._objective_critic_loss(
                             batch_states,
                             batch_expert_returns,
                             batch_old_expert_values,
@@ -3066,6 +3076,7 @@ class PPOAgentTF:
                             returns_std_tf,
                             batch_old_values
                         )
+                        objective_critic_loss_per_head = tf.zeros((self.num_objective_experts,), dtype=tf.float32)
                     # Apply configurable value-function coefficient to critic optimization.
                     # This was previously ignored because actor/critic are updated separately.
                     critic_loss = critic_loss_raw * self.vf_coef
@@ -3124,6 +3135,8 @@ class PPOAgentTF:
                 stats['objective_expert_loss'] += float(objective_expert_loss)
                 stats['objective_router_entropy'] += float(objective_router_entropy)
                 stats['objective_diversity_loss'] += float(objective_diversity_loss)
+                objective_actor_loss_per_head_np = np.asarray(objective_expert_loss_per_head.numpy(), dtype=np.float64).reshape(-1)
+                objective_critic_loss_per_head_np = np.asarray(objective_critic_loss_per_head.numpy(), dtype=np.float64).reshape(-1)
                 if self.risk_aux_cvar_adaptive_enabled:
                     self._update_adaptive_cvar_coef(float(cvar_aux_proxy))
                 stats['risk_aux_cvar_coef'] = float(self.risk_aux_cvar_coef)
@@ -3147,7 +3160,18 @@ class PPOAgentTF:
                     actor_diag = self._parse_actor_outputs(self.actor(batch_states, training=False))
                     batch_router_probs = actor_diag.get("router_probs", None)
                     if batch_router_probs is not None:
-                        stats['objective_router_probs'] += np.mean(batch_router_probs.numpy(), axis=0).astype(np.float64)
+                        batch_router_probs_np = np.mean(batch_router_probs.numpy(), axis=0).astype(np.float64)
+                        stats['objective_router_probs'] += batch_router_probs_np
+                    else:
+                        batch_router_probs_np = np.zeros((self.num_objective_experts,), dtype=np.float64)
+                    for expert_idx, expert_name in enumerate(self.objective_expert_names):
+                        safe_name = str(expert_name).strip().lower().replace("-", "_").replace(" ", "_")
+                        if expert_idx < objective_actor_loss_per_head_np.size:
+                            stats[f'objective_actor_loss_{safe_name}'] += float(objective_actor_loss_per_head_np[expert_idx])
+                        if expert_idx < objective_critic_loss_per_head_np.size:
+                            stats[f'objective_critic_loss_{safe_name}'] += float(objective_critic_loss_per_head_np[expert_idx])
+                        if expert_idx < batch_router_probs_np.size:
+                            stats[f'objective_router_prob_{safe_name}'] += float(batch_router_probs_np[expert_idx])
                 film_diag = self.get_film_diagnostics(batch_states)
                 if film_diag:
                     stats['film_seq_gamma_delta_abs_mean'] += float(film_diag.get('seq_gamma_delta_abs_mean', 0.0))
@@ -3216,6 +3240,11 @@ class PPOAgentTF:
                        'film_asset_gamma_delta_abs_mean', 'film_asset_beta_abs_mean', 'film_asset_gamma_sat_frac',
                        'ratio_mean', 'ratio_std', 'approx_kl', 'clip_fraction', 'value_clip_fraction']:
                 stats[key] /= num_updates
+            for expert_name in self.objective_expert_names:
+                safe_name = str(expert_name).strip().lower().replace("-", "_").replace(" ", "_")
+                stats[f'objective_actor_loss_{safe_name}'] /= num_updates
+                stats[f'objective_critic_loss_{safe_name}'] /= num_updates
+                stats[f'objective_router_prob_{safe_name}'] /= num_updates
             stats['alpha_per_asset'] /= num_updates
             stats['objective_router_probs'] /= num_updates
             usage_total = float(np.sum(stats['mixture_component_usage']))

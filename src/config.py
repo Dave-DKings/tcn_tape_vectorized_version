@@ -2555,6 +2555,38 @@ RUN21_OVERRIDES["training_params"].update(
     }
 )
 
+# ── Run 21 MLP: replace temporal TCNs with MLP window encoders while preserving the fusion stack ──
+RUN21_MLP_OVERRIDES = copy.deepcopy(RUN21_OVERRIDES)
+RUN21_MLP_OVERRIDES["agent_params"].update(
+    {
+        "actor_critic_type": "MLP",
+        "use_fusion": True,
+        "use_attention": False,
+        "recurrent_memory_enabled": False,
+        "actor_hidden_dims": [512, 256, 128],
+        "critic_hidden_dims": [512, 256, 128],
+        "mlp_dropout": 0.10,
+    }
+)
+RUN21_MLP_OVERRIDES["environment_params"].update(
+    {
+        "transition_sampling_enabled": True,
+        "transition_sampling_probability": 0.35,
+        "transition_sampling_radius_days": 63,
+        "transition_sampling_anchor_dates": [
+            "2021-07-06",
+            "2021-12-31",
+            "2022-01-03",
+        ],
+    }
+)
+RUN21_MLP_OVERRIDES["training_params"].update(
+    {
+        "high_watermark_checkpoint_subdir": "high_watermark_checkpoints_run21_mlp",
+        "step_sharpe_checkpoint_subdir": "step_sharpe_checkpoints_run21_mlp",
+    }
+)
+
 
 RUN11_RELAXED_OVERRIDES = copy.deepcopy(RUN10_ALPHA_OVERRIDES)
 RUN11_RELAXED_OVERRIDES.update(
@@ -4374,6 +4406,123 @@ def build_run21_config(
     if analysis_end_date is not None:
         config["ANALYSIS_END_DATE"] = analysis_end_date
     assert_run21_config(config)
+    return config
+
+
+def apply_run21_mlp_overrides(config: dict, overrides: dict = None) -> dict:
+    """Apply the canonical Run21 MLP recipe in-place."""
+    global TRAIN_TEST_SPLIT_DATE
+    resolved = copy.deepcopy(RUN21_MLP_OVERRIDES if overrides is None else overrides)
+    split_date = resolved.get("TRAIN_TEST_SPLIT_DATE")
+    if split_date:
+        TRAIN_TEST_SPLIT_DATE = split_date
+        config["TRAIN_TEST_SPLIT_DATE"] = split_date
+    _deep_update_config(config, resolved)
+    return config
+
+
+def assert_run21_mlp_config(config: dict) -> None:
+    """Raise if a config expected to match the Run21 MLP recipe drifted."""
+    agent = config.get("agent_params", {})
+    ppo = agent.get("ppo_params", {})
+    env = config.get("environment_params", {})
+    training = config.get("training_params", {})
+
+    assert str(agent.get("actor_critic_type", "")).upper() == "MLP", "Run21 MLP must use the MLP actor-critic"
+    assert bool(agent.get("use_fusion", False)), "Run21 MLP must preserve fusion"
+    assert not bool(agent.get("use_attention", True)), "Run21 MLP must keep standalone attention disabled"
+    assert not bool(agent.get("recurrent_memory_enabled", True)), "Run21 MLP must keep recurrent memory disabled"
+    assert bool(agent.get("fusion_cross_asset_mixer_enabled", False)), "Run21 MLP fusion_cross_asset_mixer_enabled must stay on"
+    assert bool(agent.get("fusion_asset_identity_enabled", False)), "Run21 MLP fusion_asset_identity_enabled must stay on"
+    assert bool(agent.get("fusion_context_cross_attention_enabled", False)), (
+        "Run21 MLP fusion_context_cross_attention_enabled must stay on"
+    )
+    assert bool(agent.get("fusion_per_asset_alpha_head", False)), "Run21 MLP fusion_per_asset_alpha_head must stay on"
+    assert bool(agent.get("regime_conditioning_enabled", False)), "Run21 MLP regime_conditioning_enabled must stay on"
+    assert str(agent.get("regime_conditioning_mode", "concat")).lower() == "film", "Run21 MLP regime_conditioning_mode must stay film"
+    assert str(agent.get("dirichlet_alpha_activation", "")).lower() == "cross_softplus", (
+        "Run21 MLP alpha activation must stay cross_softplus"
+    )
+    assert bool(agent.get("objective_experts_enabled", False)), "Run21 MLP objective experts must stay enabled"
+    assert list(agent.get("objective_expert_names", [])) == ["return", "risk", "discipline"], (
+        "Run21 MLP objective_expert_names drifted"
+    )
+    assert list(agent.get("actor_hidden_dims", [])) == [512, 256, 128], "Run21 MLP actor_hidden_dims drifted"
+    assert list(agent.get("critic_hidden_dims", [])) == [512, 256, 128], "Run21 MLP critic_hidden_dims drifted"
+    assert float(agent.get("mlp_dropout", 0.0)) == 0.10, "Run21 MLP mlp_dropout drifted"
+    assert float(env.get("target_turnover", 0.0)) == 0.35, "Run21 MLP target_turnover drifted"
+    assert bool(env.get("transition_sampling_enabled", False)), "Run21 MLP transition_sampling_enabled must stay on"
+    assert float(env.get("transition_sampling_probability", 0.0)) == 0.35, (
+        "Run21 MLP transition_sampling_probability drifted"
+    )
+    assert int(env.get("transition_sampling_radius_days", 0)) == 63, (
+        "Run21 MLP transition_sampling_radius_days drifted"
+    )
+    assert list(env.get("transition_sampling_anchor_dates", [])) == [
+        "2021-07-06",
+        "2021-12-31",
+        "2022-01-03",
+    ], "Run21 MLP transition_sampling_anchor_dates drifted"
+    assert int(training.get("training_early_stop_transition_grace_steps", 0)) == 15_000, (
+        "Run21 MLP training_early_stop_transition_grace_steps drifted"
+    )
+    assert bool(training.get("training_early_stop_reset_ema_on_transition", False)), (
+        "Run21 MLP training_early_stop_reset_ema_on_transition must stay enabled"
+    )
+    assert bool(training.get("training_early_stop_reset_on_reward_phase_change", False)), (
+        "Run21 MLP training_early_stop_reset_on_reward_phase_change must stay enabled"
+    )
+    assert not bool(training.get("training_early_stop_reset_on_turnover_scalar_update", True)), (
+        "Run21 MLP training_early_stop_reset_on_turnover_scalar_update must stay disabled"
+    )
+    assert not bool(training.get("training_early_stop_reset_on_action_execution_beta_update", True)), (
+        "Run21 MLP training_early_stop_reset_on_action_execution_beta_update must stay disabled"
+    )
+    assert float(training.get("evaluation_action_execution_beta", 0.0)) == 0.70, (
+        "Run21 MLP evaluation_action_execution_beta drifted"
+    )
+    assert float(training.get("evaluation_turnover_penalty_scalar", 0.0)) == 0.25, (
+        "Run21 MLP evaluation_turnover_penalty_scalar drifted"
+    )
+    assert str(training.get("high_watermark_checkpoint_subdir", "")) == "high_watermark_checkpoints_run21_mlp", (
+        "Run21 MLP high_watermark_checkpoint_subdir drifted"
+    )
+    assert str(training.get("step_sharpe_checkpoint_subdir", "")) == "step_sharpe_checkpoints_run21_mlp", (
+        "Run21 MLP step_sharpe_checkpoint_subdir drifted"
+    )
+    assert float(ppo.get("objective_router_entropy_coef", 0.0)) == 0.005, (
+        "Run21 MLP objective_router_entropy_coef drifted"
+    )
+    assert float(ppo.get("objective_head_diversity_coef", 0.0)) == 0.02, (
+        "Run21 MLP objective_head_diversity_coef drifted"
+    )
+    expected_reward_schedule = copy.deepcopy(RUN21_OVERRIDES["training_params"]["reward_component_schedule"])
+    actual_reward_schedule = copy.deepcopy(training.get("reward_component_schedule", []))
+    assert actual_reward_schedule == expected_reward_schedule, "Run21 MLP reward_component_schedule drifted"
+    expected_beta_schedule = copy.deepcopy(RUN21_OVERRIDES["training_params"]["action_execution_beta_schedule"])
+    actual_beta_schedule = copy.deepcopy(training.get("action_execution_beta_schedule", []))
+    assert actual_beta_schedule == expected_beta_schedule, "Run21 MLP action_execution_beta_schedule drifted"
+    expected_turnover = copy.deepcopy(RUN21_OVERRIDES["training_params"]["turnover_penalty_curriculum"])
+    actual_turnover = {
+        int(threshold): float(value)
+        for threshold, value in dict(training.get("turnover_penalty_curriculum", {})).items()
+    }
+    assert actual_turnover == expected_turnover, "Run21 MLP turnover_penalty_curriculum drifted"
+
+
+def build_run21_mlp_config(
+    phase_name: str = "phase1",
+    *,
+    analysis_end_date: str | None = None,
+    overrides: dict | None = None,
+) -> dict:
+    """Return a deep-copied phase config with the canonical Run21 MLP overrides applied."""
+    config = copy.deepcopy(get_active_config(phase_name))
+    enforce_feature_audit_plan(config)
+    apply_run21_mlp_overrides(config, overrides=overrides)
+    if analysis_end_date is not None:
+        config["ANALYSIS_END_DATE"] = analysis_end_date
+    assert_run21_mlp_config(config)
     return config
 
 

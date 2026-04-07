@@ -489,6 +489,7 @@ class PortfolioEnvTAPE(gym.Env):
 
         # Regime-balanced sampling: precompute date -> regime index mapping
         self._regime_date_indices = {}
+        self._date_regime_by_index = []
         if 'volatility_regime' in processed_data.columns:
             date_to_regime = (
                 processed_data[['Date', 'volatility_regime']]
@@ -499,8 +500,11 @@ class PortfolioEnvTAPE(gym.Env):
             for idx, date in enumerate(self.dates):
                 regime = date_to_regime.get(date, 'medium_vol')
                 self._regime_date_indices.setdefault(regime, []).append(idx)
+                self._date_regime_by_index.append(str(regime))
             logger.info(f"Regime-balanced sampling ready: "
                         f"{{{', '.join(f'{k}: {len(v)}' for k, v in self._regime_date_indices.items())}}}")
+        else:
+            self._date_regime_by_index = ['medium_vol'] * self.total_days
         self._regime_sample_counts = {}  # tracks how many episodes started in each regime
         self._regime_sample_total = 0
         env_params = self.config.get("environment_params", {}) if isinstance(self.config, dict) else {}
@@ -511,6 +515,53 @@ class PortfolioEnvTAPE(gym.Env):
                 self.regime_sampling_mode,
             )
             self.regime_sampling_mode = "uniform_regime"
+        self.transition_sampling_enabled = bool(env_params.get("transition_sampling_enabled", False))
+        self.transition_sampling_probability = float(
+            np.clip(env_params.get("transition_sampling_probability", 0.0), 0.0, 1.0)
+        )
+        self.transition_sampling_radius_days = max(0, int(env_params.get("transition_sampling_radius_days", 63)))
+        self.transition_sampling_anchor_dates = list(env_params.get("transition_sampling_anchor_dates", []) or [])
+        self._transition_date_indices = []
+        self._transition_anchor_resolution = []
+        if self.transition_sampling_enabled and self.transition_sampling_anchor_dates:
+            normalized_dates = pd.Index(pd.to_datetime(self.dates).normalize())
+            transition_index_set = set()
+            for raw_anchor in self.transition_sampling_anchor_dates:
+                try:
+                    anchor_ts = pd.Timestamp(raw_anchor).normalize()
+                except Exception:
+                    logger.warning("Skipping invalid transition sampling anchor date: %s", raw_anchor)
+                    continue
+                if len(normalized_dates) == 0:
+                    continue
+                insert_pos = int(normalized_dates.searchsorted(anchor_ts, side='left'))
+                if insert_pos >= len(normalized_dates):
+                    resolved_idx = len(normalized_dates) - 1
+                elif insert_pos <= 0:
+                    resolved_idx = 0
+                else:
+                    prev_idx = insert_pos - 1
+                    next_idx = insert_pos
+                    prev_delta = abs(normalized_dates[prev_idx] - anchor_ts)
+                    next_delta = abs(normalized_dates[next_idx] - anchor_ts)
+                    resolved_idx = prev_idx if prev_delta <= next_delta else next_idx
+                start_idx = max(0, resolved_idx - self.transition_sampling_radius_days)
+                end_idx = min(len(normalized_dates), resolved_idx + self.transition_sampling_radius_days + 1)
+                transition_index_set.update(range(start_idx, end_idx))
+                self._transition_anchor_resolution.append(
+                    {
+                        "requested_anchor": str(anchor_ts.date()),
+                        "resolved_date": str(pd.Timestamp(normalized_dates[resolved_idx]).date()),
+                        "resolved_index": int(resolved_idx),
+                    }
+                )
+            self._transition_date_indices = sorted(int(i) for i in transition_index_set)
+            logger.info(
+                "Transition-focused sampling ready: anchors=%s | radius=%d | candidate_starts=%d",
+                [item["resolved_date"] for item in self._transition_anchor_resolution],
+                self.transition_sampling_radius_days,
+                len(self._transition_date_indices),
+            )
 
         # Build return matrix: (days, assets)
         self._build_return_matrix()
@@ -620,6 +671,27 @@ class PortfolioEnvTAPE(gym.Env):
         logger.info(f"  Action Execution Beta: {self.action_execution_beta:.3f}")
         if self.episode_length_limit is not None:
             logger.info(f"  Episode Step Limit: {self.episode_length_limit}")
+
+    def _sample_transition_start_day(self, max_start: int, requested_regime: Optional[str] = None) -> Optional[int]:
+        """Optionally oversample starts near known failure transitions."""
+        if not self.transition_sampling_enabled:
+            return None
+        if self.transition_sampling_probability <= 0.0:
+            return None
+        if not self._transition_date_indices:
+            return None
+        if self.np_random.rand() >= self.transition_sampling_probability:
+            return None
+
+        valid_starts = [idx for idx in self._transition_date_indices if idx <= max_start]
+        if requested_regime and requested_regime != 'all':
+            valid_starts = [
+                idx for idx in valid_starts
+                if idx < len(self._date_regime_by_index) and self._date_regime_by_index[idx] == requested_regime
+            ]
+        if not valid_starts:
+            return None
+        return int(valid_starts[self.np_random.randint(0, len(valid_starts))])
 
     def _build_initial_weights(self) -> np.ndarray:
         """Build initial portfolio weights using configuration-driven mode."""
@@ -1060,7 +1132,16 @@ class PortfolioEnvTAPE(gym.Env):
                 requested_regime = options.get('volatility_regime')
 
             _sampled_regime = None  # track which regime was actually used
-            if (requested_regime == 'all' or requested_regime is None) and self._regime_date_indices:
+            transition_start = self._sample_transition_start_day(max_start, requested_regime=requested_regime)
+            if transition_start is not None:
+                self.day = transition_start
+                transition_regime = (
+                    self._date_regime_by_index[self.day]
+                    if self.day < len(self._date_regime_by_index)
+                    else 'unknown'
+                )
+                _sampled_regime = f"transition::{transition_regime}"
+            elif (requested_regime == 'all' or requested_regime is None) and self._regime_date_indices:
                 # "all" curriculum phase or no curriculum: sample regime bucket uniformly,
                 # then sample a start date within that bucket. This gives underrepresented
                 # regimes (e.g. high_vol/bear) equal episode probability.

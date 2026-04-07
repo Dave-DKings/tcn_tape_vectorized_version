@@ -1079,6 +1079,45 @@ class ObjectiveExpertAdapter(layers.Layer):
         return self.dropout(x, training=training)
 
 
+class WindowedMLPEncoder(layers.Layer):
+    """Encode a fixed-width flattened temporal window with a lightweight MLP."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dims: Optional[List[int]] = None,
+        dropout: float = 0.0,
+        name: str = "windowed_mlp_encoder",
+    ):
+        super().__init__(name=name)
+        sanitized_hidden_dims = [int(x) for x in (hidden_dims or []) if int(x) > 0]
+        self.input_norm = layers.LayerNormalization(epsilon=1e-6, name=f"{name}_input_norm")
+        self.hidden_layers: List[Tuple[layers.Dense, layers.Dropout]] = []
+        for i, hidden_units in enumerate(sanitized_hidden_dims):
+            self.hidden_layers.append(
+                (
+                    layers.Dense(hidden_units, activation="gelu", name=f"{name}_dense_{i}"),
+                    layers.Dropout(float(dropout), name=f"{name}_dropout_{i}"),
+                )
+            )
+        self.output_layer = layers.Dense(
+            int(output_dim),
+            activation="relu",
+            kernel_initializer="orthogonal",
+            name=f"{name}_output",
+        )
+        self.output_norm = layers.LayerNormalization(epsilon=1e-6, name=f"{name}_output_norm")
+
+    def call(self, x: tf.Tensor, training=None) -> tf.Tensor:
+        x = self.input_norm(x)
+        for dense_layer, dropout_layer in self.hidden_layers:
+            x = dense_layer(x)
+            x = dropout_layer(x, training=training)
+        x = self.output_layer(x)
+        return self.output_norm(x)
+
+
 class MLPActor(DirichletActor):
     """
     Windowed MLP actor.
@@ -1228,6 +1267,57 @@ class MLPActor(DirichletActor):
                 sequence_film_feature_dim=self.input_dim,
             )
 
+        sanitized_expert_names = [str(x).strip().lower() for x in (objective_expert_names or []) if str(x).strip()]
+        if not sanitized_expert_names:
+            sanitized_expert_names = ["return", "risk", "discipline"]
+        self.objective_experts_enabled = bool(objective_experts_enabled)
+        self.objective_expert_names = list(sanitized_expert_names[:3])
+        self.num_objective_experts = len(self.objective_expert_names)
+        self.objective_expert_adapter_dim = max(8, int(objective_expert_adapter_dim))
+        self.objective_expert_dropout = float(max(0.0, objective_expert_dropout))
+        self.objective_expert_mask = tf.Variable(
+            np.ones((self.num_objective_experts,), dtype=np.float32),
+            trainable=False,
+            dtype=tf.float32,
+            name=f"{name}_objective_expert_mask",
+        )
+        self.objective_output_adapters: List[ObjectiveExpertAdapter] = []
+        self.objective_output_heads: List[layers.Dense] = []
+        self.objective_router_layers: List[Tuple[layers.Dense, layers.Dropout]] = []
+        self.objective_router_logits = None
+        if self.objective_experts_enabled:
+            for expert_name in self.objective_expert_names:
+                self.objective_output_adapters.append(
+                    ObjectiveExpertAdapter(
+                        output_dim=self.objective_expert_adapter_dim,
+                        dropout=self.objective_expert_dropout,
+                        name=f"{name}_{expert_name}_output_adapter",
+                    )
+                )
+                self.objective_output_heads.append(
+                    layers.Dense(
+                        self.num_actions,
+                        activation=None,
+                        kernel_initializer="orthogonal",
+                        bias_initializer=tf.keras.initializers.Constant(0.5),
+                        name=f"{name}_{expert_name}_output",
+                    )
+                )
+            for i, hidden_units in enumerate([int(x) for x in (objective_router_hidden_dims or []) if int(x) > 0]):
+                self.objective_router_layers.append(
+                    (
+                        layers.Dense(hidden_units, activation="gelu", name=f"{name}_objective_router_{i}"),
+                        layers.Dropout(float(objective_router_dropout), name=f"{name}_objective_router_drop_{i}"),
+                    )
+                )
+            self.objective_router_logits = layers.Dense(
+                self.num_objective_experts,
+                activation=None,
+                kernel_initializer="orthogonal",
+                bias_initializer=tf.keras.initializers.Constant([2.0, 0.0, -0.5][: self.num_objective_experts]),
+                name=f"{name}_objective_router_logits",
+            )
+
         self.output_layer = layers.Dense(
             self.num_actions,
             activation=None,
@@ -1315,6 +1405,39 @@ class MLPActor(DirichletActor):
         sequence = tf.ensure_shape(sequence, [None, self.sequence_length, self.input_dim])
         return sequence
 
+    def set_objective_expert_mask(self, mask: List[float]) -> None:
+        if not self.objective_experts_enabled:
+            return
+        arr = np.asarray(mask, dtype=np.float32).reshape(-1)
+        if arr.size != self.num_objective_experts:
+            raise ValueError(
+                f"objective expert mask size mismatch: got {arr.size}, expected {self.num_objective_experts}"
+            )
+        arr = np.where(arr > 0.0, 1.0, 0.0).astype(np.float32)
+        if float(np.sum(arr)) <= 0.0:
+            arr[0] = 1.0
+        self.objective_expert_mask.assign(arr)
+
+    def _compute_objective_router_probs(self, router_features: tf.Tensor, training=None) -> Tuple[tf.Tensor, tf.Tensor]:
+        router_hidden = router_features
+        for dense_layer, dropout_layer in self.objective_router_layers:
+            router_hidden = dense_layer(router_hidden)
+            router_hidden = dropout_layer(router_hidden, training=training)
+        router_logits = self.objective_router_logits(router_hidden, training=training)
+        expert_mask = tf.cast(self.objective_expert_mask, router_logits.dtype)[tf.newaxis, :]
+        masked_logits = tf.where(
+            expert_mask > 0.0,
+            router_logits,
+            tf.fill(tf.shape(router_logits), tf.cast(-1e9, router_logits.dtype)),
+        )
+        router_probs = tf.nn.softmax(masked_logits, axis=-1)
+        router_probs = router_probs * expert_mask
+        router_probs = router_probs / tf.maximum(
+            tf.reduce_sum(router_probs, axis=-1, keepdims=True),
+            tf.cast(1e-8, router_probs.dtype),
+        )
+        return router_logits, router_probs
+
     def call(self, state, training=None):
         sequence = self._prepare_sequence(state)
         regime_seq = sequence
@@ -1341,7 +1464,20 @@ class MLPActor(DirichletActor):
                 training=training,
             )
 
-        logits = self.output_layer(x, training=training)
+        expert_logits = None
+        router_logits = None
+        router_probs = None
+        if self.objective_experts_enabled:
+            router_features = x if regime_embedding is None else tf.concat([x, regime_embedding], axis=-1)
+            router_logits, router_probs = self._compute_objective_router_probs(router_features, training=training)
+            expert_logits_list = []
+            for adapter, head in zip(self.objective_output_adapters, self.objective_output_heads):
+                adapted = adapter(x, training=training)
+                expert_logits_list.append(head(adapted, training=training))
+            expert_logits = tf.stack(expert_logits_list, axis=1)
+            logits = tf.reduce_sum(router_probs[:, :, tf.newaxis] * expert_logits, axis=1)
+        else:
+            logits = self.output_layer(x, training=training)
         projection_logits = self.projection_layer(x, training=training) if self.projection_layer is not None else None
         aux_preds = self.aux_return_head(x, training=training) if self.aux_return_head is not None else None
 
@@ -1372,6 +1508,9 @@ class MLPActor(DirichletActor):
             mixture_gating_logits=gating_logits,
             projection_logits=projection_logits,
             aux_return_preds=aux_preds,
+            expert_alpha=self._compute_alpha(expert_logits) if expert_logits is not None else None,
+            router_logits=router_logits,
+            router_probs=router_probs,
         )
 
     def get_film_diagnostics(self, state) -> Dict[str, float]:
@@ -2929,6 +3068,10 @@ class MLPCritic(Model):
         regime_conditioning_mode: Optional[str] = None,
         distributional_critic_enabled: Optional[bool] = None,
         distributional_num_quantiles: Optional[int] = None,
+        objective_experts_enabled: Optional[bool] = None,
+        objective_expert_names: Optional[List[str]] = None,
+        objective_expert_adapter_dim: Optional[int] = None,
+        objective_expert_dropout: Optional[float] = None,
         name: str = "mlp_critic",
     ):
         super(MLPCritic, self).__init__(name=name)
@@ -2947,6 +3090,14 @@ class MLPCritic(Model):
             distributional_critic_enabled = _DEFAULT_DISTRIBUTIONAL_CRITIC_ENABLED
         if distributional_num_quantiles is None:
             distributional_num_quantiles = _DEFAULT_DISTRIBUTIONAL_NUM_QUANTILES
+        if objective_experts_enabled is None:
+            objective_experts_enabled = _DEFAULT_OBJECTIVE_EXPERTS_ENABLED
+        if objective_expert_names is None:
+            objective_expert_names = _DEFAULT_OBJECTIVE_EXPERT_NAMES
+        if objective_expert_adapter_dim is None:
+            objective_expert_adapter_dim = _DEFAULT_OBJECTIVE_EXPERT_ADAPTER_DIM
+        if objective_expert_dropout is None:
+            objective_expert_dropout = _DEFAULT_OBJECTIVE_EXPERT_DROPOUT
 
         sanitized_hidden_dims = [int(x) for x in (hidden_dims or []) if int(x) > 0]
         if not sanitized_hidden_dims:
@@ -2961,6 +3112,14 @@ class MLPCritic(Model):
         ).lower().strip()
         self.distributional_critic_enabled = bool(distributional_critic_enabled)
         self.distributional_num_quantiles = max(2, int(distributional_num_quantiles))
+        sanitized_expert_names = [str(x).strip().lower() for x in (objective_expert_names or []) if str(x).strip()]
+        if not sanitized_expert_names:
+            sanitized_expert_names = ["return", "risk", "discipline"]
+        self.objective_experts_enabled = bool(objective_experts_enabled)
+        self.objective_expert_names = list(sanitized_expert_names[:3])
+        self.num_objective_experts = len(self.objective_expert_names)
+        self.objective_expert_adapter_dim = max(8, int(objective_expert_adapter_dim))
+        self.objective_expert_dropout = float(max(0.0, objective_expert_dropout))
 
         self.sequence_norm = layers.LayerNormalization(epsilon=1e-6, name=f"{name}_sequence_norm")
         self.flatten_layer = layers.Reshape((self.flat_dim,), name=f"{name}_flatten")
@@ -3003,6 +3162,25 @@ class MLPCritic(Model):
             kernel_initializer="orthogonal",
             name=f"{name}_output",
         )
+        self.objective_value_adapters: List[ObjectiveExpertAdapter] = []
+        self.objective_value_heads: List[layers.Dense] = []
+        if self.objective_experts_enabled:
+            for expert_name in self.objective_expert_names:
+                self.objective_value_adapters.append(
+                    ObjectiveExpertAdapter(
+                        output_dim=self.objective_expert_adapter_dim,
+                        dropout=self.objective_expert_dropout,
+                        name=f"{name}_{expert_name}_value_adapter",
+                    )
+                )
+                self.objective_value_heads.append(
+                    layers.Dense(
+                        1,
+                        activation=None,
+                        kernel_initializer="orthogonal",
+                        name=f"{name}_{expert_name}_value",
+                    )
+                )
 
     def _prepare_sequence(self, state) -> tf.Tensor:
         sequence = _flatten_structured_sequence_input(state)
@@ -3044,6 +3222,16 @@ class MLPCritic(Model):
                 regime_dropout=self.regime_dropout,
                 training=training,
             )
+
+        if self.objective_experts_enabled:
+            expert_values = []
+            for adapter, head in zip(self.objective_value_adapters, self.objective_value_heads):
+                adapted = adapter(x, training=training)
+                value = head(adapted, training=training)
+                expert_values.append(tf.squeeze(value, axis=-1))
+            return {
+                "expert_values": tf.stack(expert_values, axis=-1),
+            }
 
         return self.output_layer(x, training=training)
 
@@ -3677,6 +3865,630 @@ class TCNFusionCritic(Model):
         return self.output_layer(fused, training=training)
 
 
+class MLPFusionActor(TCNFusionActor):
+    """Fusion actor that keeps the TCN_FUSION topology but replaces temporal TCNs with windowed MLP encoders."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        num_actions: int,
+        sequence_length: int = 60,
+        temporal_hidden_dims: Optional[List[int]] = None,
+        dropout: float = None,
+        num_assets: int = None,
+        asset_feature_dim: int = None,
+        global_feature_dim: int = None,
+        fusion_embed_dim: int = None,
+        fusion_attention_heads: int = None,
+        fusion_dropout: float = None,
+        fusion_cross_asset_mixer_enabled: Optional[bool] = None,
+        fusion_cross_asset_mixer_layers: Optional[int] = None,
+        fusion_cross_asset_mixer_expansion: Optional[float] = None,
+        fusion_cross_asset_mixer_dropout: Optional[float] = None,
+        fusion_alpha_head_hidden_dims: Optional[List[int]] = None,
+        fusion_alpha_head_dropout: Optional[float] = None,
+        fusion_asset_identity_enabled: Optional[bool] = None,
+        fusion_context_cross_attention_enabled: Optional[bool] = None,
+        fusion_context_cross_attention_heads: Optional[int] = None,
+        fusion_context_cross_attention_dropout: Optional[float] = None,
+        fusion_per_asset_alpha_head: Optional[bool] = None,
+        recurrent_memory_enabled: Optional[bool] = None,
+        recurrent_memory_units: Optional[int] = None,
+        recurrent_memory_dropout: Optional[float] = None,
+        regime_conditioning_enabled: Optional[bool] = None,
+        regime_conditioning_hidden_dim: Optional[int] = None,
+        regime_conditioning_dropout: Optional[float] = None,
+        regime_conditioning_mode: Optional[str] = None,
+        name: str = "mlp_fusion_actor",
+        epsilon_start: float = 0.5,
+        epsilon_min: float = 0.1,
+        alpha_activation: str = None,
+        exp_clip: Tuple[float, float] = None,
+        logit_temperature: float = None,
+        alpha_cap: float = None,
+        adaptive_temperature_enabled: bool = False,
+        adaptive_temperature_base: float = 1.0,
+        adaptive_temperature_slope: float = 0.0,
+        adaptive_temperature_min: float = 0.8,
+        adaptive_temperature_max: float = 2.5,
+        dual_head_enabled: Optional[bool] = None,
+        mixture_dirichlet_enabled: Optional[bool] = None,
+        mixture_dirichlet_num_components: Optional[int] = None,
+        mixture_dirichlet_gating_hidden_dims: Optional[List[int]] = None,
+        mixture_dirichlet_component_hidden_dims: Optional[List[int]] = None,
+        objective_experts_enabled: Optional[bool] = None,
+        objective_expert_names: Optional[List[str]] = None,
+        objective_expert_adapter_dim: Optional[int] = None,
+        objective_expert_dropout: Optional[float] = None,
+        objective_router_hidden_dims: Optional[List[int]] = None,
+        objective_router_dropout: Optional[float] = None,
+        aux_return_enabled: bool = False,
+        exp_tanh_scale: float = 2.5,
+        softplus_alpha_floor: float = 0.0,
+        softplus_alpha_scale: float = 1.0,
+        cross_sectional_standardize: bool = False,
+    ):
+        if temporal_hidden_dims is None:
+            temporal_hidden_dims = _DEFAULT_ACTOR_HIDDEN_DIMS
+        if fusion_embed_dim is None:
+            fusion_embed_dim = _DEFAULT_FUSION_EMBED_DIM
+        super().__init__(
+            input_dim=input_dim,
+            num_actions=num_actions,
+            tcn_filters=[int(fusion_embed_dim)],
+            kernel_size=1,
+            dilations=[1],
+            dropout=dropout,
+            num_assets=num_assets,
+            asset_feature_dim=asset_feature_dim,
+            global_feature_dim=global_feature_dim,
+            fusion_embed_dim=fusion_embed_dim,
+            fusion_attention_heads=fusion_attention_heads,
+            fusion_dropout=fusion_dropout,
+            fusion_cross_asset_mixer_enabled=fusion_cross_asset_mixer_enabled,
+            fusion_cross_asset_mixer_layers=fusion_cross_asset_mixer_layers,
+            fusion_cross_asset_mixer_expansion=fusion_cross_asset_mixer_expansion,
+            fusion_cross_asset_mixer_dropout=fusion_cross_asset_mixer_dropout,
+            fusion_alpha_head_hidden_dims=fusion_alpha_head_hidden_dims,
+            fusion_alpha_head_dropout=fusion_alpha_head_dropout,
+            fusion_asset_identity_enabled=fusion_asset_identity_enabled,
+            fusion_context_cross_attention_enabled=fusion_context_cross_attention_enabled,
+            fusion_context_cross_attention_heads=fusion_context_cross_attention_heads,
+            fusion_context_cross_attention_dropout=fusion_context_cross_attention_dropout,
+            fusion_per_asset_alpha_head=fusion_per_asset_alpha_head,
+            recurrent_memory_enabled=recurrent_memory_enabled,
+            recurrent_memory_units=recurrent_memory_units,
+            recurrent_memory_dropout=recurrent_memory_dropout,
+            regime_conditioning_enabled=regime_conditioning_enabled,
+            regime_conditioning_hidden_dim=regime_conditioning_hidden_dim,
+            regime_conditioning_dropout=regime_conditioning_dropout,
+            regime_conditioning_mode=regime_conditioning_mode,
+            name=name,
+            epsilon_start=epsilon_start,
+            epsilon_min=epsilon_min,
+            alpha_activation=alpha_activation,
+            exp_clip=exp_clip,
+            logit_temperature=logit_temperature,
+            alpha_cap=alpha_cap,
+            adaptive_temperature_enabled=adaptive_temperature_enabled,
+            adaptive_temperature_base=adaptive_temperature_base,
+            adaptive_temperature_slope=adaptive_temperature_slope,
+            adaptive_temperature_min=adaptive_temperature_min,
+            adaptive_temperature_max=adaptive_temperature_max,
+            dual_head_enabled=dual_head_enabled,
+            mixture_dirichlet_enabled=mixture_dirichlet_enabled,
+            mixture_dirichlet_num_components=mixture_dirichlet_num_components,
+            mixture_dirichlet_gating_hidden_dims=mixture_dirichlet_gating_hidden_dims,
+            mixture_dirichlet_component_hidden_dims=mixture_dirichlet_component_hidden_dims,
+            objective_experts_enabled=objective_experts_enabled,
+            objective_expert_names=objective_expert_names,
+            objective_expert_adapter_dim=objective_expert_adapter_dim,
+            objective_expert_dropout=objective_expert_dropout,
+            objective_router_hidden_dims=objective_router_hidden_dims,
+            objective_router_dropout=objective_router_dropout,
+            aux_return_enabled=aux_return_enabled,
+            exp_tanh_scale=exp_tanh_scale,
+            softplus_alpha_floor=softplus_alpha_floor,
+            softplus_alpha_scale=softplus_alpha_scale,
+            cross_sectional_standardize=cross_sectional_standardize,
+        )
+        self.sequence_length = max(1, int(sequence_length))
+        self.context_sequence_feature_dim = self.global_feature_dim if self.global_feature_dim > 0 else self.local_flat_dim
+        self.asset_window_flatten = layers.Reshape(
+            (self.sequence_length * self.per_asset_dim,),
+            name=f"{name}_asset_window_flatten",
+        )
+        self.context_window_flatten = layers.Reshape(
+            (self.sequence_length * self.context_sequence_feature_dim,),
+            name=f"{name}_context_window_flatten",
+        )
+        self.asset_temporal_encoder = WindowedMLPEncoder(
+            input_dim=self.sequence_length * self.per_asset_dim,
+            output_dim=self.fusion_embed_dim,
+            hidden_dims=temporal_hidden_dims,
+            dropout=float(dropout if dropout is not None else _DEFAULT_TCN_DROPOUT),
+            name=f"{name}_asset_temporal_encoder",
+        )
+        self.context_temporal_encoder = WindowedMLPEncoder(
+            input_dim=self.sequence_length * self.context_sequence_feature_dim,
+            output_dim=self.fusion_embed_dim,
+            hidden_dims=temporal_hidden_dims,
+            dropout=float(fusion_dropout if fusion_dropout is not None else _DEFAULT_FUSION_DROPOUT),
+            name=f"{name}_context_temporal_encoder",
+        )
+
+    def _align_sequence_length(self, x: tf.Tensor) -> tf.Tensor:
+        pad_time = tf.maximum(0, self.sequence_length - tf.shape(x)[1])
+        x = tf.pad(x, [[0, 0], [0, pad_time], [0, 0]])
+        return x[:, : self.sequence_length, :]
+
+    def _align_asset_tensor(self, asset_tensor: tf.Tensor) -> tf.Tensor:
+        x_assets = super()._align_asset_tensor(asset_tensor)
+        return self._align_sequence_length(x_assets)
+
+    def _align_context_tensor(self, context_tensor: tf.Tensor, *, batch: tf.Tensor, timesteps: tf.Tensor, fallback: tf.Tensor) -> tf.Tensor:
+        aligned = super()._align_context_tensor(
+            context_tensor,
+            batch=batch,
+            timesteps=timesteps,
+            fallback=fallback,
+        )
+        return self._align_sequence_length(aligned)
+
+    def _build_regime_sequence(self, state) -> tf.Tensor:
+        seq = super()._build_regime_sequence(state)
+        return self._align_sequence_length(seq)
+
+    def call(self, state, training=None):
+        if isinstance(state, dict):
+            structured_assets = self._align_asset_tensor(state.get("asset"))
+            batch = tf.shape(structured_assets)[0]
+            timesteps = tf.shape(structured_assets)[1]
+            x_assets = tf.transpose(structured_assets, perm=[0, 2, 1, 3])
+            x_assets = tf.reshape(x_assets, (-1, timesteps, self.per_asset_dim))
+            context_seq = self._align_context_tensor(
+                state.get("context"),
+                batch=batch,
+                timesteps=timesteps,
+                fallback=tf.zeros((batch, timesteps, self.context_sequence_feature_dim), dtype=structured_assets.dtype),
+            )
+        else:
+            x = self._align_feature_dim(state)
+            x = self._align_sequence_length(x)
+            batch = tf.shape(x)[0]
+            timesteps = tf.shape(x)[1]
+            x_local = x[:, :, : self.local_flat_dim]
+            x_assets = tf.reshape(x_local, (batch, timesteps, self.num_assets, self.per_asset_dim))
+            x_assets = tf.transpose(x_assets, perm=[0, 2, 1, 3])
+            x_assets = tf.reshape(x_assets, (-1, timesteps, self.per_asset_dim))
+            x_context = x[:, :, self.local_flat_dim:]
+            if self.global_feature_dim <= 0:
+                context_seq = self._align_sequence_length(x_local)
+            else:
+                context_seq = self._align_context_tensor(
+                    x_context,
+                    batch=batch,
+                    timesteps=timesteps,
+                    fallback=x_local,
+                )
+
+        regime_embedding = None
+        if self.regime_conditioning_enabled and self.regime_sequence_encoder is not None:
+            regime_seq = self._build_regime_sequence(state)
+            regime_embedding = self.regime_sequence_encoder(regime_seq, training=training)
+
+        if regime_embedding is not None and self.regime_sequence_film_layer is not None:
+            asset_regime_embedding = tf.repeat(regime_embedding, repeats=self.num_assets, axis=0)
+            x_assets = self.regime_sequence_film_layer(x_assets, asset_regime_embedding, training=training)
+        if regime_embedding is not None and self.regime_context_sequence_film_layer is not None:
+            context_seq = self.regime_context_sequence_film_layer(context_seq, regime_embedding, training=training)
+
+        asset_flat = self.asset_window_flatten(x_assets)
+        x_assets = self.asset_temporal_encoder(asset_flat, training=training)
+        x_assets = tf.reshape(x_assets, (batch, self.num_assets, self.fusion_embed_dim))
+
+        if self.asset_identity_embed is not None:
+            x_assets = x_assets + self.asset_identity_embed[tf.newaxis, :, :]
+
+        if self.use_three_layer_context_stack:
+            x_assets = self.asset_mixer_blocks[0](x_assets, training=training)
+        else:
+            x_assets = self.asset_attention(x_assets, training=training)
+            for mixer_block in self.asset_mixer_blocks:
+                x_assets = mixer_block(x_assets, training=training)
+
+        context_flat = self.context_window_flatten(context_seq)
+        global_context = self.context_temporal_encoder(context_flat, training=training)
+        global_context = self.global_dropout(global_context, training=training)
+
+        if self.context_cross_attn_enabled and self.context_cross_attn_block is not None:
+            ctx_token = self.context_projection(global_context)
+            ctx_token = tf.expand_dims(ctx_token, axis=1)
+            x_assets = self.context_cross_attn_block(query=x_assets, context=ctx_token, training=training)
+            if self.use_three_layer_context_stack:
+                for mixer_block in self.asset_mixer_blocks[1:]:
+                    x_assets = mixer_block(x_assets, training=training)
+            fused = self.asset_pool(x_assets)
+        else:
+            asset_context = self.asset_pool(x_assets)
+            gate = self.gate_layer(tf.concat([asset_context, global_context], axis=-1))
+            fused = gate * asset_context + (1.0 - gate) * global_context
+
+        if regime_embedding is not None:
+            if self.per_asset_alpha_head_enabled:
+                x_assets = _apply_regime_conditioning(
+                    x_assets,
+                    regime_embedding,
+                    regime_film_layer=self.regime_film_layer,
+                    regime_fusion=self.regime_fusion,
+                    regime_dropout=self.regime_dropout,
+                    training=training,
+                )
+            else:
+                fused = _apply_regime_conditioning(
+                    fused,
+                    regime_embedding,
+                    regime_film_layer=self.regime_film_layer,
+                    regime_fusion=self.regime_fusion,
+                    regime_dropout=self.regime_dropout,
+                    training=training,
+                )
+
+        if self.asset_film_layer is not None:
+            batch_size = tf.shape(x_assets)[0]
+            market_mean = tf.reduce_mean(x_assets, axis=1, keepdims=True)
+            relative = x_assets - market_mean
+            if self.asset_identity_embed is not None:
+                identity = tf.tile(self.asset_identity_embed[tf.newaxis, :, :], [batch_size, 1, 1])
+                relative = relative + identity
+            x_flat = tf.reshape(x_assets, (-1, self.fusion_embed_dim))
+            cond_flat = tf.reshape(relative, (-1, self.fusion_embed_dim))
+            x_flat = self.asset_film_layer(x_flat, cond_flat, training=training)
+            x_assets = tf.reshape(x_flat, (batch_size, self.num_assets, self.fusion_embed_dim))
+
+        aux_preds = None
+        if self._aux_return_enabled and hasattr(self, "aux_return_head"):
+            aux_preds = self.aux_return_head(tf.stop_gradient(x_assets) if not training else x_assets, training=training)
+            aux_preds = tf.squeeze(aux_preds, axis=-1)
+
+        alpha_features = None
+        logits = None
+        expert_logits = None
+        router_logits = None
+        router_probs = None
+        if self.objective_experts_enabled:
+            expert_logits_list = []
+            asset_context_router = self.asset_pool(x_assets)
+            router_feature_parts = [asset_context_router, global_context]
+            if regime_embedding is not None:
+                router_feature_parts.append(regime_embedding)
+            router_features = tf.concat(router_feature_parts, axis=-1)
+            router_logits, router_probs = self._compute_objective_router_probs(router_features, training=training)
+
+            for expert_idx in range(self.num_objective_experts):
+                expert_asset_features = self.objective_asset_adapters[expert_idx](x_assets, training=training)
+                expert_fused_features = self.objective_fused_adapters[expert_idx](fused, training=training)
+                if self.per_asset_alpha_head_enabled and self.objective_per_asset_logit_heads:
+                    risky_logits = self.objective_per_asset_logit_heads[expert_idx](expert_asset_features, training=training)
+                    risky_logits = tf.squeeze(risky_logits, axis=-1)
+                    cash_head = self.objective_cash_logit_heads[expert_idx]
+                    if cash_head is not None:
+                        cash_logits = cash_head(expert_fused_features, training=training)
+                        expert_logit = tf.concat([risky_logits, cash_logits], axis=-1)
+                    else:
+                        expert_logit = risky_logits
+                else:
+                    expert_logit = self.objective_output_heads[expert_idx](expert_fused_features, training=training)
+                expert_logits_list.append(expert_logit)
+
+            expert_logits = tf.stack(expert_logits_list, axis=1)
+            logits = tf.reduce_sum(router_probs[:, :, tf.newaxis] * expert_logits, axis=1)
+        elif self.per_asset_alpha_head_enabled and self.per_asset_logit_head is not None:
+            if self.use_richer_alpha_head and self.alpha_pre_norm is not None:
+                x_assets = self.alpha_pre_norm(x_assets)
+                for dense_layer, dropout_layer in self.alpha_head_blocks:
+                    x_assets = dense_layer(x_assets)
+                    x_assets = dropout_layer(x_assets, training=training)
+            else:
+                x_assets = self.per_asset_pre_norm(x_assets)
+            risky_logits = self.per_asset_logit_head(x_assets, training=training)
+            risky_logits = tf.squeeze(risky_logits, axis=-1)
+
+            if self.cash_logit_head is not None:
+                if self.use_richer_alpha_head and self.alpha_pre_norm is not None:
+                    cash_features = self.alpha_pre_norm(fused)
+                    for dense_layer, dropout_layer in self.alpha_head_blocks:
+                        cash_features = dense_layer(cash_features)
+                        cash_features = dropout_layer(cash_features, training=training)
+                else:
+                    cash_features = fused
+                cash_logits = self.cash_logit_head(cash_features, training=training)
+                logits = tf.concat([risky_logits, cash_logits], axis=-1)
+            else:
+                logits = risky_logits
+        else:
+            if self.use_richer_alpha_head and self.alpha_pre_norm is not None:
+                alpha_features = self.alpha_pre_norm(fused)
+                for dense_layer, dropout_layer in self.alpha_head_blocks:
+                    alpha_features = dense_layer(alpha_features)
+                    alpha_features = dropout_layer(alpha_features, training=training)
+            else:
+                alpha_features = fused
+            logits = self.output_layer(alpha_features, training=training)
+
+        gating_logits = None
+        mixture_logits = None
+        if self.mixture_dirichlet_enabled and self.mixture_gating_logits_layer is not None:
+            gating_features = fused
+            for dense_layer, dropout_layer in self.mixture_gating_layers:
+                gating_features = dense_layer(gating_features)
+                gating_features = dropout_layer(gating_features, training=training)
+            gating_logits = self.mixture_gating_logits_layer(gating_features, training=training)
+
+            if self.per_asset_alpha_head_enabled and self.per_asset_component_logit_head is not None:
+                component_features = x_assets
+                if self.mixture_component_norm is not None:
+                    component_features = self.mixture_component_norm(component_features)
+                for dense_layer, dropout_layer in self.mixture_component_layers:
+                    component_features = dense_layer(component_features)
+                    component_features = dropout_layer(component_features, training=training)
+                risky_component_logits = self.per_asset_component_logit_head(component_features, training=training)
+                risky_component_logits = tf.transpose(risky_component_logits, perm=[0, 2, 1])
+                if self.cash_component_logit_head is not None:
+                    cash_component_logits = self.cash_component_logit_head(fused, training=training)
+                    cash_component_logits = tf.reshape(
+                        cash_component_logits,
+                        (-1, self.mixture_dirichlet_num_components, self.num_actions - self.num_assets),
+                    )
+                    mixture_logits = tf.concat([risky_component_logits, cash_component_logits], axis=-1)
+                else:
+                    mixture_logits = risky_component_logits
+            else:
+                component_features = alpha_features if alpha_features is not None else fused
+                if self.mixture_component_norm is not None:
+                    component_features = self.mixture_component_norm(component_features)
+                for dense_layer, dropout_layer in self.mixture_component_layers:
+                    component_features = dense_layer(component_features)
+                    component_features = dropout_layer(component_features, training=training)
+                mixture_logits = self.mixture_output_layer(component_features, training=training)
+                mixture_logits = tf.reshape(
+                    mixture_logits,
+                    (-1, self.mixture_dirichlet_num_components, self.num_actions),
+                )
+
+        return self._format_actor_output(
+            logits_for_alpha=logits,
+            mixture_logits_for_alpha=mixture_logits,
+            mixture_gating_logits=gating_logits,
+            aux_return_preds=aux_preds,
+            expert_alpha=self._compute_alpha(expert_logits) if expert_logits is not None else None,
+            router_logits=router_logits,
+            router_probs=router_probs,
+        )
+
+
+class MLPFusionCritic(TCNFusionCritic):
+    """Fusion critic that preserves the TCN_FUSION topology while swapping in windowed MLP temporal encoders."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        sequence_length: int = 60,
+        temporal_hidden_dims: Optional[List[int]] = None,
+        dropout: float = None,
+        num_assets: int = None,
+        asset_feature_dim: int = None,
+        global_feature_dim: int = None,
+        fusion_embed_dim: int = None,
+        fusion_attention_heads: int = None,
+        fusion_dropout: float = None,
+        fusion_cross_asset_mixer_enabled: Optional[bool] = None,
+        fusion_cross_asset_mixer_layers: Optional[int] = None,
+        fusion_cross_asset_mixer_expansion: Optional[float] = None,
+        fusion_cross_asset_mixer_dropout: Optional[float] = None,
+        fusion_asset_identity_enabled: Optional[bool] = None,
+        fusion_context_cross_attention_enabled: Optional[bool] = None,
+        fusion_context_cross_attention_heads: Optional[int] = None,
+        fusion_context_cross_attention_dropout: Optional[float] = None,
+        recurrent_memory_enabled: Optional[bool] = None,
+        recurrent_memory_units: Optional[int] = None,
+        recurrent_memory_dropout: Optional[float] = None,
+        regime_conditioning_enabled: Optional[bool] = None,
+        regime_conditioning_hidden_dim: Optional[int] = None,
+        regime_conditioning_dropout: Optional[float] = None,
+        regime_conditioning_mode: Optional[str] = None,
+        distributional_critic_enabled: Optional[bool] = None,
+        distributional_num_quantiles: Optional[int] = None,
+        objective_experts_enabled: Optional[bool] = None,
+        objective_expert_names: Optional[List[str]] = None,
+        objective_expert_adapter_dim: Optional[int] = None,
+        objective_expert_dropout: Optional[float] = None,
+        name: str = "mlp_fusion_critic",
+    ):
+        if temporal_hidden_dims is None:
+            temporal_hidden_dims = _DEFAULT_CRITIC_HIDDEN_DIMS
+        if fusion_embed_dim is None:
+            fusion_embed_dim = _DEFAULT_FUSION_EMBED_DIM
+        super().__init__(
+            input_dim=input_dim,
+            tcn_filters=[int(fusion_embed_dim)],
+            kernel_size=1,
+            dilations=[1],
+            dropout=dropout,
+            num_assets=num_assets,
+            asset_feature_dim=asset_feature_dim,
+            global_feature_dim=global_feature_dim,
+            fusion_embed_dim=fusion_embed_dim,
+            fusion_attention_heads=fusion_attention_heads,
+            fusion_dropout=fusion_dropout,
+            fusion_cross_asset_mixer_enabled=fusion_cross_asset_mixer_enabled,
+            fusion_cross_asset_mixer_layers=fusion_cross_asset_mixer_layers,
+            fusion_cross_asset_mixer_expansion=fusion_cross_asset_mixer_expansion,
+            fusion_cross_asset_mixer_dropout=fusion_cross_asset_mixer_dropout,
+            fusion_asset_identity_enabled=fusion_asset_identity_enabled,
+            fusion_context_cross_attention_enabled=fusion_context_cross_attention_enabled,
+            fusion_context_cross_attention_heads=fusion_context_cross_attention_heads,
+            fusion_context_cross_attention_dropout=fusion_context_cross_attention_dropout,
+            recurrent_memory_enabled=recurrent_memory_enabled,
+            recurrent_memory_units=recurrent_memory_units,
+            recurrent_memory_dropout=recurrent_memory_dropout,
+            regime_conditioning_enabled=regime_conditioning_enabled,
+            regime_conditioning_hidden_dim=regime_conditioning_hidden_dim,
+            regime_conditioning_dropout=regime_conditioning_dropout,
+            regime_conditioning_mode=regime_conditioning_mode,
+            distributional_critic_enabled=distributional_critic_enabled,
+            distributional_num_quantiles=distributional_num_quantiles,
+            objective_experts_enabled=objective_experts_enabled,
+            objective_expert_names=objective_expert_names,
+            objective_expert_adapter_dim=objective_expert_adapter_dim,
+            objective_expert_dropout=objective_expert_dropout,
+            name=name,
+        )
+        self.sequence_length = max(1, int(sequence_length))
+        self.context_sequence_feature_dim = self.global_feature_dim if self.global_feature_dim > 0 else self.local_flat_dim
+        self.asset_window_flatten = layers.Reshape(
+            (self.sequence_length * self.per_asset_dim,),
+            name=f"{name}_asset_window_flatten",
+        )
+        self.context_window_flatten = layers.Reshape(
+            (self.sequence_length * self.context_sequence_feature_dim,),
+            name=f"{name}_context_window_flatten",
+        )
+        self.asset_temporal_encoder = WindowedMLPEncoder(
+            input_dim=self.sequence_length * self.per_asset_dim,
+            output_dim=self.fusion_embed_dim,
+            hidden_dims=temporal_hidden_dims,
+            dropout=float(dropout if dropout is not None else _DEFAULT_TCN_DROPOUT),
+            name=f"{name}_asset_temporal_encoder",
+        )
+        self.context_temporal_encoder = WindowedMLPEncoder(
+            input_dim=self.sequence_length * self.context_sequence_feature_dim,
+            output_dim=self.fusion_embed_dim,
+            hidden_dims=temporal_hidden_dims,
+            dropout=float(fusion_dropout if fusion_dropout is not None else _DEFAULT_FUSION_DROPOUT),
+            name=f"{name}_context_temporal_encoder",
+        )
+
+    def _align_sequence_length(self, x: tf.Tensor) -> tf.Tensor:
+        pad_time = tf.maximum(0, self.sequence_length - tf.shape(x)[1])
+        x = tf.pad(x, [[0, 0], [0, pad_time], [0, 0]])
+        return x[:, : self.sequence_length, :]
+
+    def _align_asset_tensor(self, asset_tensor: tf.Tensor) -> tf.Tensor:
+        x_assets = super()._align_asset_tensor(asset_tensor)
+        return self._align_sequence_length(x_assets)
+
+    def _align_context_tensor(self, context_tensor: tf.Tensor, *, batch: tf.Tensor, timesteps: tf.Tensor, fallback: tf.Tensor) -> tf.Tensor:
+        aligned = super()._align_context_tensor(
+            context_tensor,
+            batch=batch,
+            timesteps=timesteps,
+            fallback=fallback,
+        )
+        return self._align_sequence_length(aligned)
+
+    def _build_regime_sequence(self, state) -> tf.Tensor:
+        seq = super()._build_regime_sequence(state)
+        return self._align_sequence_length(seq)
+
+    def call(self, state, training=None):
+        if isinstance(state, dict):
+            structured_assets = self._align_asset_tensor(state.get("asset"))
+            batch = tf.shape(structured_assets)[0]
+            timesteps = tf.shape(structured_assets)[1]
+            x_assets = tf.transpose(structured_assets, perm=[0, 2, 1, 3])
+            x_assets = tf.reshape(x_assets, (-1, timesteps, self.per_asset_dim))
+            context_seq = self._align_context_tensor(
+                state.get("context"),
+                batch=batch,
+                timesteps=timesteps,
+                fallback=tf.zeros((batch, timesteps, self.context_sequence_feature_dim), dtype=structured_assets.dtype),
+            )
+        else:
+            x = self._align_feature_dim(state)
+            x = self._align_sequence_length(x)
+            batch = tf.shape(x)[0]
+            timesteps = tf.shape(x)[1]
+            x_local = x[:, :, : self.local_flat_dim]
+            x_assets = tf.reshape(x_local, (batch, timesteps, self.num_assets, self.per_asset_dim))
+            x_assets = tf.transpose(x_assets, perm=[0, 2, 1, 3])
+            x_assets = tf.reshape(x_assets, (-1, timesteps, self.per_asset_dim))
+            x_context = x[:, :, self.local_flat_dim:]
+            if self.global_feature_dim <= 0:
+                context_seq = self._align_sequence_length(x_local)
+            else:
+                context_seq = self._align_context_tensor(
+                    x_context,
+                    batch=batch,
+                    timesteps=timesteps,
+                    fallback=x_local,
+                )
+
+        regime_embedding = None
+        if self.regime_conditioning_enabled and self.regime_sequence_encoder is not None:
+            regime_seq = self._build_regime_sequence(state)
+            regime_embedding = self.regime_sequence_encoder(regime_seq, training=training)
+
+        if regime_embedding is not None and self.regime_sequence_film_layer is not None:
+            asset_regime_embedding = tf.repeat(regime_embedding, repeats=self.num_assets, axis=0)
+            x_assets = self.regime_sequence_film_layer(x_assets, asset_regime_embedding, training=training)
+        if regime_embedding is not None and self.regime_context_sequence_film_layer is not None:
+            context_seq = self.regime_context_sequence_film_layer(context_seq, regime_embedding, training=training)
+
+        asset_flat = self.asset_window_flatten(x_assets)
+        x_assets = self.asset_temporal_encoder(asset_flat, training=training)
+        x_assets = tf.reshape(x_assets, (batch, self.num_assets, self.fusion_embed_dim))
+
+        if self.asset_identity_embed is not None:
+            x_assets = x_assets + self.asset_identity_embed[tf.newaxis, :, :]
+
+        if self.use_three_layer_context_stack:
+            x_assets = self.asset_mixer_blocks[0](x_assets, training=training)
+        else:
+            x_assets = self.asset_attention(x_assets, training=training)
+            for mixer_block in self.asset_mixer_blocks:
+                x_assets = mixer_block(x_assets, training=training)
+
+        context_flat = self.context_window_flatten(context_seq)
+        global_context = self.context_temporal_encoder(context_flat, training=training)
+        global_context = self.global_dropout(global_context, training=training)
+
+        if self.context_cross_attn_enabled and self.context_cross_attn_block is not None:
+            ctx_token = self.context_projection_critic(global_context)
+            ctx_token = tf.expand_dims(ctx_token, axis=1)
+            x_assets = self.context_cross_attn_block(query=x_assets, context=ctx_token, training=training)
+            if self.use_three_layer_context_stack:
+                for mixer_block in self.asset_mixer_blocks[1:]:
+                    x_assets = mixer_block(x_assets, training=training)
+            fused = self.asset_pool(x_assets)
+        else:
+            asset_context = self.asset_pool(x_assets)
+            gate = self.gate_layer(tf.concat([asset_context, global_context], axis=-1))
+            fused = gate * asset_context + (1.0 - gate) * global_context
+
+        if regime_embedding is not None:
+            fused = _apply_regime_conditioning(
+                fused,
+                regime_embedding,
+                regime_film_layer=self.regime_film_layer,
+                regime_fusion=self.regime_fusion,
+                regime_dropout=self.regime_dropout,
+                training=training,
+            )
+
+        if self.objective_experts_enabled:
+            expert_values = []
+            for adapter, head in zip(self.objective_value_adapters, self.objective_value_heads):
+                adapted = adapter(fused, training=training)
+                value = head(adapted, training=training)
+                expert_values.append(tf.squeeze(value, axis=-1))
+            return {
+                "expert_values": tf.stack(expert_values, axis=-1),
+            }
+
+        return self.output_layer(fused, training=training)
+
+
 # ============================================================================
 # ARCHITECTURE FACTORY
 # ============================================================================
@@ -3807,26 +4619,94 @@ def create_actor_critic(architecture: str,
         config.get("aux_return_pred_enabled", ppo_params_cfg.get("aux_return_pred_enabled", False))
     )
     if arch_upper == 'MLP':
-        actor = MLPActor(
-            input_dim=input_dim,
-            num_actions=num_actions,
-            sequence_length=int(config.get('sequence_length', 60)),
-            hidden_dims=config.get('actor_hidden_dims', _DEFAULT_ACTOR_HIDDEN_DIMS),
-            dropout=config.get('mlp_dropout', config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT)),
-            dual_head_enabled=dual_head_enabled_cfg,
-            **mixture_kwargs,
-            aux_return_enabled=aux_return_enabled_cfg,
-            **regime_kwargs,
-            **epsilon_kwargs,
-        )
-        critic = MLPCritic(
-            input_dim=input_dim,
-            sequence_length=int(config.get('sequence_length', 60)),
-            hidden_dims=config.get('critic_hidden_dims', _DEFAULT_CRITIC_HIDDEN_DIMS),
-            dropout=config.get('mlp_dropout', config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT)),
-            **regime_kwargs,
-            **critic_distributional_kwargs,
-        )
+        mlp_sequence_length = int(config.get('sequence_length', 60))
+        mlp_dropout = config.get('mlp_dropout', config.get('tcn_dropout', _DEFAULT_TCN_DROPOUT))
+        if config.get('use_fusion', False):
+            resolved_num_assets = int(config.get('num_assets', max(1, num_actions - 1)))
+            actor = MLPFusionActor(
+                input_dim=input_dim,
+                num_actions=num_actions,
+                sequence_length=mlp_sequence_length,
+                temporal_hidden_dims=config.get('actor_hidden_dims', _DEFAULT_ACTOR_HIDDEN_DIMS),
+                dropout=mlp_dropout,
+                num_assets=resolved_num_assets,
+                asset_feature_dim=resolved_asset_feature_dim,
+                global_feature_dim=resolved_global_feature_dim,
+                fusion_embed_dim=config.get('fusion_embed_dim', _DEFAULT_FUSION_EMBED_DIM),
+                fusion_attention_heads=config.get('fusion_attention_heads', _DEFAULT_FUSION_HEADS),
+                fusion_dropout=config.get('fusion_dropout', _DEFAULT_FUSION_DROPOUT),
+                fusion_cross_asset_mixer_enabled=config.get('fusion_cross_asset_mixer_enabled', _DEFAULT_FUSION_CROSS_ASSET_MIXER_ENABLED),
+                fusion_cross_asset_mixer_layers=config.get('fusion_cross_asset_mixer_layers', _DEFAULT_FUSION_CROSS_ASSET_MIXER_LAYERS),
+                fusion_cross_asset_mixer_expansion=config.get('fusion_cross_asset_mixer_expansion', _DEFAULT_FUSION_CROSS_ASSET_MIXER_EXPANSION),
+                fusion_cross_asset_mixer_dropout=config.get('fusion_cross_asset_mixer_dropout', _DEFAULT_FUSION_CROSS_ASSET_MIXER_DROPOUT),
+                fusion_alpha_head_hidden_dims=config.get('fusion_alpha_head_hidden_dims', _DEFAULT_FUSION_ALPHA_HEAD_HIDDEN_DIMS),
+                fusion_alpha_head_dropout=config.get('fusion_alpha_head_dropout', _DEFAULT_FUSION_ALPHA_HEAD_DROPOUT),
+                fusion_asset_identity_enabled=config.get('fusion_asset_identity_enabled', _DEFAULT_FUSION_ASSET_IDENTITY_ENABLED),
+                fusion_context_cross_attention_enabled=config.get('fusion_context_cross_attention_enabled', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_ENABLED),
+                fusion_context_cross_attention_heads=config.get('fusion_context_cross_attention_heads', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_HEADS),
+                fusion_context_cross_attention_dropout=config.get('fusion_context_cross_attention_dropout', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_DROPOUT),
+                fusion_per_asset_alpha_head=config.get('fusion_per_asset_alpha_head', _DEFAULT_FUSION_PER_ASSET_ALPHA_HEAD),
+                dual_head_enabled=dual_head_enabled_cfg,
+                **mixture_kwargs,
+                **objective_expert_kwargs,
+                aux_return_enabled=aux_return_enabled_cfg,
+                **recurrent_kwargs,
+                **regime_kwargs,
+                **epsilon_kwargs,
+            )
+            critic = MLPFusionCritic(
+                input_dim=input_dim,
+                sequence_length=mlp_sequence_length,
+                temporal_hidden_dims=config.get('critic_hidden_dims', _DEFAULT_CRITIC_HIDDEN_DIMS),
+                dropout=mlp_dropout,
+                num_assets=resolved_num_assets,
+                asset_feature_dim=resolved_asset_feature_dim,
+                global_feature_dim=resolved_global_feature_dim,
+                fusion_embed_dim=config.get('fusion_embed_dim', _DEFAULT_FUSION_EMBED_DIM),
+                fusion_attention_heads=config.get('fusion_attention_heads', _DEFAULT_FUSION_HEADS),
+                fusion_dropout=config.get('fusion_dropout', _DEFAULT_FUSION_DROPOUT),
+                fusion_cross_asset_mixer_enabled=config.get('fusion_cross_asset_mixer_enabled', _DEFAULT_FUSION_CROSS_ASSET_MIXER_ENABLED),
+                fusion_cross_asset_mixer_layers=config.get('fusion_cross_asset_mixer_layers', _DEFAULT_FUSION_CROSS_ASSET_MIXER_LAYERS),
+                fusion_cross_asset_mixer_expansion=config.get('fusion_cross_asset_mixer_expansion', _DEFAULT_FUSION_CROSS_ASSET_MIXER_EXPANSION),
+                fusion_cross_asset_mixer_dropout=config.get('fusion_cross_asset_mixer_dropout', _DEFAULT_FUSION_CROSS_ASSET_MIXER_DROPOUT),
+                fusion_asset_identity_enabled=config.get('fusion_asset_identity_enabled', _DEFAULT_FUSION_ASSET_IDENTITY_ENABLED),
+                fusion_context_cross_attention_enabled=config.get('fusion_context_cross_attention_enabled', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_ENABLED),
+                fusion_context_cross_attention_heads=config.get('fusion_context_cross_attention_heads', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_HEADS),
+                fusion_context_cross_attention_dropout=config.get('fusion_context_cross_attention_dropout', _DEFAULT_FUSION_CONTEXT_CROSS_ATTN_DROPOUT),
+                objective_experts_enabled=objective_expert_kwargs["objective_experts_enabled"],
+                objective_expert_names=objective_expert_kwargs["objective_expert_names"],
+                objective_expert_adapter_dim=objective_expert_kwargs["objective_expert_adapter_dim"],
+                objective_expert_dropout=objective_expert_kwargs["objective_expert_dropout"],
+                **recurrent_kwargs,
+                **regime_kwargs,
+                **critic_distributional_kwargs,
+            )
+        else:
+            actor = MLPActor(
+                input_dim=input_dim,
+                num_actions=num_actions,
+                sequence_length=mlp_sequence_length,
+                hidden_dims=config.get('actor_hidden_dims', _DEFAULT_ACTOR_HIDDEN_DIMS),
+                dropout=mlp_dropout,
+                dual_head_enabled=dual_head_enabled_cfg,
+                **mixture_kwargs,
+                **objective_expert_kwargs,
+                aux_return_enabled=aux_return_enabled_cfg,
+                **regime_kwargs,
+                **epsilon_kwargs,
+            )
+            critic = MLPCritic(
+                input_dim=input_dim,
+                sequence_length=mlp_sequence_length,
+                hidden_dims=config.get('critic_hidden_dims', _DEFAULT_CRITIC_HIDDEN_DIMS),
+                dropout=mlp_dropout,
+                objective_experts_enabled=objective_expert_kwargs["objective_experts_enabled"],
+                objective_expert_names=objective_expert_kwargs["objective_expert_names"],
+                objective_expert_adapter_dim=objective_expert_kwargs["objective_expert_adapter_dim"],
+                objective_expert_dropout=objective_expert_kwargs["objective_expert_dropout"],
+                **regime_kwargs,
+                **critic_distributional_kwargs,
+            )
 
     elif arch_upper == 'TCN':
         if config.get('use_fusion', False):

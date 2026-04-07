@@ -109,6 +109,7 @@ class TrainingSession:
         # Training state
         self.episode = 0
         self.total_timesteps = 0
+        self.training_stats = []  # Legacy combined view kept for JSON compatibility
         # ENHANCEMENT: Split stats for separate CSV files
         self.episode_stats_list = []  # For episodes.csv
         self.update_stats_list = []   # For updates.csv
@@ -1086,9 +1087,21 @@ class TrainingSession:
             'tape_terminal_baseline': episode_stats.get('tape_terminal_baseline', np.nan),
             'tape_terminal_neutral_band_applied': episode_stats.get('tape_terminal_neutral_band_applied', False),
             'tape_terminal_neutral_band_halfwidth': episode_stats.get('tape_terminal_neutral_band_halfwidth', np.nan),
-            'profile_name': episode_stats.get('profile_name', '')
+            'profile_name': episode_stats.get('profile_name', ''),
+            # Persist the latest PPO update decomposition alongside episode metrics.
+            'actor_loss': update_stats.get('actor_loss', np.nan) if update_stats else np.nan,
+            'critic_loss': update_stats.get('critic_loss', np.nan) if update_stats else np.nan,
+            'critic_loss_scaled': update_stats.get('critic_loss_scaled', np.nan) if update_stats else np.nan,
+            'risk_aux_total': update_stats.get('risk_aux_total', np.nan) if update_stats else np.nan,
+            'entropy': update_stats.get('entropy', np.nan) if update_stats else np.nan,
+            'approx_kl': update_stats.get('approx_kl', np.nan) if update_stats else np.nan,
         }
+        if update_stats:
+            for key, value in update_stats.items():
+                if key.startswith('objective_actor_loss_') or key.startswith('objective_critic_loss_') or key.startswith('objective_router_prob_'):
+                    episode_entry[key] = value
         self.episode_stats_list.append(episode_entry)
+        self.training_stats.append(dict(episode_entry))
         
         # ENHANCEMENT: Store update stats separately (for updates.csv) - only when update occurs
         if update_stats:
@@ -1098,6 +1111,8 @@ class TrainingSession:
                 # RL training metrics
                 'actor_loss': update_stats.get('actor_loss', 0.0),
                 'critic_loss': update_stats.get('critic_loss', 0.0),
+                'critic_loss_scaled': update_stats.get('critic_loss_scaled', 0.0),
+                'risk_aux_total': update_stats.get('risk_aux_total', 0.0),
                 'mean_adv': update_stats.get('mean_advantage', 0.0),
                 'entropy': update_stats.get('entropy', 0.0),
                 'kl_divergence': update_stats.get('approx_kl', np.nan),
@@ -1109,6 +1124,9 @@ class TrainingSession:
                 'advantage_mean': update_stats.get('adv_mean', 0.0),
                 'advantage_std': update_stats.get('adv_std', 0.0),
             }
+            for key, value in update_stats.items():
+                if key.startswith('objective_actor_loss_') or key.startswith('objective_critic_loss_') or key.startswith('objective_router_prob_'):
+                    update_entry[key] = value
             self.update_stats_list.append(update_entry)
         
         # Log to console
@@ -1131,7 +1149,22 @@ class TrainingSession:
                 logger.info(f"         Update | "
                            f"Actor: {update_stats.get('actor_loss', 0):8.4f} | "
                            f"Critic: {update_stats.get('critic_loss', 0):8.4f} | "
-                           f"Entropy: {update_stats.get('entropy', 0):8.4f}")
+                           f"CriticScaled: {update_stats.get('critic_loss_scaled', 0):8.4f} | "
+                           f"RiskAux: {update_stats.get('risk_aux_total', 0):8.4f} | "
+                           f"Entropy: {update_stats.get('entropy', 0):8.4f} | "
+                           f"KL: {update_stats.get('approx_kl', np.nan):8.5f}")
+                expert_fragments = []
+                for key in sorted(update_stats.keys()):
+                    if key.startswith('objective_actor_loss_'):
+                        expert_name = key[len('objective_actor_loss_'):]
+                        actor_val = update_stats.get(key, 0.0)
+                        critic_val = update_stats.get(f'objective_critic_loss_{expert_name}', np.nan)
+                        router_val = update_stats.get(f'objective_router_prob_{expert_name}', np.nan)
+                        expert_fragments.append(
+                            f"{expert_name}: actor={actor_val:.4f}, critic={critic_val:.4f}, router={router_val:.3f}"
+                        )
+                if expert_fragments:
+                    logger.info("         Experts | %s", " | ".join(expert_fragments))
     
     def save_checkpoint(self, agent: PPOAgentTF, episode_stats: Dict[str, float]):
         """
@@ -1277,8 +1310,12 @@ class TrainingSession:
             
         # Save training stats as JSON (legacy/backup)
         stats_file = os.path.join(self.results_dir, 'training_stats.json')
+        legacy_stats_payload = {
+            'episodes': self.episode_stats_list,
+            'updates': self.update_stats_list,
+        }
         with open(stats_file, 'w') as f:
-            json.dump(self.training_stats, f, indent=2)
+            json.dump(legacy_stats_payload, f, indent=2)
         logger.info(f"[OK] Training stats saved: {stats_file}")
         
         # Create training plots
@@ -1333,77 +1370,116 @@ class TrainingSession:
     
     def create_training_plots(self):
         """Create and save comprehensive training progress plots."""
-        if not self.training_stats:
+        if not self.episode_stats_list and not self.update_stats_list:
             logger.warning("No training stats to plot")
             return
-        
-        df_stats = pd.DataFrame(self.training_stats)
-        
-        # Create figure with 6 subplots
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+
+        episodes_df = pd.DataFrame(self.episode_stats_list) if self.episode_stats_list else pd.DataFrame()
+        updates_df = pd.DataFrame(self.update_stats_list) if self.update_stats_list else pd.DataFrame()
+
+        # Create figure with 9 subplots to include expert diagnostics.
+        fig, axes = plt.subplots(3, 3, figsize=(20, 14))
         fig.suptitle(f'Training Progress - {self.architecture} Architecture', fontsize=16, fontweight='bold')
-        
+
         # 1. Episode rewards
-        axes[0, 0].plot(df_stats['episode'], df_stats['episode_reward'], alpha=0.6, label='Rewards')
-        axes[0, 0].plot(df_stats['episode'], df_stats['episode_reward'].rolling(10).mean(), 
-                       linewidth=2, label='MA(10)')
+        if not episodes_df.empty and 'episode_reward' in episodes_df.columns:
+            axes[0, 0].plot(episodes_df['episode'], episodes_df['episode_reward'], alpha=0.6, label='Rewards')
+            axes[0, 0].plot(episodes_df['episode'], episodes_df['episode_reward'].rolling(10).mean(),
+                            linewidth=2, label='MA(10)')
+            axes[0, 0].legend()
         axes[0, 0].set_title('Episode Rewards', fontweight='bold')
         axes[0, 0].set_xlabel('Episode')
         axes[0, 0].set_ylabel('Reward')
-        axes[0, 0].legend()
         axes[0, 0].grid(True, alpha=0.3)
-        
+
         # 2. Portfolio value
-        axes[0, 1].plot(df_stats['episode'], df_stats['final_portfolio_value'], color='green')
+        if not episodes_df.empty and 'final_portfolio_value' in episodes_df.columns:
+            axes[0, 1].plot(episodes_df['episode'], episodes_df['final_portfolio_value'], color='green')
         axes[0, 1].axhline(y=100000, color='red', linestyle='--', alpha=0.5, label='Initial Capital')
         axes[0, 1].set_title('Final Portfolio Value', fontweight='bold')
         axes[0, 1].set_xlabel('Episode')
         axes[0, 1].set_ylabel('Portfolio Value ($)')
         axes[0, 1].legend()
         axes[0, 1].grid(True, alpha=0.3)
-        
+
         # 3. Total returns
-        if 'total_return' in df_stats.columns:
-            axes[0, 2].plot(df_stats['episode'], df_stats['total_return'] * 100, color='purple')
+        if not episodes_df.empty and 'total_return' in episodes_df.columns:
+            axes[0, 2].plot(episodes_df['episode'], episodes_df['total_return'] * 100, color='purple')
             axes[0, 2].axhline(y=0, color='black', linestyle='--', alpha=0.3)
-            axes[0, 2].set_title('Total Returns', fontweight='bold')
-            axes[0, 2].set_xlabel('Episode')
-            axes[0, 2].set_ylabel('Return (%)')
-            axes[0, 2].grid(True, alpha=0.3)
-        
+        axes[0, 2].set_title('Total Returns', fontweight='bold')
+        axes[0, 2].set_xlabel('Episode')
+        axes[0, 2].set_ylabel('Return (%)')
+        axes[0, 2].grid(True, alpha=0.3)
+
         # 4. Episode lengths
-        axes[1, 0].plot(df_stats['episode'], df_stats['episode_length'], color='orange')
+        if not episodes_df.empty and 'episode_length' in episodes_df.columns:
+            axes[1, 0].plot(episodes_df['episode'], episodes_df['episode_length'], color='orange')
         axes[1, 0].set_title('Episode Lengths', fontweight='bold')
         axes[1, 0].set_xlabel('Episode')
         axes[1, 0].set_ylabel('Steps')
         axes[1, 0].grid(True, alpha=0.3)
-        
+
         # 5. Actor loss (if available)
-        if 'actor_loss' in df_stats.columns:
-            actor_losses = df_stats['actor_loss'].dropna()
+        if not updates_df.empty and 'actor_loss' in updates_df.columns:
+            actor_losses = updates_df['actor_loss'].dropna()
             if len(actor_losses) > 0:
                 axes[1, 1].plot(actor_losses.index, actor_losses, color='blue', alpha=0.6)
                 axes[1, 1].plot(actor_losses.index, actor_losses.rolling(5).mean(), 
                                linewidth=2, color='darkblue', label='MA(5)')
-                axes[1, 1].set_title('Actor Loss', fontweight='bold')
-                axes[1, 1].set_xlabel('Update Step')
-                axes[1, 1].set_ylabel('Loss')
                 axes[1, 1].legend()
-                axes[1, 1].grid(True, alpha=0.3)
-        
+        axes[1, 1].set_title('Actor Loss', fontweight='bold')
+        axes[1, 1].set_xlabel('Update Step')
+        axes[1, 1].set_ylabel('Loss')
+        axes[1, 1].grid(True, alpha=0.3)
+
         # 6. Critic loss (if available)
-        if 'critic_loss' in df_stats.columns:
-            critic_losses = df_stats['critic_loss'].dropna()
+        if not updates_df.empty and 'critic_loss' in updates_df.columns:
+            critic_losses = updates_df['critic_loss'].dropna()
             if len(critic_losses) > 0:
                 axes[1, 2].plot(critic_losses.index, critic_losses, color='red', alpha=0.6)
                 axes[1, 2].plot(critic_losses.index, critic_losses.rolling(5).mean(), 
                                linewidth=2, color='darkred', label='MA(5)')
-                axes[1, 2].set_title('Critic Loss', fontweight='bold')
-                axes[1, 2].set_xlabel('Update Step')
-                axes[1, 2].set_ylabel('Loss')
                 axes[1, 2].legend()
-                axes[1, 2].grid(True, alpha=0.3)
-        
+        axes[1, 2].set_title('Critic Loss', fontweight='bold')
+        axes[1, 2].set_xlabel('Update Step')
+        axes[1, 2].set_ylabel('Loss')
+        axes[1, 2].grid(True, alpha=0.3)
+
+        # 7. Expert actor auxiliary losses
+        expert_actor_cols = [c for c in updates_df.columns if c.startswith('objective_actor_loss_')] if not updates_df.empty else []
+        if expert_actor_cols:
+            for col in sorted(expert_actor_cols):
+                axes[2, 0].plot(updates_df.index, updates_df[col], alpha=0.8, label=col.replace('objective_actor_loss_', ''))
+            axes[2, 0].legend()
+        axes[2, 0].set_title('Expert Actor Losses', fontweight='bold')
+        axes[2, 0].set_xlabel('Update Step')
+        axes[2, 0].set_ylabel('Loss')
+        axes[2, 0].grid(True, alpha=0.3)
+
+        # 8. Expert critic losses
+        expert_critic_cols = [c for c in updates_df.columns if c.startswith('objective_critic_loss_')] if not updates_df.empty else []
+        if expert_critic_cols:
+            for col in sorted(expert_critic_cols):
+                axes[2, 1].plot(updates_df.index, updates_df[col], alpha=0.8, label=col.replace('objective_critic_loss_', ''))
+            axes[2, 1].legend()
+        axes[2, 1].set_title('Expert Critic Losses', fontweight='bold')
+        axes[2, 1].set_xlabel('Update Step')
+        axes[2, 1].set_ylabel('Loss')
+        axes[2, 1].grid(True, alpha=0.3)
+
+        # 9. Expert router probabilities
+        router_prob_cols = [c for c in updates_df.columns if c.startswith('objective_router_prob_')] if not updates_df.empty else []
+        router_prob_cols = [c for c in router_prob_cols if c not in {'objective_router_probs'}]
+        if router_prob_cols:
+            for col in sorted(router_prob_cols):
+                axes[2, 2].plot(updates_df.index, updates_df[col], alpha=0.8, label=col.replace('objective_router_prob_', ''))
+            axes[2, 2].legend()
+        axes[2, 2].set_title('Expert Router Probabilities', fontweight='bold')
+        axes[2, 2].set_xlabel('Update Step')
+        axes[2, 2].set_ylabel('Probability')
+        axes[2, 2].set_ylim(0.0, 1.0)
+        axes[2, 2].grid(True, alpha=0.3)
+
         plt.tight_layout()
         plot_file = os.path.join(self.results_dir, 'training_progress.png')
         plt.savefig(plot_file, dpi=300, bbox_inches='tight')
@@ -1525,6 +1601,8 @@ class TrainingSession:
                             'timesteps': self.total_timesteps,
                             'actor_loss': update_stats.get('actor_loss', 0.0),
                             'critic_loss': update_stats.get('critic_loss', 0.0),
+                            'critic_loss_scaled': update_stats.get('critic_loss_scaled', 0.0),
+                            'risk_aux_total': update_stats.get('risk_aux_total', 0.0),
                             'mean_adv': update_stats.get('mean_advantage', 0.0),
                             'entropy': update_stats.get('entropy', 0.0),
                             'kl_divergence': update_stats.get('approx_kl', np.nan),
@@ -1535,6 +1613,9 @@ class TrainingSession:
                             'advantage_mean': update_stats.get('adv_mean', 0.0),
                             'advantage_std': update_stats.get('adv_std', 0.0),
                         }
+                        for key, value in update_stats.items():
+                            if key.startswith('objective_actor_loss_') or key.startswith('objective_critic_loss_') or key.startswith('objective_router_prob_'):
+                                update_entry[key] = value
                         self.update_stats_list.append(update_entry)
 
                     if self.total_timesteps >= max_timesteps:
