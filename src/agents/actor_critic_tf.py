@@ -4019,8 +4019,15 @@ class MLPFusionActor(TCNFusionActor):
 
     def _align_sequence_length(self, x: tf.Tensor) -> tf.Tensor:
         pad_time = tf.maximum(0, self.sequence_length - tf.shape(x)[1])
-        x = tf.pad(x, [[0, 0], [0, pad_time], [0, 0]])
-        return x[:, : self.sequence_length, :]
+        if x.shape.rank == 3:
+            x = tf.pad(x, [[0, 0], [0, pad_time], [0, 0]])
+            return x[:, : self.sequence_length, :]
+        if x.shape.rank == 4:
+            x = tf.pad(x, [[0, 0], [0, pad_time], [0, 0], [0, 0]])
+            return x[:, : self.sequence_length, :, :]
+        raise ValueError(
+            f"MLPFusionActor expected rank-3 or rank-4 sequence tensor, got shape {x.shape}"
+        )
 
     def _align_asset_tensor(self, asset_tensor: tf.Tensor) -> tf.Tensor:
         x_assets = super()._align_asset_tensor(asset_tensor)
@@ -4371,8 +4378,15 @@ class MLPFusionCritic(TCNFusionCritic):
 
     def _align_sequence_length(self, x: tf.Tensor) -> tf.Tensor:
         pad_time = tf.maximum(0, self.sequence_length - tf.shape(x)[1])
-        x = tf.pad(x, [[0, 0], [0, pad_time], [0, 0]])
-        return x[:, : self.sequence_length, :]
+        if x.shape.rank == 3:
+            x = tf.pad(x, [[0, 0], [0, pad_time], [0, 0]])
+            return x[:, : self.sequence_length, :]
+        if x.shape.rank == 4:
+            x = tf.pad(x, [[0, 0], [0, pad_time], [0, 0], [0, 0]])
+            return x[:, : self.sequence_length, :, :]
+        raise ValueError(
+            f"MLPFusionCritic expected rank-3 or rank-4 sequence tensor, got shape {x.shape}"
+        )
 
     def _align_asset_tensor(self, asset_tensor: tf.Tensor) -> tf.Tensor:
         x_assets = super()._align_asset_tensor(asset_tensor)
