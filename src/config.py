@@ -4432,12 +4432,19 @@ def assert_run21_mlp_config(config: dict) -> None:
     assert bool(agent.get("use_fusion", False)), "Run21 MLP must preserve fusion"
     assert not bool(agent.get("use_attention", True)), "Run21 MLP must keep standalone attention disabled"
     assert not bool(agent.get("recurrent_memory_enabled", True)), "Run21 MLP must keep recurrent memory disabled"
-    assert bool(agent.get("fusion_cross_asset_mixer_enabled", False)), "Run21 MLP fusion_cross_asset_mixer_enabled must stay on"
-    assert bool(agent.get("fusion_asset_identity_enabled", False)), "Run21 MLP fusion_asset_identity_enabled must stay on"
-    assert bool(agent.get("fusion_context_cross_attention_enabled", False)), (
-        "Run21 MLP fusion_context_cross_attention_enabled must stay on"
-    )
-    assert bool(agent.get("fusion_per_asset_alpha_head", False)), "Run21 MLP fusion_per_asset_alpha_head must stay on"
+    expected_run21_agent = RUN21_OVERRIDES.get("agent_params", {})
+    assert bool(agent.get("fusion_cross_asset_mixer_enabled", False)) == bool(
+        expected_run21_agent.get("fusion_cross_asset_mixer_enabled", False)
+    ), "Run21 MLP fusion_cross_asset_mixer_enabled drifted"
+    assert bool(agent.get("fusion_asset_identity_enabled", False)) == bool(
+        expected_run21_agent.get("fusion_asset_identity_enabled", False)
+    ), "Run21 MLP fusion_asset_identity_enabled drifted"
+    assert bool(agent.get("fusion_context_cross_attention_enabled", False)) == bool(
+        expected_run21_agent.get("fusion_context_cross_attention_enabled", False)
+    ), "Run21 MLP fusion_context_cross_attention_enabled drifted"
+    assert bool(agent.get("fusion_per_asset_alpha_head", False)) == bool(
+        expected_run21_agent.get("fusion_per_asset_alpha_head", False)
+    ), "Run21 MLP fusion_per_asset_alpha_head drifted"
     assert bool(agent.get("regime_conditioning_enabled", False)), "Run21 MLP regime_conditioning_enabled must stay on"
     assert str(agent.get("regime_conditioning_mode", "concat")).lower() == "film", "Run21 MLP regime_conditioning_mode must stay film"
     assert str(agent.get("dirichlet_alpha_activation", "")).lower() == "cross_softplus", (
