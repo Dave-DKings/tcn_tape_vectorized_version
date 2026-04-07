@@ -4418,8 +4418,24 @@ class MLPFusionCritic(TCNFusionCritic):
         return self._align_sequence_length(aligned)
 
     def _build_regime_sequence(self, state) -> tf.Tensor:
-        seq = super()._build_regime_sequence(state)
-        return self._align_sequence_length(seq)
+        if isinstance(state, dict):
+            structured_assets = self._align_asset_tensor(state.get("asset"))
+            batch = tf.shape(structured_assets)[0]
+            timesteps = tf.shape(structured_assets)[1]
+            context_seq = self._align_context_tensor(
+                state.get("context"),
+                batch=batch,
+                timesteps=timesteps,
+                fallback=tf.zeros((batch, timesteps, self.per_asset_dim), dtype=structured_assets.dtype),
+            )
+            asset_flat_for_regime = tf.reshape(
+                structured_assets,
+                (batch, timesteps, self.num_assets * self.per_asset_dim),
+            )
+            return tf.concat([asset_flat_for_regime, context_seq], axis=-1)
+
+        x = self._align_feature_dim(state)
+        return self._align_sequence_length(x)
 
     def call(self, state, training=None):
         if isinstance(state, dict):
